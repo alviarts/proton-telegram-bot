@@ -16,9 +16,13 @@ from proton_telegram_bot.models import AliasStatus
 class _RecordingNotifier(Notifier):
     def __init__(self) -> None:
         self.calls: list[tuple[int, str, dict[str, str]]] = []
+        self.discovery_calls: list[tuple[int, list[str]]] = []
 
     async def notify_email_received(self, chat_id, alias_email, summary) -> None:
         self.calls.append((chat_id, alias_email, summary))
+
+    async def notify_aliases_discovered(self, chat_id, aliases) -> None:
+        self.discovery_calls.append((chat_id, aliases))
 
 
 @pytest.fixture
@@ -59,7 +63,8 @@ async def test_handle_message_marks_alias_consumed_and_notifies(db: Database) ->
     assert (received_chat, received_email) == (chat_id, "vielz50@proton.me")
 
 
-async def test_handle_message_ignores_unmatched_recipient(db: Database) -> None:
+async def test_handle_message_auto_adds_new_recipient(db: Database) -> None:
+    """An email to an unknown address auto-adds it, consumes, and notifies."""
     chat_id = 7
     await db.upsert_user(chat_id)
     await db.add_aliases(chat_id, ["only@proton.me"])
@@ -70,9 +75,37 @@ async def test_handle_message_ignores_unmatched_recipient(db: Database) -> None:
         notifier=notifier,
     )
     await manager._handle_new_message(chat_id, _make_message("someone-else@proton.me"), "1")
-    assert notifier.calls == []
-    available = await db.list_aliases(chat_id, status=AliasStatus.AVAILABLE)
-    assert [a.email for a in available] == ["only@proton.me"]
+    # Auto-add creates the alias and immediately consumes it.
+    assert len(notifier.calls) == 1
+    assert notifier.calls[0][1] == "someone-else@proton.me"
+    all_aliases = await db.list_aliases(chat_id)
+    assert sorted(a.email for a in all_aliases) == ["only@proton.me", "someone-else@proton.me"]
+    consumed = await db.list_aliases(chat_id, status=AliasStatus.CONSUMED)
+    assert [a.email for a in consumed] == ["someone-else@proton.me"]
+
+
+async def test_discovered_aliases_adds_and_notifies(db: Database) -> None:
+    """Inbox scan discovers new addresses and notifies the user."""
+    chat_id = 42
+    await db.upsert_user(chat_id)
+    await db.add_aliases(chat_id, ["existing@proton.me"])
+    notifier = _RecordingNotifier()
+    manager = ListenerManager(
+        db=db,
+        cipher=CredentialCipher(CredentialCipher.generate_key()),
+        notifier=notifier,
+    )
+    await manager._handle_discovered_aliases(
+        chat_id, {"existing@proton.me", "new1@proton.me", "new2@proton.me"}
+    )
+    all_aliases = await db.list_aliases(chat_id)
+    assert sorted(a.email for a in all_aliases) == [
+        "existing@proton.me",
+        "new1@proton.me",
+        "new2@proton.me",
+    ]
+    assert len(notifier.discovery_calls) == 1
+    assert notifier.discovery_calls[0][0] == chat_id
 
 
 async def test_handle_message_does_not_rematch_consumed_alias(db: Database) -> None:

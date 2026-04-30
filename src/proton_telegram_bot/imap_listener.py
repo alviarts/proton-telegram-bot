@@ -14,13 +14,16 @@ from email.message import Message
 
 from aioimaplib import aioimaplib
 
-from .email_parser import parse_message
+from .email_parser import extract_recipients, parse_message
 from .models import BridgeCredentials
 
 LOGGER = logging.getLogger(__name__)
 
 NewMessageCallback = Callable[[int, Message, str], Awaitable[None]]
 """Callback signature: (chat_id, parsed_message, raw_uid)."""
+
+AliasDiscoveryCallback = Callable[[int, set[str]], Awaitable[None]]
+"""Callback signature: (chat_id, discovered_addresses)."""
 
 # How often the listener polls for new messages (seconds).
 POLL_INTERVAL_SECONDS = 5
@@ -36,11 +39,15 @@ class IMAPListener:
         chat_id: int,
         credentials: BridgeCredentials,
         on_new_message: NewMessageCallback,
+        on_aliases_discovered: AliasDiscoveryCallback | None = None,
+        alias_sync_interval: int = 300,
         mailbox: str = "INBOX",
     ) -> None:
         self.chat_id = chat_id
         self._credentials = credentials
         self._on_new_message = on_new_message
+        self._on_aliases_discovered = on_aliases_discovered
+        self._alias_sync_interval = alias_sync_interval
         self._mailbox = mailbox
         self._task: asyncio.Task[None] | None = None
         self._stop_event = asyncio.Event()
@@ -96,6 +103,10 @@ class IMAPListener:
             await client.select(self._mailbox)
             await self._initialize_uid_baseline(client)
 
+            # Scan inbox for alias discovery at startup.
+            await self._scan_inbox_aliases(client)
+
+            seconds_since_sync = 0
             # Poll for new messages every POLL_INTERVAL_SECONDS.
             while not self._stop_event.is_set():
                 await self._fetch_new_messages(client)
@@ -113,6 +124,12 @@ class IMAPListener:
                 except Exception:
                     LOGGER.debug("NOOP failed for chat %s, reconnecting", self.chat_id)
                     break
+
+                # Periodic alias sync.
+                seconds_since_sync += POLL_INTERVAL_SECONDS
+                if seconds_since_sync >= self._alias_sync_interval:
+                    seconds_since_sync = 0
+                    await self._scan_inbox_aliases(client)
         finally:
             try:
                 await client.logout()
@@ -150,6 +167,45 @@ class IMAPListener:
             self._last_seen_uid,
             self._mailbox,
         )
+
+    async def _scan_inbox_aliases(self, client: aioimaplib.IMAP4) -> None:
+        """Scan all messages in the inbox and report discovered recipient addresses."""
+        if self._on_aliases_discovered is None:
+            return
+        response = await client.uid_search("ALL")
+        if response.result != "OK":
+            return
+        uids = self._parse_uids(response.lines)
+        if not uids:
+            return
+        discovered: set[str] = set()
+        for uid in uids:
+            try:
+                raw = await self._fetch_headers(client, uid)
+                if raw is None:
+                    continue
+                msg = parse_message(raw)
+                discovered.update(extract_recipients(msg))
+            except Exception:
+                LOGGER.debug("failed to fetch headers for UID %s", uid)
+        if discovered:
+            LOGGER.info(
+                "chat %s alias scan discovered %d addresses",
+                self.chat_id,
+                len(discovered),
+            )
+            await self._on_aliases_discovered(self.chat_id, discovered)
+
+    async def _fetch_headers(
+        self, client: aioimaplib.IMAP4, uid: int
+    ) -> bytes | None:
+        """Fetch only the header portion of a message (lighter than full RFC822)."""
+        response = await client.uid(
+            "fetch", str(uid), "(BODY.PEEK[HEADER])"
+        )
+        if response.result != "OK":
+            return None
+        return self._extract_rfc822_payload(response.lines)
 
     async def _fetch_new_messages(self, client: aioimaplib.IMAP4) -> None:
         response = await client.uid_search(f"UID {self._last_seen_uid + 1}:*")

@@ -560,6 +560,23 @@ class TelegramNotifier(Notifier):
             parse_mode=ParseMode.HTML,
         )
 
+    async def notify_aliases_discovered(
+        self,
+        chat_id: int,
+        aliases: list[str],
+    ) -> None:
+        if not aliases:
+            return
+        lines = [f"<b>Auto-sync:</b> {len(aliases)} alias baru ditemukan:"]
+        for alias in sorted(aliases):
+            lines.append(f"• <code>{html.escape(alias)}</code>")
+        lines.append("\n/list untuk lihat semua alias.")
+        await self._application.bot.send_message(
+            chat_id=chat_id,
+            text="\n".join(lines),
+            parse_mode=ParseMode.HTML,
+        )
+
 
 # Telegram caps each message at 4096 characters; we leave headroom for the rendered
 # trailer that the helper below appends when truncating.
