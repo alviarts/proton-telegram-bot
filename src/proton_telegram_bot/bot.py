@@ -33,6 +33,9 @@ LOGGER = logging.getLogger(__name__)
 # Conversation states for /connect
 CONNECT_HOST, CONNECT_PORT, CONNECT_USERNAME, CONNECT_PASSWORD, CONNECT_SSL = range(5)
 
+# Conversation states for /sync
+SYNC_CAPTCHA = 10
+
 CB_PICK = "pick"
 CB_REFRESH = "refresh"
 CB_RESET = "reset"
@@ -226,11 +229,11 @@ async def cmd_addalias(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 @_gate
-async def cmd_sync(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_sync(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Fetch addresses from the Proton API and add them as aliases."""
     chat = update.effective_chat
     if chat is None:
-        return
+        return ConversationHandler.END
     args = context.args or []
     if len(args) < 2:
         await update.effective_message.reply_text(  # type: ignore[union-attr]
@@ -238,22 +241,96 @@ async def cmd_sync(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "Contoh: /sync vielz43 passwordku\n\n"
             "Username dan password akun Proton (bukan Bridge)."
         )
-        return
+        return ConversationHandler.END
     username, password = args[0], " ".join(args[1:])
     await update.effective_message.reply_text("Menghubungi Proton API...")  # type: ignore[union-attr]
     try:
-        from .proton_api import fetch_addresses
+        from .proton_api import CaptchaChallenge, start_auth
 
-        addresses = await asyncio.to_thread(fetch_addresses, username, password)
+        result = await asyncio.to_thread(start_auth, username, password)
     except Exception as exc:
         LOGGER.exception("proton API sync failed")
         await update.effective_message.reply_text(  # type: ignore[union-attr]
             f"Gagal mengambil alamat dari Proton: {exc}"
         )
-        return
+        return ConversationHandler.END
+
+    if isinstance(result, CaptchaChallenge):
+        user_data = cast(dict, context.user_data)
+        user_data["sync_challenge"] = result
+        await update.effective_message.reply_text(  # type: ignore[union-attr]
+            "Proton memerlukan verifikasi CAPTCHA.\n\n"
+            f"1. Buka link ini di browser:\n{result.web_url}\n\n"
+            "2. Selesaikan CAPTCHA\n"
+            "3. Setelah selesai, kirim 'done' di sini.\n\n"
+            "Kirim /cancel untuk membatalkan.",
+        )
+        return SYNC_CAPTCHA
+
+    return await _sync_complete(update, context, result)
+
+
+async def sync_captcha_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle user confirming CAPTCHA is solved."""
+    user_data = cast(dict, context.user_data)
+    challenge = user_data.pop("sync_challenge", None)
+    if challenge is None:
+        await update.effective_message.reply_text("Sesi sync sudah kedaluwarsa. Coba /sync lagi.")  # type: ignore[union-attr]
+        return ConversationHandler.END
+
+    text = (update.effective_message.text or "").strip().lower()  # type: ignore[union-attr]
+    if text == "done":
+        # User solved CAPTCHA on the web page; retry with the original token
+        await update.effective_message.reply_text("Mencoba ulang autentikasi...")  # type: ignore[union-attr]
+        try:
+            from .proton_api import complete_auth_with_captcha
+
+            session = await asyncio.to_thread(
+                complete_auth_with_captcha, challenge, challenge.token
+            )
+        except Exception as exc:
+            LOGGER.exception("CAPTCHA auth retry failed")
+            await update.effective_message.reply_text(  # type: ignore[union-attr]
+                f"Gagal setelah CAPTCHA: {exc}\nCoba /sync lagi."
+            )
+            return ConversationHandler.END
+        return await _sync_complete(update, context, session)
+
+    # User sent a captcha response token directly
+    await update.effective_message.reply_text("Memverifikasi token CAPTCHA...")  # type: ignore[union-attr]
+    try:
+        from .proton_api import complete_auth_with_captcha
+
+        session = await asyncio.to_thread(complete_auth_with_captcha, challenge, text)
+    except Exception as exc:
+        LOGGER.exception("CAPTCHA token auth failed")
+        await update.effective_message.reply_text(  # type: ignore[union-attr]
+            f"Token CAPTCHA tidak valid: {exc}\nCoba /sync lagi."
+        )
+        return ConversationHandler.END
+    return await _sync_complete(update, context, session)
+
+
+async def _sync_complete(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, session: object
+) -> int:
+    """Finish the /sync flow: fetch addresses and add as aliases."""
+    chat = update.effective_chat
+    if chat is None:
+        return ConversationHandler.END
+    try:
+        from .proton_api import fetch_addresses_from_session
+
+        addresses = await asyncio.to_thread(fetch_addresses_from_session, session)
+    except Exception as exc:
+        LOGGER.exception("address fetch failed")
+        await update.effective_message.reply_text(  # type: ignore[union-attr]
+            f"Gagal mengambil alamat: {exc}"
+        )
+        return ConversationHandler.END
     if not addresses:
         await update.effective_message.reply_text("Tidak ada alamat aktif di akun Proton.")  # type: ignore[union-attr]
-        return
+        return ConversationHandler.END
     db = _bot_db(context)
     inserted = await db.add_aliases(chat.id, addresses)
     total = len(addresses)
@@ -266,6 +343,7 @@ async def cmd_sync(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         msg,
         reply_markup=_build_alias_keyboard(aliases),
     )
+    return ConversationHandler.END
 
 
 @_gate
@@ -551,15 +629,27 @@ def build_handlers() -> list:
         persistent=False,
     )
 
+    sync_conv = ConversationHandler(
+        entry_points=[CommandHandler("sync", cmd_sync)],
+        states={
+            SYNC_CAPTCHA: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, sync_captcha_done),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cmd_cancel)],
+        name="sync",
+        persistent=False,
+    )
+
     return [
         CommandHandler("start", cmd_start),
         CommandHandler("list", cmd_list),
         CommandHandler("history", cmd_history),
         CommandHandler("addalias", cmd_addalias),
-        CommandHandler("sync", cmd_sync),
         CommandHandler("removealias", cmd_removealias),
         CommandHandler("reset", cmd_reset),
         CommandHandler("disconnect", cmd_disconnect),
         connect_conv,
+        sync_conv,
         CallbackQueryHandler(on_callback),
     ]
