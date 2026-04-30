@@ -1,0 +1,46 @@
+[project]
+name = "proton-telegram-bot"
+version = "0.1.0"
+description = "Telegram bot that notifies you when new emails arrive at your Proton Mail aliases via Proton Bridge."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "alviarts" }]
+dependencies = [
+    "python-telegram-bot[rate-limiter]>=21.6",
+    "aioimaplib>=1.1.0",
+    "aiosqlite>=0.20.0",
+    "cryptography>=43.0.0",
+    "pydantic>=2.8.0",
+    "pydantic-settings>=2.4.0",
+    "python-dotenv>=1.0.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.23.0",
+    "ruff>=0.6.0",
+]
+
+[project.scripts]
+proton-telegram-bot = "proton_telegram_bot.__main__:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "N", "RUF"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
