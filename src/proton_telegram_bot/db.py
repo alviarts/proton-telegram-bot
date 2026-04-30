@@ -190,11 +190,25 @@ class Database:
         ]
 
     async def find_alias(self, chat_id: int, email: str) -> AliasRecord | None:
-        async with self.conn.execute(
-            "SELECT id, chat_id, email, status, consumed_at, last_message_id FROM aliases "
+        return await self._find_alias(
             "WHERE chat_id = ? AND email = ?",
             (chat_id, email.strip().lower()),
-        ) as cursor:
+        )
+
+    async def find_alias_by_id(self, chat_id: int, alias_id: int) -> AliasRecord | None:
+        return await self._find_alias(
+            "WHERE chat_id = ? AND id = ?",
+            (chat_id, alias_id),
+        )
+
+    async def _find_alias(
+        self, where_clause: str, params: tuple[object, ...]
+    ) -> AliasRecord | None:
+        query = (
+            "SELECT id, chat_id, email, status, consumed_at, last_message_id FROM aliases "
+            f"{where_clause}"
+        )
+        async with self.conn.execute(query, params) as cursor:
             row = await cursor.fetchone()
         if row is None:
             return None

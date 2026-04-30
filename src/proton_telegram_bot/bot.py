@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import html
 import logging
-from collections.abc import Iterable
 from typing import cast
 
 from telegram import (
@@ -26,7 +25,7 @@ from .config import Settings
 from .crypto import CredentialCipher
 from .db import Database
 from .manager import ListenerManager, Notifier
-from .models import AliasStatus
+from .models import AliasRecord, AliasStatus
 
 LOGGER = logging.getLogger(__name__)
 
@@ -81,16 +80,23 @@ def _bot_manager(context: ContextTypes.DEFAULT_TYPE) -> ListenerManager:
     return cast(ListenerManager, context.application.bot_data["manager"])
 
 
-def _build_alias_keyboard(emails: Iterable[str]) -> InlineKeyboardMarkup:
+def _build_alias_keyboard(aliases: list[AliasRecord]) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
-    emails_list = list(emails)
-    if not emails_list:
+    if not aliases:
         rows.append(
             [InlineKeyboardButton("(belum ada alias tersedia)", callback_data=CB_NOOP)]
         )
     else:
-        for email in emails_list:
-            rows.append([InlineKeyboardButton(email, callback_data=f"{CB_PICK}:{email}")])
+        for alias in aliases:
+            # callback_data must be ≤ 64 bytes (Telegram API), so we use the
+            # alias's numeric id rather than the email address itself.
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        alias.email, callback_data=f"{CB_PICK}:{alias.id}"
+                    )
+                ]
+            )
     rows.append([InlineKeyboardButton("🔄 Refresh", callback_data=CB_REFRESH)])
     return InlineKeyboardMarkup(rows)
 
@@ -119,7 +125,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     aliases = await db.list_aliases(chat.id, status=AliasStatus.AVAILABLE)
     await update.effective_message.reply_text(  # type: ignore[union-attr]
         "Halo! Berikut alias yang masih tersedia:",
-        reply_markup=_build_alias_keyboard([a.email for a in aliases]),
+        reply_markup=_build_alias_keyboard(aliases),
     )
 
 
@@ -135,7 +141,7 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     aliases = await db.list_aliases(chat.id, status=AliasStatus.AVAILABLE)
     await update.effective_message.reply_text(  # type: ignore[union-attr]
         "Alias yang masih tersedia:",
-        reply_markup=_build_alias_keyboard([a.email for a in aliases]),
+        reply_markup=_build_alias_keyboard(aliases),
     )
 
 
@@ -197,7 +203,7 @@ async def cmd_addalias(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     aliases = await db.list_aliases(chat.id, status=AliasStatus.AVAILABLE)
     await update.effective_message.reply_text(  # type: ignore[union-attr]
         msg,
-        reply_markup=_build_alias_keyboard([a.email for a in aliases]),
+        reply_markup=_build_alias_keyboard(aliases),
     )
 
 
@@ -363,14 +369,19 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         aliases = await db.list_aliases(chat_id, status=AliasStatus.AVAILABLE)
         try:
             await query.edit_message_reply_markup(
-                reply_markup=_build_alias_keyboard([a.email for a in aliases])
+                reply_markup=_build_alias_keyboard(aliases)
             )
         except Exception:
             pass
         return
     if data.startswith(f"{CB_PICK}:"):
-        email = data.split(":", 1)[1]
-        alias = await db.find_alias(chat_id, email)
+        raw_id = data.split(":", 1)[1]
+        try:
+            alias_id = int(raw_id)
+        except ValueError:
+            await query.edit_message_text("Alias tidak valid.")
+            return
+        alias = await db.find_alias_by_id(chat_id, alias_id)
         if alias is None:
             await query.edit_message_text("Alias tidak ditemukan.")
             return
@@ -404,23 +415,61 @@ class TelegramNotifier(Notifier):
         alias_email: str,
         summary: dict[str, str],
     ) -> None:
-        body = summary.get("body") or "(tidak ada isi text)"
-        text = (
-            f"<b>Email masuk untuk</b> <code>{html.escape(alias_email)}</code>\n"
-            f"<b>Dari:</b> {html.escape(summary.get('from', '?'))}\n"
-            f"<b>Subjek:</b> {html.escape(summary.get('subject', ''))}\n"
-            f"<b>Tanggal:</b> {html.escape(summary.get('date', ''))}\n\n"
-            f"<pre>{html.escape(body)}</pre>\n\n"
-            "Alias ini sudah dihapus dari daftar. /list untuk lihat sisanya."
-        )
-        # Telegram message limit is 4096 chars; trim defensively.
-        if len(text) > 4000:
-            text = text[:4000] + "\n…(dipotong)"
         await self._application.bot.send_message(
             chat_id=chat_id,
-            text=text,
+            text=_render_email_message(alias_email, summary),
             parse_mode=ParseMode.HTML,
         )
+
+
+# Telegram caps each message at 4096 characters; we leave headroom for the rendered
+# trailer that the helper below appends when truncating.
+_TELEGRAM_MESSAGE_LIMIT = 4000
+_TRUNCATION_MARKER = "\n…(dipotong)"
+
+
+def _render_email_message(alias_email: str, summary: dict[str, str]) -> str:
+    """Render the email-received Telegram message safely under the 4096-byte limit.
+
+    The body is truncated *before* HTML escaping/assembly so we never split an HTML
+    tag (e.g. ``<pre>``) or an entity (e.g. ``&amp;``) at the byte boundary, which
+    would cause Telegram's HTML parser to reject the message.
+    """
+    body = summary.get("body") or "(tidak ada isi text)"
+    header = (
+        f"<b>Email masuk untuk</b> <code>{html.escape(alias_email)}</code>\n"
+        f"<b>Dari:</b> {html.escape(summary.get('from', '?'))}\n"
+        f"<b>Subjek:</b> {html.escape(summary.get('subject', ''))}\n"
+        f"<b>Tanggal:</b> {html.escape(summary.get('date', ''))}\n\n"
+    )
+    footer = "\n\nAlias ini sudah dihapus dari daftar. /list untuk lihat sisanya."
+    overhead = len(header) + len("<pre></pre>") + len(footer)
+    available = _TELEGRAM_MESSAGE_LIMIT - overhead
+    truncated = False
+    if available <= 0:
+        # Pathological case where the headers themselves exceed the budget.
+        body_rendered = ""
+        truncated = True
+    else:
+        escaped = html.escape(body)
+        if len(escaped) <= available:
+            body_rendered = escaped
+        else:
+            # Re-escape only the portion of the raw body that fits, leaving room
+            # for the truncation marker on its own line.
+            marker_budget = len(_TRUNCATION_MARKER)
+            target = max(available - marker_budget, 0)
+            shrunk = body
+            while shrunk and len(html.escape(shrunk)) > target:
+                # Drop characters from the end until the escaped form fits.
+                shrunk = shrunk[: max(len(shrunk) - 32, 0)]
+            body_rendered = html.escape(shrunk)
+            truncated = True
+    text = f"{header}<pre>{body_rendered}</pre>"
+    if truncated:
+        text += _TRUNCATION_MARKER
+    text += footer
+    return text
 
 
 # --------------------------------------------------------------- registration

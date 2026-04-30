@@ -52,6 +52,11 @@ async def test_alias_lifecycle(db: Database) -> None:
 
     alias = await db.find_alias(1, "A@proton.me")
     assert alias is not None and alias.status == AliasStatus.AVAILABLE
+    by_id = await db.find_alias_by_id(1, alias.id)
+    assert by_id is not None and by_id.email == "a@proton.me"
+    assert await db.find_alias_by_id(1, 9999) is None
+    # find_alias_by_id is scoped to chat_id, so a stranger can't find it.
+    assert await db.find_alias_by_id(2, alias.id) is None
     await db.mark_consumed(alias.id, message_id="<msg-1@example>")
 
     available = await db.list_aliases(1, status=AliasStatus.AVAILABLE)
