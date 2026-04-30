@@ -85,26 +85,32 @@ class IMAPListener:
 
     async def _run_session(self) -> None:
         client = self._build_client()
-        await client.wait_hello_from_server()
-        await client.login(self._credentials.username, self._credentials.password)
         try:
+            await client.wait_hello_from_server()
+            await client.login(self._credentials.username, self._credentials.password)
             await client.select(self._mailbox)
             await self._initialize_uid_baseline(client)
+            # Always pick up anything that arrived between connections before going idle.
+            await self._fetch_new_messages(client)
             while not self._stop_event.is_set():
-                if not client.has_pending_idle_command():
-                    idle_task = await client.idle_start(timeout=IDLE_TIMEOUT_SECONDS)
-                else:
-                    idle_task = None
-                got_event = await self._wait_for_idle_event(client, idle_task)
-                if client.has_pending_idle_command():
+                idle_task = await client.idle_start(timeout=IDLE_TIMEOUT_SECONDS)
+                # wait_server_push() returns when the server sends an unsolicited
+                # response (EXISTS / RECENT / EXPUNGE) or when the IDLE timeout
+                # we passed to idle_start fires its sentinel. We always re-check
+                # for new UIDs after IDLE ends, regardless of which case it was.
+                try:
+                    await client.wait_server_push(timeout=IDLE_TIMEOUT_SECONDS + 30)
+                except TimeoutError:
+                    pass
+                if client.has_pending_idle():
                     client.idle_done()
-                    if idle_task is not None:
-                        try:
-                            await asyncio.wait_for(idle_task, timeout=10)
-                        except TimeoutError:
-                            LOGGER.debug("idle_done acknowledgement timed out for chat %s", self.chat_id)
-                if got_event:
-                    await self._fetch_new_messages(client)
+                try:
+                    await asyncio.wait_for(idle_task, timeout=10)
+                except TimeoutError:
+                    LOGGER.debug(
+                        "idle_done acknowledgement timed out for chat %s", self.chat_id
+                    )
+                await self._fetch_new_messages(client)
         finally:
             try:
                 await client.logout()
@@ -132,18 +138,6 @@ class IMAPListener:
             self._last_seen_uid,
             self._mailbox,
         )
-
-    async def _wait_for_idle_event(
-        self,
-        client: aioimaplib.IMAP4,
-        idle_task: asyncio.Future[object] | None,
-    ) -> bool:
-        queue = client.idle_queue
-        try:
-            await asyncio.wait_for(queue.get(), timeout=IDLE_TIMEOUT_SECONDS)
-            return True
-        except TimeoutError:
-            return False
 
     async def _fetch_new_messages(self, client: aioimaplib.IMAP4) -> None:
         response = await client.uid_search(f"UID {self._last_seen_uid + 1}:*")
