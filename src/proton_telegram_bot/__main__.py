@@ -40,7 +40,12 @@ def _build_application(settings: Settings) -> Application:
     db = Database(settings.database_path)
     cipher = CredentialCipher(settings.encryption_key)
     notifier = TelegramNotifier(application)
-    manager = ListenerManager(db=db, cipher=cipher, notifier=notifier)
+    manager = ListenerManager(
+        db=db,
+        cipher=cipher,
+        notifier=notifier,
+        alias_sync_interval=settings.alias_sync_interval_minutes * 60,
+    )
     application.bot_data["settings"] = settings
     application.bot_data["db"] = db
     application.bot_data["cipher"] = cipher

@@ -72,6 +72,7 @@ python -m proton_telegram_bot
 | `DATABASE_PATH` | no | SQLite file path. Default: `data/bot.sqlite3`. |
 | `ALLOWED_USER_IDS` | no | Comma-separated list of Telegram user IDs allowed to use the bot. Empty = anyone. |
 | `LOG_LEVEL` | no | `DEBUG`, `INFO`, `WARNING`, or `ERROR`. Default: `INFO`. |
+| `ALIAS_SYNC_INTERVAL_MINUTES` | no | How often (in minutes) to re-scan the inbox for new aliases. Default: `5`. |
 
 ## Telegram commands
 

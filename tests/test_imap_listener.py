@@ -36,10 +36,7 @@ def test_aioimaplib_public_api_exists() -> None:
         "select",
         "uid_search",
         "uid",
-        "idle_start",
-        "wait_server_push",
-        "idle_done",
-        "has_pending_idle",
+        "noop",
         "logout",
     ):
         assert hasattr(aioimaplib.IMAP4, name), f"aioimaplib.IMAP4 lost {name}()"
@@ -55,10 +52,12 @@ def test_listener_does_not_use_protocol_internal_names() -> None:
     ).read_text()
     assert "has_pending_idle_command" not in src
     assert ".idle_queue" not in src
-    # And we *do* use the real ones.
-    assert "has_pending_idle()" in src
-    assert "wait_server_push" in src
-    assert "idle_done()" in src
+    # Polling mode uses noop() instead of IDLE.
+    assert "noop()" in src
+    assert "POLL_INTERVAL_SECONDS" in src
+    # Alias auto-discovery via inbox scan.
+    assert "_scan_inbox_aliases" in src
+    assert "extract_recipients" in src
 
 
 # --------------------------------------------------------------------------- #
@@ -227,3 +226,72 @@ async def test_fetch_skips_uids_already_seen() -> None:
 
     assert received == ["11"]
     assert listener._last_seen_uid == 11
+
+
+# --------------------------------------------------------------------------- #
+# 5. Inbox alias scan: discovers recipient addresses from existing messages.
+# --------------------------------------------------------------------------- #
+
+
+class _ScanClient:
+    """Stub that supports uid_search ALL + uid fetch BODY.PEEK[HEADER]."""
+
+    def __init__(self, headers: dict[int, bytes]) -> None:
+        self._headers = headers
+
+    async def uid_search(self, criteria: str) -> _Response:
+        uids = b" ".join(str(u).encode() for u in self._headers)
+        return _Response("OK", [uids])
+
+    async def uid(self, command: str, uid: str, *_: Any) -> _Response:
+        payload = self._headers[int(uid)]
+        return _Response(
+            "OK",
+            [
+                f"* {uid} FETCH (UID {uid} BODY[HEADER] {{{len(payload)}}})".encode(),
+                payload,
+                b")",
+            ],
+        )
+
+
+@pytest.mark.asyncio
+async def test_scan_inbox_aliases_discovers_recipients() -> None:
+    discovered: list[tuple[int, set[str]]] = []
+
+    async def on_discovery(chat_id: int, addrs: set[str]) -> None:
+        discovered.append((chat_id, addrs))
+
+    creds = BridgeCredentials(host="127.0.0.1", port=1143, username="u", password="p")
+    listener = IMAPListener(
+        chat_id=99,
+        credentials=creds,
+        on_new_message=lambda *_: _async_noop(),
+        on_aliases_discovered=on_discovery,
+    )
+    fake = _ScanClient(
+        headers={
+            1: b"To: alice@proton.me\r\nFrom: bob@example.com\r\n\r\n",
+            2: b"To: charlie@proton.me\r\nCc: alice@proton.me\r\nFrom: dave@example.com\r\n\r\n",
+        },
+    )
+
+    await listener._scan_inbox_aliases(fake)  # type: ignore[arg-type]
+
+    assert len(discovered) == 1
+    chat_id, addrs = discovered[0]
+    assert chat_id == 99
+    assert addrs == {"alice@proton.me", "charlie@proton.me"}
+
+
+@pytest.mark.asyncio
+async def test_scan_inbox_aliases_skipped_without_callback() -> None:
+    """When no discovery callback is set, _scan_inbox_aliases is a no-op."""
+    creds = BridgeCredentials(host="127.0.0.1", port=1143, username="u", password="p")
+    listener = IMAPListener(
+        chat_id=1,
+        credentials=creds,
+        on_new_message=lambda *_: _async_noop(),
+    )
+    # Should not raise even with a None callback.
+    await listener._scan_inbox_aliases(object())  # type: ignore[arg-type]

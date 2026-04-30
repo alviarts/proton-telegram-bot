@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     # validators run, which makes a comma-separated value awkward.
     allowed_user_ids_raw: str = Field(default="", alias="ALLOWED_USER_IDS")
     log_level: str = Field(default="INFO")
+    alias_sync_interval_minutes: int = Field(default=5)
 
     @computed_field  # type: ignore[prop-decorator]
     @property
