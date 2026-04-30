@@ -36,10 +36,7 @@ def test_aioimaplib_public_api_exists() -> None:
         "select",
         "uid_search",
         "uid",
-        "idle_start",
-        "wait_server_push",
-        "idle_done",
-        "has_pending_idle",
+        "noop",
         "logout",
     ):
         assert hasattr(aioimaplib.IMAP4, name), f"aioimaplib.IMAP4 lost {name}()"
@@ -55,10 +52,9 @@ def test_listener_does_not_use_protocol_internal_names() -> None:
     ).read_text()
     assert "has_pending_idle_command" not in src
     assert ".idle_queue" not in src
-    # And we *do* use the real ones.
-    assert "has_pending_idle()" in src
-    assert "wait_server_push" in src
-    assert "idle_done()" in src
+    # Polling mode uses noop() instead of IDLE.
+    assert "noop()" in src
+    assert "POLL_INTERVAL_SECONDS" in src
 
 
 # --------------------------------------------------------------------------- #

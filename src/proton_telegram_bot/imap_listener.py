@@ -1,4 +1,9 @@
-"""Long-running IMAP IDLE listener for a single Proton Bridge account."""
+"""Long-running IMAP listener for a single Proton Bridge account.
+
+Uses short-interval polling (default 5 s) instead of IMAP IDLE so that new
+mail is detected reliably even when the server's IDLE implementation is
+incomplete (as is the case with Proton Mail Bridge).
+"""
 from __future__ import annotations
 
 import asyncio
@@ -17,8 +22,8 @@ LOGGER = logging.getLogger(__name__)
 NewMessageCallback = Callable[[int, Message, str], Awaitable[None]]
 """Callback signature: (chat_id, parsed_message, raw_uid)."""
 
-# Conservative IDLE timeout. RFC 2177 recommends re-issuing IDLE every ~29 minutes.
-IDLE_TIMEOUT_SECONDS = 25 * 60
+# How often the listener polls for new messages (seconds).
+POLL_INTERVAL_SECONDS = 5
 RECONNECT_BACKOFF_SECONDS = (5, 15, 30, 60, 120)
 FETCH_RESPONSE_RE = re.compile(rb"^\* \d+ FETCH ", re.IGNORECASE)
 
@@ -90,27 +95,24 @@ class IMAPListener:
             await client.login(self._credentials.username, self._credentials.password)
             await client.select(self._mailbox)
             await self._initialize_uid_baseline(client)
-            # Always pick up anything that arrived between connections before going idle.
-            await self._fetch_new_messages(client)
+
+            # Poll for new messages every POLL_INTERVAL_SECONDS.
             while not self._stop_event.is_set():
-                idle_task = await client.idle_start(timeout=IDLE_TIMEOUT_SECONDS)
-                # wait_server_push() returns when the server sends an unsolicited
-                # response (EXISTS / RECENT / EXPUNGE) or when the IDLE timeout
-                # we passed to idle_start fires its sentinel. We always re-check
-                # for new UIDs after IDLE ends, regardless of which case it was.
+                await self._fetch_new_messages(client)
                 try:
-                    await client.wait_server_push(timeout=IDLE_TIMEOUT_SECONDS + 30)
+                    await asyncio.wait_for(
+                        self._stop_event.wait(), timeout=POLL_INTERVAL_SECONDS
+                    )
                 except TimeoutError:
                     pass
-                if client.has_pending_idle():
-                    client.idle_done()
+
+                # Re-issue NOOP to keep the connection alive and trigger
+                # server-side mailbox updates before the next search.
                 try:
-                    await asyncio.wait_for(idle_task, timeout=10)
-                except TimeoutError:
-                    LOGGER.debug(
-                        "idle_done acknowledgement timed out for chat %s", self.chat_id
-                    )
-                await self._fetch_new_messages(client)
+                    await client.noop()
+                except Exception:
+                    LOGGER.debug("NOOP failed for chat %s, reconnecting", self.chat_id)
+                    break
         finally:
             try:
                 await client.logout()
