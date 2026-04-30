@@ -160,6 +160,52 @@ async def test_fetch_new_messages_dispatches_each_uid_once() -> None:
     assert [msg["Subject"] for _, msg, _ in received] == ["Hi", "Hi2"]
 
 
+class _BaselineProbeClient:
+    """Records each call to ``uid_search`` so we can assert it wasn't issued."""
+
+    def __init__(self, uids_to_return: bytes) -> None:
+        self._uids_to_return = uids_to_return
+        self.searches: list[str] = []
+
+    async def uid_search(self, criteria: str) -> _Response:
+        self.searches.append(criteria)
+        return _Response("OK", [self._uids_to_return])
+
+
+@pytest.mark.asyncio
+async def test_baseline_is_preserved_across_reconnects() -> None:
+    """On the first successful session the listener seeds the baseline from
+    ``UID SEARCH ALL``; on reconnect it must NOT re-seed, otherwise UIDs that
+    arrived while the connection was down get folded into the new baseline and
+    are silently lost (regression of Devin Review BUG_*_0001)."""
+    creds = BridgeCredentials(host="127.0.0.1", port=1143, username="u", password="p")
+    listener = IMAPListener(
+        chat_id=1, credentials=creds, on_new_message=lambda *_: _async_noop()
+    )
+
+    # First connection: empty mailbox → baseline 0.
+    fake1 = _BaselineProbeClient(b"")
+    await listener._initialize_uid_baseline(fake1)  # type: ignore[arg-type]
+    assert listener._last_seen_uid == 0
+    assert fake1.searches == ["ALL"]
+
+    # First message arrives in this session — listener advances watermark to 101.
+    listener._last_seen_uid = 101
+
+    # Connection drops. While disconnected, UIDs 102 and 103 arrive on the server.
+    # On reconnect, _initialize_uid_baseline must NOT issue UID SEARCH ALL —
+    # otherwise it would set _last_seen_uid to 103 and _fetch_new_messages
+    # (which searches UID > _last_seen_uid) would never see 102 or 103.
+    fake2 = _BaselineProbeClient(b"102 103")
+    await listener._initialize_uid_baseline(fake2)  # type: ignore[arg-type]
+    assert fake2.searches == [], "must not re-seed baseline on reconnect"
+    assert listener._last_seen_uid == 101
+
+
+async def _async_noop() -> None:
+    return None
+
+
 @pytest.mark.asyncio
 async def test_fetch_skips_uids_already_seen() -> None:
     received: list[str] = []

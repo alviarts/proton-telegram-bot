@@ -127,6 +127,16 @@ class IMAPListener:
         )
 
     async def _initialize_uid_baseline(self, client: aioimaplib.IMAP4) -> None:
+        # Only seed the baseline on the *first* successful session — on reconnects
+        # we must preserve the previous high-water mark so messages that arrived
+        # while the connection was down are still picked up by _fetch_new_messages.
+        if self._last_seen_uid > 0:
+            LOGGER.debug(
+                "chat %s preserving baseline UID %s across reconnect",
+                self.chat_id,
+                self._last_seen_uid,
+            )
+            return
         response = await client.uid_search("ALL")
         if response.result != "OK":
             return
