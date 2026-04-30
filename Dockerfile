@@ -2,6 +2,8 @@ FROM python:3.12-slim AS base
 
 WORKDIR /app
 
+RUN apt-get update && apt-get install -y --no-install-recommends gnupg && rm -rf /var/lib/apt/lists/*
+
 RUN adduser --disabled-password --gecos "" botuser
 
 COPY pyproject.toml README.md LICENSE ./

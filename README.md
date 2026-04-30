@@ -167,6 +167,7 @@ and note the credentials it provides:
 | `/connect` | Guided dialog to store your Proton Bridge IMAP credentials. |
 | `/disconnect` | Delete stored credentials and stop watching your inbox. |
 | `/addalias a@b.com c@d.com …` | Register one or more aliases. Repeats are ignored. |
+| `/sync user password` | Auto-sync all addresses from your Proton account. |
 | `/removealias a@b.com` | Forget an alias entirely. |
 | `/list` | Show available aliases as inline buttons. |
 | `/history` | Show aliases that already received their email. |

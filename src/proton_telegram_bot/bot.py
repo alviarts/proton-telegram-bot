@@ -1,6 +1,7 @@
 """Telegram bot wiring: handlers, menus, and notifier implementation."""
 from __future__ import annotations
 
+import asyncio
 import html
 import logging
 from typing import cast
@@ -200,6 +201,49 @@ async def cmd_addalias(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     msg = f"Ditambahkan: {inserted} alias."
     if skipped:
         msg += f" Sudah ada sebelumnya: {skipped}."
+    aliases = await db.list_aliases(chat.id, status=AliasStatus.AVAILABLE)
+    await update.effective_message.reply_text(  # type: ignore[union-attr]
+        msg,
+        reply_markup=_build_alias_keyboard(aliases),
+    )
+
+
+@_gate
+async def cmd_sync(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Fetch addresses from the Proton API and add them as aliases."""
+    chat = update.effective_chat
+    if chat is None:
+        return
+    args = context.args or []
+    if len(args) < 2:
+        await update.effective_message.reply_text(  # type: ignore[union-attr]
+            "Pakai: /sync <username_proton> <password_proton>\n"
+            "Contoh: /sync vielz43 passwordku\n\n"
+            "Username dan password akun Proton (bukan Bridge)."
+        )
+        return
+    username, password = args[0], " ".join(args[1:])
+    await update.effective_message.reply_text("Menghubungi Proton API...")  # type: ignore[union-attr]
+    try:
+        from .proton_api import fetch_addresses
+
+        addresses = await asyncio.to_thread(fetch_addresses, username, password)
+    except Exception as exc:
+        LOGGER.exception("proton API sync failed")
+        await update.effective_message.reply_text(  # type: ignore[union-attr]
+            f"Gagal mengambil alamat dari Proton: {exc}"
+        )
+        return
+    if not addresses:
+        await update.effective_message.reply_text("Tidak ada alamat aktif di akun Proton.")  # type: ignore[union-attr]
+        return
+    db = _bot_db(context)
+    inserted = await db.add_aliases(chat.id, addresses)
+    total = len(addresses)
+    skipped = total - inserted
+    msg = f"Sync selesai! Ditemukan {total} alamat.\nDitambahkan: {inserted}."
+    if skipped:
+        msg += f" Sudah ada: {skipped}."
     aliases = await db.list_aliases(chat.id, status=AliasStatus.AVAILABLE)
     await update.effective_message.reply_text(  # type: ignore[union-attr]
         msg,
@@ -495,6 +539,7 @@ def build_handlers() -> list:
         CommandHandler("list", cmd_list),
         CommandHandler("history", cmd_history),
         CommandHandler("addalias", cmd_addalias),
+        CommandHandler("sync", cmd_sync),
         CommandHandler("removealias", cmd_removealias),
         CommandHandler("reset", cmd_reset),
         CommandHandler("disconnect", cmd_disconnect),
