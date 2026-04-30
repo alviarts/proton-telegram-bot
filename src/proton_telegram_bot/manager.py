@@ -7,11 +7,14 @@ from email.message import Message
 
 from .crypto import CredentialCipher
 from .db import Database, credentials_from_user
-from .email_parser import find_matching_alias, summarize
+from .email_parser import extract_recipients, find_matching_alias, summarize
 from .imap_listener import IMAPListener
 from .models import AliasStatus
 
 LOGGER = logging.getLogger(__name__)
+
+# Default sync interval in seconds (5 minutes).
+DEFAULT_ALIAS_SYNC_INTERVAL = 300
 
 
 class ListenerManager:
@@ -22,10 +25,12 @@ class ListenerManager:
         db: Database,
         cipher: CredentialCipher,
         notifier: Notifier,
+        alias_sync_interval: int = DEFAULT_ALIAS_SYNC_INTERVAL,
     ) -> None:
         self._db = db
         self._cipher = cipher
         self._notifier = notifier
+        self._alias_sync_interval = alias_sync_interval
         self._listeners: dict[int, IMAPListener] = {}
         self._lock = asyncio.Lock()
 
@@ -51,6 +56,8 @@ class ListenerManager:
                 chat_id=chat_id,
                 credentials=credentials,
                 on_new_message=self._handle_new_message,
+                on_aliases_discovered=self._handle_discovered_aliases,
+                alias_sync_interval=self._alias_sync_interval,
             )
             listener.start()
             self._listeners[chat_id] = listener
@@ -77,6 +84,15 @@ class ListenerManager:
         message: Message,
         uid: str,
     ) -> None:
+        # Auto-add any new recipient addresses found in this message.
+        recipients = extract_recipients(message)
+        if recipients:
+            added = await self._db.add_aliases(chat_id, list(recipients))
+            if added > 0:
+                LOGGER.info(
+                    "chat %s auto-added %d alias(es) from uid %s", chat_id, added, uid
+                )
+
         available = await self._db.list_aliases(chat_id, status=AliasStatus.AVAILABLE)
         candidate_emails = {row.email for row in available}
         if not candidate_emails:
@@ -94,6 +110,25 @@ class ListenerManager:
         summary = summarize(message)
         await self._notifier.notify_email_received(chat_id, alias.email, summary)
 
+    async def _handle_discovered_aliases(
+        self,
+        chat_id: int,
+        addresses: set[str],
+    ) -> None:
+        """Auto-add aliases discovered during inbox scan."""
+        added = await self._db.add_aliases(chat_id, list(addresses))
+        if added > 0:
+            LOGGER.info(
+                "chat %s inbox scan added %d new alias(es) from %d discovered",
+                chat_id,
+                added,
+                len(addresses),
+            )
+            await self._notifier.notify_aliases_discovered(
+                chat_id,
+                [a for a in addresses if await self._db.find_alias(chat_id, a) is not None],
+            )
+
 
 class Notifier:
     """Tiny adapter so the manager can deliver notifications without importing telegram types."""
@@ -105,3 +140,10 @@ class Notifier:
         summary: dict[str, str],
     ) -> None:  # pragma: no cover - implemented by the bot module
         raise NotImplementedError
+
+    async def notify_aliases_discovered(
+        self,
+        chat_id: int,
+        aliases: list[str],
+    ) -> None:  # pragma: no cover - implemented by the bot module
+        pass
