@@ -113,20 +113,37 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     db = _bot_db(context)
     await db.upsert_user(chat.id)
     user = await db.get_user(chat.id)
+    commands_help = (
+        "\n\n<b>Perintah yang tersedia:</b>\n"
+        "/start — Tampilkan pesan ini\n"
+        "/connect — Setup kredensial IMAP Proton Bridge\n"
+        "/disconnect — Hapus kredensial dan stop listener\n"
+        "/sync &lt;user&gt; &lt;pass&gt; — Auto-sync alias dari akun Proton\n"
+        "/addalias — Tambah alias secara manual\n"
+        "/removealias — Hapus alias\n"
+        "/list — Lihat alias yang masih tersedia\n"
+        "/history — Lihat alias yang sudah terpakai\n"
+        "/reset — Kembalikan alias ke daftar tersedia\n"
+        "/cancel — Batalkan dialog /connect"
+    )
     if user is None or not user.has_credentials:
         await update.effective_message.reply_text(  # type: ignore[union-attr]
             "Halo! Aku akan memberitahumu kalau ada email masuk ke alias Proton-mu.\n\n"
             "Langkah:\n"
             "1) Jalankan Proton Bridge di komputermu (atau VPS).\n"
             "2) Kirim /connect untuk memasukkan detail IMAP dari Bridge.\n"
-            "3) Kirim /addalias diikuti daftar alamat alias-mu.\n"
+            "3) Kirim /sync untuk auto-sync alias dari akun Proton, "
+            "atau /addalias untuk tambah manual.\n"
             "4) Kirim /list untuk melihat alias yang masih tersedia."
+            + commands_help,
+            parse_mode=ParseMode.HTML,
         )
         return
     aliases = await db.list_aliases(chat.id, status=AliasStatus.AVAILABLE)
     await update.effective_message.reply_text(  # type: ignore[union-attr]
-        "Halo! Berikut alias yang masih tersedia:",
+        "Halo! Berikut alias yang masih tersedia:" + commands_help,
         reply_markup=_build_alias_keyboard(aliases),
+        parse_mode=ParseMode.HTML,
     )
 
 
