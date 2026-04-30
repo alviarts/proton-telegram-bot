@@ -44,7 +44,7 @@ aliases.
 > private channel (e.g. SSH tunnel, WireGuard). Don't expose Bridge
 > directly to the public internet.
 
-## Setup
+## Quick start (local)
 
 ```bash
 git clone https://github.com/alviarts/proton-telegram-bot.git
@@ -62,6 +62,92 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 
 python -m proton_telegram_bot
 ```
+
+## Deployment
+
+### Option A — Docker (recommended)
+
+The simplest way to deploy on a VPS that already runs Proton Bridge.
+
+```bash
+git clone https://github.com/alviarts/proton-telegram-bot.git
+cd proton-telegram-bot
+
+cp .env.example .env
+# edit .env — fill in TELEGRAM_BOT_TOKEN and ENCRYPTION_KEY
+
+docker compose up -d          # build & start
+docker compose logs -f bot    # tail logs
+```
+
+`docker-compose.yml` uses `network_mode: host` so the bot can reach
+Bridge on `127.0.0.1:1143` without extra configuration. Data is
+persisted in a Docker volume (`bot-data`).
+
+Useful commands:
+
+```bash
+docker compose down            # stop
+docker compose up -d --build   # rebuild after a code update
+docker compose logs -f bot     # watch live logs
+```
+
+### Option B — systemd service (no Docker)
+
+1. Clone and install on your server:
+
+```bash
+sudo useradd -r -s /usr/sbin/nologin botuser
+sudo mkdir -p /opt/proton-telegram-bot
+sudo chown botuser:botuser /opt/proton-telegram-bot
+
+sudo -u botuser git clone https://github.com/alviarts/proton-telegram-bot.git /opt/proton-telegram-bot
+cd /opt/proton-telegram-bot
+sudo -u botuser python3 -m venv .venv
+sudo -u botuser .venv/bin/pip install .
+```
+
+2. Configure:
+
+```bash
+sudo -u botuser cp .env.example .env
+sudo -u botuser nano .env
+# fill in TELEGRAM_BOT_TOKEN and ENCRYPTION_KEY
+
+# generate key:
+python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
+
+3. Install and start the service:
+
+```bash
+sudo cp deploy/proton-telegram-bot.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now proton-telegram-bot
+
+# check status
+sudo systemctl status proton-telegram-bot
+sudo journalctl -u proton-telegram-bot -f
+```
+
+### Proton Bridge setup
+
+The bot connects to Proton Bridge via IMAP. Make sure Bridge is running
+and note the credentials it provides:
+
+1. Install [Proton Mail Bridge](https://proton.me/mail/bridge) on your
+   server or local machine.
+2. Log in with your Proton account.
+3. In Bridge, go to the account settings and note:
+   - **IMAP host**: usually `127.0.0.1`
+   - **IMAP port**: usually `1143`
+   - **Username**: your Proton email address
+   - **Password**: the Bridge-generated password (not your Proton password)
+4. Use these credentials when running `/connect` in the Telegram bot.
+
+> **Headless server?** Proton Bridge has a CLI mode:
+> `protonmail-bridge --cli`. See the
+> [Bridge documentation](https://proton.me/support/bridge) for details.
 
 ## Environment variables
 
@@ -81,6 +167,7 @@ python -m proton_telegram_bot
 | `/connect` | Guided dialog to store your Proton Bridge IMAP credentials. |
 | `/disconnect` | Delete stored credentials and stop watching your inbox. |
 | `/addalias a@b.com c@d.com …` | Register one or more aliases. Repeats are ignored. |
+| `/sync user password` | Auto-sync all addresses from your Proton account. |
 | `/removealias a@b.com` | Forget an alias entirely. |
 | `/list` | Show available aliases as inline buttons. |
 | `/history` | Show aliases that already received their email. |
@@ -108,6 +195,8 @@ state is fully isolated.
   chat history as you would your inbox.
 - Never commit your `.env` or the SQLite database. Both are excluded
   by `.gitignore`.
+- Set `ALLOWED_USER_IDS` to restrict access to your Telegram user ID
+  only. Without it anyone who finds your bot can use it.
 
 ## License
 
