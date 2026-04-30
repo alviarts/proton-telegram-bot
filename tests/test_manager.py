@@ -85,7 +85,7 @@ async def test_handle_message_auto_adds_new_recipient(db: Database) -> None:
 
 
 async def test_discovered_aliases_adds_and_notifies(db: Database) -> None:
-    """Inbox scan discovers new addresses and notifies the user."""
+    """Inbox scan discovers new addresses and notifies only the new ones."""
     chat_id = 42
     await db.upsert_user(chat_id)
     await db.add_aliases(chat_id, ["existing@proton.me"])
@@ -106,6 +106,8 @@ async def test_discovered_aliases_adds_and_notifies(db: Database) -> None:
     ]
     assert len(notifier.discovery_calls) == 1
     assert notifier.discovery_calls[0][0] == chat_id
+    # Only the NEW aliases should be in the notification, not the pre-existing one.
+    assert sorted(notifier.discovery_calls[0][1]) == ["new1@proton.me", "new2@proton.me"]
 
 
 async def test_handle_message_does_not_rematch_consumed_alias(db: Database) -> None:
