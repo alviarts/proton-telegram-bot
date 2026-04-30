@@ -116,18 +116,17 @@ class ListenerManager:
         addresses: set[str],
     ) -> None:
         """Auto-add aliases discovered during inbox scan."""
+        existing = {a.email for a in await self._db.list_aliases(chat_id)}
         added = await self._db.add_aliases(chat_id, list(addresses))
         if added > 0:
+            new_aliases = sorted(addresses - existing)
             LOGGER.info(
                 "chat %s inbox scan added %d new alias(es) from %d discovered",
                 chat_id,
                 added,
                 len(addresses),
             )
-            await self._notifier.notify_aliases_discovered(
-                chat_id,
-                [a for a in addresses if await self._db.find_alias(chat_id, a) is not None],
-            )
+            await self._notifier.notify_aliases_discovered(chat_id, new_aliases)
 
 
 class Notifier:
