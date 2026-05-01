@@ -13,7 +13,7 @@ from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
 from typing import Any
 
-from .alias_gen import generate_batch
+from .alias_gen import generate_batch, iter_names
 from .crypto import CredentialCipher
 from .db import Database
 from .models import PrimaryAccount
@@ -103,19 +103,27 @@ async def run_batch(
         ) from exc
 
     state = await db.get_generator_state(chat_id, primary.id, base)
-    names, _next_state_unused = generate_batch(
-        base=base,
-        state=state,
-        count=count,
-        domain=domain,
-    )
+    domain_clean = domain.lstrip("@").lower()
 
     summary = BatchSummary(
         primary=primary,
         base=base,
         requested=count,
-        domain=domain.lstrip("@").lower(),
+        domain=domain_clean,
     )
+
+    # New semantics (per user feedback): ``count`` is the target number of
+    # SUCCESSFUL addresses, not the number of attempts. We generate names
+    # lazily from the iterator, advancing the cursor on every attempt
+    # (success OR failure -- once Proton has seen a name we should not
+    # try it again), and stop once ``successes == count`` or the safety
+    # cap kicks in. The cap exists so a Proton-side issue (e.g. every
+    # request returning ``ALREADY_EXISTS``) doesn't loop forever -- if we
+    # need 22 successes and have already attempted ``MAX_ATTEMPTS_FACTOR
+    # * 22 = 66`` names without getting there, something is structurally
+    # broken and bailing out is more useful than spinning.
+    max_attempts_factor = 3
+    max_attempts = max(count * max_attempts_factor, count + 10)
 
     if browser_factory is not None:
         factory = browser_factory
@@ -134,11 +142,18 @@ async def run_batch(
             # without waiting for the Playwright timeout to fire.
             if browser_handle is not None:
                 browser_handle["browser"] = browser
-            for index, full_email in enumerate(names, start=1):
+            successes = 0
+            attempts = 0
+            name_iter = iter_names(base, state)
+            while successes < count and attempts < max_attempts:
                 if cancel_event is not None and cancel_event.is_set():
                     summary.aborted_reason = "cancelled by user"
                     break
-                local = full_email.split("@", 1)[0]
+                # Pull the next candidate name; the iterator's post-state
+                # is reconstructed below from ``len(summary.results)`` so
+                # we don't track it here.
+                local, _ = next(name_iter)
+                attempts += 1
                 display = (
                     display_name_template.format(local=local)
                     if display_name_template
@@ -147,7 +162,7 @@ async def run_batch(
                 try:
                     result = await browser.create_address(
                         local=local,
-                        domain=summary.domain,
+                        domain=domain_clean,
                         display_name=display,
                         password_for_keygen=password,
                     )
@@ -183,16 +198,42 @@ async def run_batch(
 
                 summary.results.append(result)
                 if result.status is CreationStatus.SUCCESS:
+                    successes += 1
                     await db.add_aliases(
                         chat_id=chat_id,
                         emails=[result.email],
                         primary_id=primary.id,
                     )
                 if progress is not None:
-                    await progress(index, count, result)
+                    # Progress callback signature stays (current, target, result)
+                    # but ``current`` is now successes-so-far so the user sees
+                    # "5/22 sukses" advance only on real success. Failures still
+                    # show in the result detail so the UI can include them in a
+                    # secondary counter.
+                    await progress(successes, count, result)
                 if result.status is CreationStatus.LIMIT_REACHED:
                     summary.aborted_reason = "Proton reported address limit reached"
                     break
+                if (
+                    result.status is CreationStatus.AUTH_FAILED
+                ):
+                    # Auth failure mid-batch is unrecoverable: re-trying the
+                    # same password against the same locked account just
+                    # burns more retries.
+                    summary.aborted_reason = (
+                        "Proton rejected credentials mid-batch"
+                    )
+                    break
+
+            if (
+                successes < count
+                and attempts >= max_attempts
+                and summary.aborted_reason is None
+            ):
+                summary.aborted_reason = (
+                    f"safety cap reached after {attempts} attempts "
+                    f"(only {successes}/{count} succeeded)"
+                )
     except LoginFailedError as exc:
         raise AddressGenerationError(f"Proton login failed: {exc}") from exc
     except CaptchaInterruptError as exc:
@@ -207,20 +248,23 @@ async def run_batch(
         if browser_handle is not None:
             browser_handle.pop("browser", None)
 
-    # Persist the cursor advanced by however many names Proton ACCEPTED
-    # (success or already-exists). Names that errored aren't consumed, so a
-    # re-run picks them up again.
-    consumed = sum(
-        1
-        for r in summary.results
-        if r.status in (CreationStatus.SUCCESS, CreationStatus.ALREADY_EXISTS)
-    )
-    if consumed > 0:
-        # Re-derive the cursor by replaying the generator from the original
-        # state — this keeps alias_gen the single source of truth even when
-        # only a subset of the batch was consumed.
+    # Persist the cursor advanced by however many names we actually
+    # ATTEMPTED. With the new "loop until N successes" semantics every
+    # attempt -- success, already-exists, or transient error -- has been
+    # seen by Proton, so re-trying the same name on the next /genaddr
+    # would only burn more retries. The exception is when we couldn't
+    # even start (e.g. login failure before the first attempt) -- in
+    # that case ``summary.results`` is empty and the cursor stays put.
+    if summary.results:
+        # Re-derive the cursor by replaying the generator one step per
+        # attempt. This keeps alias_gen the single source of truth and
+        # avoids leaking the live ``cursor`` variable from inside the
+        # ``async with`` block (where exceptions may have unwound it).
         _, advanced = generate_batch(
-            base=base, state=state, count=consumed, domain=domain
+            base=base,
+            state=state,
+            count=len(summary.results),
+            domain=domain,
         )
         await db.save_generator_state(chat_id, primary.id, base, advanced)
 

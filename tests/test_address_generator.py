@@ -230,15 +230,25 @@ async def test_progress_callback_invoked_per_address(
 # ---------------------------------------------------------------- partial / abort paths
 
 
-async def test_already_exists_advances_cursor_but_not_aliases(
+async def test_already_exists_keeps_going_until_target_successes(
     db_and_primary, cipher: CredentialCipher
 ) -> None:
+    """Loop continues past an ALREADY_EXISTS until the success target is hit.
+
+    Under the "count = number of successful addresses" semantics, a
+    duplicate doesn't burn one of the requested 3 -- the orchestrator
+    keeps generating new names. We feed it three results: success,
+    already-exists, success, and on the 4th call the FakeBrowser
+    falls back to its default ``SUCCESS`` outcome.
+    """
     db, chat_id, primary = db_and_primary
     _, factory = _factory(
         [
             CreationStatus.SUCCESS,
             CreationStatus.ALREADY_EXISTS,
             CreationStatus.SUCCESS,
+            # 4th attempt: factory default SUCCESS -- needed because the
+            # ALREADY_EXISTS no longer counts toward the 3-success target.
         ]
     )
 
@@ -253,28 +263,33 @@ async def test_already_exists_advances_cursor_but_not_aliases(
         browser_factory=factory,
     )
 
-    assert len(summary.created) == 2
+    assert len(summary.created) == 3
     assert len(summary.already_existing) == 1
 
-    # Only the *successful* addresses are stored as aliases — duplicates that
-    # already exist on Proton's side aren't re-inserted (they would already
-    # be in /sync's view).
+    # Three actual successes are stored; the duplicate is skipped.
     aliases = await db.list_aliases(chat_id, primary_id=primary.id)
     assert sorted(a.email for a in aliases) == [
         "vielz001@proton.me",
         "vielz003@proton.me",
+        "vielz004@proton.me",
     ]
 
-    # Cursor still advanced past the duplicate (Proton accepted that name).
-    assert await db.get_generator_state(chat_id, primary.id, "vielz") == GenState("", 4)
+    # Cursor advanced one step per attempt -- four attempts -> 005.
+    assert await db.get_generator_state(chat_id, primary.id, "vielz") == GenState("", 5)
 
 
-async def test_error_does_not_advance_cursor(
+async def test_error_keeps_going_until_target_successes(
     db_and_primary, cipher: CredentialCipher
 ) -> None:
+    """A transient error doesn't burn a request slot either.
+
+    Old behaviour: 3 attempts, 1 failed -> 2 successes total.
+    New behaviour: keep going past the failure to reach 3 successes.
+    """
     db, chat_id, primary = db_and_primary
     _, factory = _factory(
         [CreationStatus.SUCCESS, CreationStatus.ERROR, CreationStatus.SUCCESS]
+        # 4th call: factory default SUCCESS.
     )
 
     summary = await run_batch(
@@ -288,12 +303,41 @@ async def test_error_does_not_advance_cursor(
         browser_factory=factory,
     )
 
-    assert len(summary.created) == 2
+    assert len(summary.created) == 3
     assert len(summary.failed) == 1
 
-    # Two acceptances → cursor at 003, not 004 — the failed name is retried
-    # next time.
-    assert await db.get_generator_state(chat_id, primary.id, "vielz") == GenState("", 3)
+    # Cursor advances one step PER ATTEMPT now -- the failed name is
+    # also consumed because Proton has already seen it. Re-trying the
+    # same number on the next /genaddr would just spend another attempt
+    # for nothing.
+    assert await db.get_generator_state(chat_id, primary.id, "vielz") == GenState("", 5)
+
+
+async def test_safety_cap_aborts_when_too_many_failures(
+    db_and_primary, cipher: CredentialCipher
+) -> None:
+    """If 3*count attempts fail to produce N successes, bail out cleanly."""
+    db, chat_id, primary = db_and_primary
+    # All ERROR -- never reaches success target.
+    _, factory = _factory([CreationStatus.ERROR] * 30)
+
+    summary = await run_batch(
+        db=db,
+        cipher=cipher,
+        chat_id=chat_id,
+        primary=primary,
+        base="vielz",
+        count=2,
+        domain="proton.me",
+        browser_factory=factory,
+    )
+
+    # count=2, max_attempts = max(2*3, 2+10) = 12 -- so we stop after 12
+    # attempts even though all failed.
+    assert len(summary.created) == 0
+    assert len(summary.failed) == 12
+    assert summary.aborted_reason is not None
+    assert "safety cap" in summary.aborted_reason
 
 
 async def test_limit_reached_aborts_batch(db_and_primary, cipher: CredentialCipher) -> None:

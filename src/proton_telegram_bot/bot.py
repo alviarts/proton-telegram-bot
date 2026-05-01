@@ -1035,20 +1035,31 @@ async def cmd_genaddr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     successes: list[str] = []
     failures: list[tuple[str, str]] = []
 
-    async def _on_progress(index: int, total: int, result) -> None:
+    async def _on_progress(success_count: int, target: int, result) -> None:
         # ``result`` is an AddressCreationResult — deliberately untyped here
         # to avoid widening the bot.py imports; we only use a few fields.
+        # ``success_count`` is the number of successful addresses so far
+        # (NOT the attempt index): the orchestrator now loops until we
+        # reach ``target`` successes, attempting more names if some fail.
         if result.status is CreationStatus.SUCCESS:
             successes.append(result.email)
         else:
             failures.append((result.email, result.status.value))
-        if index % GENADDR_PROGRESS_EVERY != 0 and index != total:
+        attempts = len(successes) + len(failures)
+        # Throttle by attempts (every Nth attempt OR when target reached)
+        # so failures still drive UI updates -- otherwise the bot would
+        # look frozen during a long string of duplicates.
+        if (
+            attempts % GENADDR_PROGRESS_EVERY != 0
+            and success_count != target
+            and result.status is not CreationStatus.SUCCESS
+        ):
             return
         try:
             await progress_message.edit_text(
-                f"⏳ <b>{index}/{total}</b> diproses pada "
+                f"✅ <b>{success_count}/{target}</b> sukses pada "
                 f"<b>{html.escape(primary.email)}</b>\n"
-                f"✅ {len(successes)} sukses · ⚠️ {len(failures)} gagal/duplikat\n"
+                f"⏳ {attempts} percobaan · ⚠️ {len(failures)} gagal/duplikat\n"
                 f"Terakhir: <code>{html.escape(result.email)}</code> "
                 f"({html.escape(result.status.value)})",
                 parse_mode=ParseMode.HTML,
