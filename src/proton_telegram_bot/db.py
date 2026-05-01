@@ -19,7 +19,8 @@ CREATE TABLE IF NOT EXISTS users (
     imap_username TEXT,
     imap_password_encrypted TEXT,
     imap_use_ssl INTEGER NOT NULL DEFAULT 0,
-    active_alias_id INTEGER REFERENCES aliases(id) ON DELETE SET NULL
+    active_alias_id INTEGER REFERENCES aliases(id) ON DELETE SET NULL,
+    active_primary_id INTEGER REFERENCES primary_accounts(id) ON DELETE SET NULL
 );
 
 CREATE TABLE IF NOT EXISTS aliases (
@@ -96,6 +97,14 @@ class Database:
         if "active_alias_id" not in user_cols:
             await self.conn.execute(
                 "ALTER TABLE users ADD COLUMN active_alias_id INTEGER"
+            )
+        if "active_primary_id" not in user_cols:
+            # Tracks which primary account is the "current" one for this
+            # chat. Set by ``/setprotonpw`` when the user picks an account
+            # and consumed by ``/genaddr`` so the next batch runs against
+            # the same primary the user just configured.
+            await self.conn.execute(
+                "ALTER TABLE users ADD COLUMN active_primary_id INTEGER"
             )
         async with self.conn.execute("PRAGMA table_info(aliases)") as cursor:
             alias_cols = {row["name"] for row in await cursor.fetchall()}
@@ -264,6 +273,33 @@ class Database:
             return None
         return await self.find_alias_by_id(chat_id, row["active_alias_id"])
 
+    async def set_active_primary(
+        self, chat_id: int, primary_id: int | None
+    ) -> None:
+        """Mark ``primary_id`` as the chat's current account.
+
+        Called when the user picks an account in ``/setprotonpw`` so that
+        subsequent commands (``/genaddr``, status banners, …) default to
+        the account they just configured instead of an arbitrary one.
+        """
+        await self.upsert_user(chat_id)
+        await self.conn.execute(
+            "UPDATE users SET active_primary_id = ? WHERE chat_id = ?",
+            (primary_id, chat_id),
+        )
+        await self.conn.commit()
+
+    async def get_active_primary_id(self, chat_id: int) -> int | None:
+        async with self.conn.execute(
+            "SELECT active_primary_id FROM users WHERE chat_id = ?",
+            (chat_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        value = row["active_primary_id"]
+        return int(value) if value is not None else None
+
     async def list_users_with_credentials(self) -> list[int]:
         async with self.conn.execute(
             "SELECT chat_id FROM users WHERE imap_password_encrypted IS NOT NULL"
@@ -370,6 +406,14 @@ class Database:
         # orphan aliases for an account the user just removed.
         await self.conn.execute(
             "DELETE FROM aliases WHERE chat_id = ? AND primary_id = ?",
+            (chat_id, primary_id),
+        )
+        # Clear ``active_primary_id`` if it points at the row we're about to
+        # delete. The schema added a FK with ``ON DELETE SET NULL`` but
+        # migrated DBs added the column without an FK, so do it explicitly.
+        await self.conn.execute(
+            "UPDATE users SET active_primary_id = NULL "
+            "WHERE chat_id = ? AND active_primary_id = ?",
             (chat_id, primary_id),
         )
         cursor = await self.conn.execute(
