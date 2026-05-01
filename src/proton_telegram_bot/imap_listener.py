@@ -233,30 +233,33 @@ class IMAPListener:
 
     @staticmethod
     def _parse_uids(lines: list[bytes | str]) -> list[int]:
-        """Extract UIDs from an IMAP SEARCH response.
+        """Extract UIDs from an aioimaplib SEARCH response.
 
-        Only digits that follow the "SEARCH" keyword are treated as UIDs.
-        Other untagged data (e.g. "JBND92 OK command completed in 1253 microsec",
-        "OK [HIGHESTMODSEQ 42]", "12 EXISTS") may also appear in
-        ``response.lines`` and must be ignored, otherwise we will try to fetch
-        bogus UIDs that don't exist.
+        ``aioimaplib`` strips the leading ``* SEARCH`` token before populating
+        ``response.lines``, so the data line is just whitespace-separated
+        digits (e.g. ``b"1 2 3 4 ... 64"``) followed by extra status lines
+        like ``b"command completed in 303 microsec."``. We only take tokens
+        from a line whose content is *entirely* digits, which discards both
+        the trailing OK status line and any untagged status data.
+
+        This guards against the regression where the OK status line's
+        microsec count was being parsed as a UID, causing the listener to
+        chase ghost UIDs that don't exist and silently drop real ones.
         """
         uids: list[int] = []
         for line in lines:
             if isinstance(line, bytes):
                 line = line.decode("ascii", errors="ignore")
             tokens = line.split()
-            try:
-                idx = tokens.index("SEARCH")
-            except ValueError:
+            if not tokens:
                 continue
-            for token in tokens[idx + 1 :]:
-                if token.isdigit():
-                    uids.append(int(token))
-                else:
-                    # Stop at the first non-digit token to avoid picking up
-                    # MODSEQ values or other annotations after the UID list.
-                    break
+            # Drop a leading ``SEARCH`` keyword if a future aioimaplib
+            # version stops stripping it for us.
+            if tokens[0].upper() == "SEARCH":
+                tokens = tokens[1:]
+            if not tokens or not all(t.isdigit() for t in tokens):
+                continue
+            uids.extend(int(t) for t in tokens)
         return uids
 
     @staticmethod

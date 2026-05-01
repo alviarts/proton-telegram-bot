@@ -144,7 +144,9 @@ async def test_fetch_new_messages_dispatches_each_uid_once() -> None:
     listener = IMAPListener(chat_id=42, credentials=creds, on_new_message=on_new)
     listener._last_seen_uid = 5
     fake = _FetchOnlyClient(
-        search_lines=[b"SEARCH 6 7"],
+        # Real aioimaplib returns the data line as just whitespace-separated
+        # digits, followed by an OK status line like 'command completed ...'.
+        search_lines=[b"6 7", b"command completed in 303 microsec."],
         fetch_payloads={
             6: b"From: a@x.example\r\nTo: target@proton.me\r\nSubject: Hi\r\n\r\nbody-6",
             7: b"From: b@x.example\r\nTo: other@proton.me\r\nSubject: Hi2\r\n\r\nbody-7",
@@ -183,7 +185,7 @@ async def test_baseline_is_preserved_across_reconnects() -> None:
     )
 
     # First connection: empty mailbox → baseline 0.
-    fake1 = _BaselineProbeClient(b"SEARCH")
+    fake1 = _BaselineProbeClient(b"")
     await listener._initialize_uid_baseline(fake1)  # type: ignore[arg-type]
     assert listener._last_seen_uid == 0
     assert fake1.searches == ["ALL"]
@@ -195,7 +197,7 @@ async def test_baseline_is_preserved_across_reconnects() -> None:
     # On reconnect, _initialize_uid_baseline must NOT issue UID SEARCH ALL —
     # otherwise it would set _last_seen_uid to 103 and _fetch_new_messages
     # (which searches UID > _last_seen_uid) would never see 102 or 103.
-    fake2 = _BaselineProbeClient(b"SEARCH 102 103")
+    fake2 = _BaselineProbeClient(b"102 103")
     await listener._initialize_uid_baseline(fake2)  # type: ignore[arg-type]
     assert fake2.searches == [], "must not re-seed baseline on reconnect"
     assert listener._last_seen_uid == 101
@@ -216,7 +218,7 @@ async def test_fetch_skips_uids_already_seen() -> None:
     listener = IMAPListener(chat_id=1, credentials=creds, on_new_message=on_new)
     listener._last_seen_uid = 10
     fake = _FetchOnlyClient(
-        search_lines=[b"SEARCH 7 11"],  # 7 is below the baseline; only 11 is new
+        search_lines=[b"7 11"],  # 7 is below the baseline; only 11 is new
         fetch_payloads={
             11: b"From: x@y.example\r\nTo: a@proton.me\r\nSubject: New\r\n\r\nbody",
         },
@@ -240,8 +242,8 @@ class _ScanClient:
         self._headers = headers
 
     async def uid_search(self, criteria: str) -> _Response:
-        uids = b"SEARCH " + b" ".join(str(u).encode() for u in self._headers)
-        return _Response("OK", [uids])
+        uids = b" ".join(str(u).encode() for u in self._headers)
+        return _Response("OK", [uids, b"command completed in 222 microsec."])
 
     async def uid(self, command: str, uid: str, *_: Any) -> _Response:
         payload = self._headers[int(uid)]
@@ -285,37 +287,41 @@ async def test_scan_inbox_aliases_discovers_recipients() -> None:
 
 
 def test_parse_uids_ignores_status_line_with_microsec_count() -> None:
-    """Regression: Proton Bridge OK status line ``JBND92 OK command completed
-    in 1253 microsec.`` was being parsed as UID 1253 by the previous greedy
-    digit extractor, causing the listener to chase ghost UIDs that don't
-    exist and ignore the real ones."""
+    """Regression: Proton Bridge OK status line ``command completed in 1253
+    microsec.`` was being parsed as UID 1253 by the previous greedy digit
+    extractor, which made the listener chase ghost UIDs that don't exist
+    and silently drop real ones.
+
+    aioimaplib strips the leading ``* SEARCH`` from the response, so what
+    actually appears in ``response.lines`` is the bare data line followed
+    by the status line."""
     lines: list[bytes | str] = [
-        b"SEARCH 63 64",
-        b"JBND92 OK command completed in 1253 microsec.",
+        b"63 64",
+        b"command completed in 1253 microsec.",
     ]
     assert IMAPListener._parse_uids(lines) == [63, 64]
 
 
-def test_parse_uids_ignores_modseq_after_search() -> None:
-    """MODSEQ is appended to SEARCH results when CONDSTORE is enabled.
-    The parenthesised ``(MODSEQ N)`` must not be picked up as a UID."""
-    lines: list[bytes | str] = [b"SEARCH 1 2 3 (MODSEQ 9999)"]
-    assert IMAPListener._parse_uids(lines) == [1, 2, 3]
+def test_parse_uids_accepts_legacy_search_prefix() -> None:
+    """If aioimaplib stops stripping the SEARCH keyword, parser still works."""
+    assert IMAPListener._parse_uids([b"SEARCH 1 2 3"]) == [1, 2, 3]
 
 
 def test_parse_uids_ignores_exists_and_recent_untagged_data() -> None:
-    """Untagged ``* 64 EXISTS`` / ``* 1 RECENT`` lines must not be UIDs."""
+    """Untagged ``* 64 EXISTS`` / ``* 1 RECENT`` lines must not be UIDs.
+    They are mixed-content (digit + word), so the parser drops them."""
     lines: list[bytes | str] = [
         b"64 EXISTS",
         b"1 RECENT",
         b"OK [HIGHESTMODSEQ 9999]",
-        b"SEARCH 64",
+        b"64",  # the real SEARCH data line
     ]
     assert IMAPListener._parse_uids(lines) == [64]
 
 
 def test_parse_uids_handles_empty_search() -> None:
-    assert IMAPListener._parse_uids([b"SEARCH"]) == []
+    assert IMAPListener._parse_uids([b""]) == []
+    assert IMAPListener._parse_uids([b"", b"command completed."]) == []
     assert IMAPListener._parse_uids([]) == []
 
 
