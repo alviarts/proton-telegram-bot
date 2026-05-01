@@ -46,14 +46,23 @@ logger = logging.getLogger(__name__)
 # Public Proton account URLs we navigate to. Kept here so deployments behind
 # a reverse proxy / staging environment can patch them in one place.
 LOGIN_URL = "https://account.proton.me/login"
-ADDRESSES_URL_TEMPLATE = "https://account.proton.me/u/{user_index}/mail/identity-addresses"
+# For Business / org-admin accounts the address management page lives at
+# ``users-addresses``; personal accounts use ``identity-addresses``. We
+# default to the Business path because that's where the "Tambah alamat"
+# / "Add address" button lives for accounts that can manage org members.
+ADDRESSES_URL_TEMPLATE = "https://account.proton.me/u/{user_index}/mail/users-addresses"
 
-# Regex that matches the post-login URL Proton redirects to. After a
-# successful login the path picks up a ``/u/<index>/`` segment regardless of
-# which dashboard the user lands on, so this is the most reliable sentinel
-# we have for "login succeeded". Failures keep us on ``/login`` (or push us
-# to ``/login?error=...``).
-LOGGED_IN_URL_RE = re.compile(r"https://account\.proton\.me/u/\d+/")
+# Regex that matches the post-login URL Proton redirects to. After login
+# Proton sends users to one of:
+#   * ``/u/<index>/...`` — direct dashboard land for personal accounts
+#   * ``/apps`` — app picker for Business / multi-product accounts
+#   * ``/dashboard`` — billing/plan dashboard for new sessions
+#   * ``/setup-internal-address`` — Business first-login onboarding
+# Failures keep us on ``/login`` (sometimes with a ``?error=...`` query).
+# This regex matches any of the success paths above.
+LOGGED_IN_URL_RE = re.compile(
+    r"https://account\.proton\.me/(?:u/\d+/|apps(?:[/?#]|$)|dashboard(?:[/?#]|$)|setup-internal-address)"
+)
 
 # Default user_index in the Proton URL. The web UI renumbers logged-in
 # accounts in the order they were added; a fresh login lands at /u/0.
@@ -94,19 +103,64 @@ SELECTORS = {
         "button[aria-label='User menu'], "
         "a[href*='/dashboard']"
     ),
-    # Address listing page
-    "add_address_button": "button:has-text('Add address'), button:has-text('Tambah alamat')",
-    # Add address modal
-    "address_modal": "[role='dialog']",
-    "address_local_input": "input[name='address'], input[id='address']",
-    "address_display_name_input": "input[name='name'], input[id='name']",
-    "address_password_input": "input[name='password'], input[id='password']",
-    "address_password_confirm_input": "input[name='confirmPassword'], input[id='confirmPassword']",
-    "address_submit_button": "button[type='submit']",
-    # Notifications / errors. Proton renders toast notifications with role=alert
-    # in a top-right corner.
-    "success_notification": "[role='alert']:has-text('Address added')",
-    "error_notification": "[role='alert'][aria-live='assertive'], [role='alert']:has-text('error')",
+    # Address listing page — the page header has both "Tambah alamat" (Add
+    # address) and "Tambahkan pengguna" (Add user). We need to be specific
+    # to avoid matching "Tambahkan pengguna" by accident.
+    "add_address_button": (
+        "button:has-text('Tambah alamat'):not(:has-text('pengguna')), "
+        "button:has-text('Add address'):not(:has-text('user'))"
+    ),
+    # Add address modal. Proton renders modals as overlay divs and the
+    # ``role='dialog'`` attribute is on the inner card. Easiest reliable
+    # marker is the modal title text "Tambahkan alamat" / "Add address".
+    "address_modal_title": (
+        "text=/^\\s*(Tambahkan alamat|Add address)\\s*$/i"
+    ),
+    "address_modal": (
+        "[role='dialog'], dialog, "
+        "div.modal-two, [class*='modal']:has-text('Tambahkan alamat')"
+    ),
+    # Address input — sits to the left of the @proton.me dropdown. We
+    # try common attribute names first, then fall back to "first text
+    # input inside the modal" which is what the layout guarantees.
+    "address_local_input": (
+        "input[name='address'], input#address, "
+        "input[placeholder*='vielz'], "
+        "[role='dialog'] input[type='text']:not([readonly])"
+    ),
+    "address_display_name_input": (
+        "input[name='name'], input#name, "
+        "input[placeholder*='nama tampilan' i], "
+        "input[placeholder*='display name' i]"
+    ),
+    # Some flows ask for the master password as a re-auth step (sensitive
+    # operation modal). Optional — we skip filling when the field isn't
+    # rendered.
+    "address_password_input": "input[name='password'], input#password, input[type='password']",
+    "address_password_confirm_input": (
+        "input[name='confirmPassword'], input#confirmPassword"
+    ),
+    # Submit button is labelled "Simpan alamat" (Save address) inside the
+    # modal. ``button[type='submit']`` is too broad and will sometimes
+    # match the wrong form.
+    "address_submit_button": (
+        "button:has-text('Simpan alamat'), "
+        "button:has-text('Save address'), "
+        "[role='dialog'] button[type='submit']"
+    ),
+    # Notifications / errors. Proton renders toast notifications with
+    # role=alert in a top-right corner. Proton's success copy on this page
+    # is something like "Alamat ditambahkan" — we match either language.
+    "success_notification": (
+        "[role='alert']:has-text('Address added'), "
+        "[role='alert']:has-text('Alamat ditambahkan'), "
+        "[role='alert']:has-text('berhasil')"
+    ),
+    "error_notification": (
+        "[role='alert'][aria-live='assertive'], "
+        "[role='alert']:has-text('error'), "
+        "[role='alert']:has-text('gagal')"
+    ),
     # CAPTCHA iframe — same convention as the existing /sync flow.
     "captcha_iframe": "iframe[src*='captcha'], iframe[title*='challenge']",
 }
@@ -235,7 +289,14 @@ class ProtonBrowser:
         )
         try:
             await instance.login(password=password)
-            yield instance
+            try:
+                yield instance
+            except Exception:
+                # Capture the page state on any error from the caller
+                # (e.g. address-modal timeout) so operators can diagnose
+                # without a second run.
+                await instance._dump_debug("session-error")
+                raise
         finally:
             await instance.close()
 
@@ -351,9 +412,14 @@ class ProtonBrowser:
         page = self._page
         await page.goto(_addresses_url(self._user_index))
 
+        # Wait until the page is interactive — the "Tambah alamat" button is
+        # disabled until the user list has loaded.
+        add_btn = page.locator(SELECTORS["add_address_button"]).first
         try:
-            await page.click(SELECTORS["add_address_button"])
+            await add_btn.wait_for(state="visible", timeout=30_000)
+            await add_btn.click()
         except Exception as exc:
+            await self._dump_debug(f"add-address-button-failed-{local}")
             return AddressCreationResult(
                 local=local,
                 domain=domain,
@@ -361,19 +427,45 @@ class ProtonBrowser:
                 detail=f"could not open Add address modal: {exc}",
             )
 
-        modal = page.locator(SELECTORS["address_modal"]).first
-        await modal.wait_for(state="visible")
-
-        await modal.locator(SELECTORS["address_local_input"]).fill(local)
-        if display_name is not None:
-            await modal.locator(SELECTORS["address_display_name_input"]).fill(display_name)
-        if password_for_keygen is not None:
-            await modal.locator(SELECTORS["address_password_input"]).fill(password_for_keygen)
-            await modal.locator(SELECTORS["address_password_confirm_input"]).fill(
-                password_for_keygen
+        # Detect modal opening via the title text — this is the most stable
+        # signal across Proton WebClient releases.
+        title = page.locator(SELECTORS["address_modal_title"]).first
+        try:
+            await title.wait_for(state="visible", timeout=15_000)
+        except Exception as exc:
+            await self._dump_debug(f"modal-not-visible-{local}")
+            return AddressCreationResult(
+                local=local,
+                domain=domain,
+                status=CreationStatus.ERROR,
+                detail=f"address modal did not open: {exc}",
             )
 
-        await modal.locator(SELECTORS["address_submit_button"]).click()
+        # Some flows render ``role='dialog'`` on the inner card; others
+        # don't. Scope inputs to the page (not modal) and rely on Proton
+        # only ever showing one address modal at a time.
+        await page.locator(SELECTORS["address_local_input"]).first.fill(local)
+        if display_name is not None:
+            try:
+                await page.locator(SELECTORS["address_display_name_input"]).first.fill(
+                    display_name
+                )
+            except Exception:
+                logger.debug("display_name input not found, skipping")
+
+        # Optional re-auth password modal: fill only if the field is
+        # actually visible (org-managed members usually don't see it).
+        if password_for_keygen is not None:
+            pw_input = page.locator(SELECTORS["address_password_input"]).first
+            if await pw_input.is_visible():
+                await pw_input.fill(password_for_keygen)
+                pw_confirm = page.locator(
+                    SELECTORS["address_password_confirm_input"]
+                ).first
+                if await pw_confirm.is_visible():
+                    await pw_confirm.fill(password_for_keygen)
+
+        await page.locator(SELECTORS["address_submit_button"]).first.click()
 
         return await self._wait_for_address_outcome(local=local, domain=domain)
 
@@ -384,11 +476,17 @@ class ProtonBrowser:
         success = page.locator(SELECTORS["success_notification"]).first
         captcha = page.locator(SELECTORS["captcha_iframe"]).first
         error_toast = page.locator(SELECTORS["error_notification"]).first
+        # The modal disappears once Proton accepts the submission. We treat
+        # the title becoming hidden as a success signal even if no toast
+        # appeared (some Proton builds skip the toast on quick succession).
+        modal_title = page.locator(SELECTORS["address_modal_title"]).first
 
+        outcome_timeout_ms = 60_000
         tasks = [
-            asyncio.create_task(success.wait_for(state="visible")),
-            asyncio.create_task(captcha.wait_for(state="visible")),
-            asyncio.create_task(error_toast.wait_for(state="visible")),
+            asyncio.create_task(success.wait_for(state="visible", timeout=outcome_timeout_ms)),
+            asyncio.create_task(captcha.wait_for(state="visible", timeout=outcome_timeout_ms)),
+            asyncio.create_task(error_toast.wait_for(state="visible", timeout=outcome_timeout_ms)),
+            asyncio.create_task(modal_title.wait_for(state="hidden", timeout=outcome_timeout_ms)),
         ]
         try:
             await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
@@ -396,18 +494,12 @@ class ProtonBrowser:
             for task in tasks:
                 if not task.done():
                     task.cancel()
+            for task in tasks:
+                with _SuppressCancelledOrTimeout():
+                    await task
 
-        if await success.is_visible():
-            return AddressCreationResult(
-                local=local, domain=domain, status=CreationStatus.SUCCESS
-            )
-        if await captcha.is_visible():
-            return AddressCreationResult(
-                local=local,
-                domain=domain,
-                status=CreationStatus.CAPTCHA_REQUIRED,
-                detail="proton served a captcha challenge",
-            )
+        # Error wins over modal-closed because Proton sometimes briefly
+        # closes the modal then reopens with the error toast visible.
         if await error_toast.is_visible():
             text = ((await error_toast.text_content()) or "").lower().strip()
             return AddressCreationResult(
@@ -416,11 +508,27 @@ class ProtonBrowser:
                 status=_classify_error(text),
                 detail=text or None,
             )
+        if await captcha.is_visible():
+            return AddressCreationResult(
+                local=local,
+                domain=domain,
+                status=CreationStatus.CAPTCHA_REQUIRED,
+                detail="proton served a captcha challenge",
+            )
+        if await success.is_visible():
+            return AddressCreationResult(
+                local=local, domain=domain, status=CreationStatus.SUCCESS
+            )
+        # Modal-closed-without-error = success.
+        if not await modal_title.is_visible():
+            return AddressCreationResult(
+                local=local, domain=domain, status=CreationStatus.SUCCESS
+            )
         return AddressCreationResult(
             local=local,
             domain=domain,
             status=CreationStatus.ERROR,
-            detail="no toast appeared after submit",
+            detail="no outcome signal after submit",
         )
 
 

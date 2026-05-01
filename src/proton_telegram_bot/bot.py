@@ -66,6 +66,7 @@ CB_POLL_NOW = "poll_now"
 CB_PICK_PRIMARY = "pickp"
 CB_BACK_TO_PRIMARIES = "backp"
 CB_DEL_PRIMARY = "delp"
+CB_GENADDR_CANCEL = "genaddr_cancel"
 
 
 def _is_allowed(settings: Settings, user_id: int | None) -> bool:
@@ -928,12 +929,27 @@ async def cmd_genaddr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             parse_mode=ParseMode.HTML,
         )
 
+    if context.chat_data.get("genaddr_running"):
+        await update.effective_message.reply_text(  # type: ignore[union-attr]
+            "⚠️ Masih ada /genaddr lain yang berjalan di chat ini. "
+            "Tunggu selesai atau klik tombol Batalkan di pesan progressnya.",
+        )
+        return
+
+    cancel_keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("❌ Batalkan", callback_data=CB_GENADDR_CANCEL)]]
+    )
     progress_message = await update.effective_message.reply_text(  # type: ignore[union-attr]
         f"⏳ Menyiapkan browser & login ke {html.escape(primary.email)}...\n"
         f"Akan membuat <b>{count}</b> alamat dengan pola "
         f"<code>{html.escape(base)}NNN@{html.escape(domain)}</code>.",
         parse_mode=ParseMode.HTML,
+        reply_markup=cancel_keyboard,
     )
+
+    cancel_event = asyncio.Event()
+    context.chat_data["genaddr_running"] = True
+    context.chat_data["genaddr_cancel_event"] = cancel_event
 
     successes: list[str] = []
     failures: list[tuple[str, str]] = []
@@ -962,35 +978,42 @@ async def cmd_genaddr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             LOGGER.debug("genaddr progress edit failed", exc_info=True)
 
     try:
-        summary = await address_generator.run_batch(
-            db=db,
-            cipher=cipher,
-            chat_id=chat.id,
-            primary=primary,
-            base=base,
-            count=count,
-            domain=domain,
-            browser_factory=context.application.bot_data.get("browser_factory"),
-            progress=_on_progress,
-        )
-    except address_generator.AddressGenerationError as exc:
-        await progress_message.edit_text(
-            f"❌ Tidak bisa mulai: {html.escape(str(exc))}\n\n"
-            "Kalau belum, set password Proton dengan /setprotonpw.",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-    except Exception as exc:
-        LOGGER.exception("genaddr crashed")
-        await progress_message.edit_text(
-            "❌ Browser otomasi crash.\n"
-            f"Detail: <code>{html.escape(str(exc) or type(exc).__name__)}</code>\n\n"
-            "Screenshot + HTML halaman terakhir disimpan di "
-            "<code>/tmp/proton-browser-debug/</code> dalam container.\n"
-            "Ambil dengan: <code>docker compose cp bot:/tmp/proton-browser-debug ./debug</code>",
-            parse_mode=ParseMode.HTML,
-        )
-        return
+        try:
+            summary = await address_generator.run_batch(
+                db=db,
+                cipher=cipher,
+                chat_id=chat.id,
+                primary=primary,
+                base=base,
+                count=count,
+                domain=domain,
+                browser_factory=context.application.bot_data.get("browser_factory"),
+                progress=_on_progress,
+                cancel_event=cancel_event,
+            )
+        except address_generator.AddressGenerationError as exc:
+            await progress_message.edit_text(
+                f"❌ Tidak bisa mulai: {html.escape(str(exc))}\n\n"
+                "Kalau belum, set password Proton dengan /setprotonpw.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        except Exception as exc:
+            LOGGER.exception("genaddr crashed")
+            await progress_message.edit_text(
+                "❌ Browser otomasi crash.\n"
+                f"Detail: <code>{html.escape(str(exc) or type(exc).__name__)}</code>\n\n"
+                "Screenshot + HTML halaman terakhir disimpan di "
+                "<code>/tmp/proton-browser-debug/</code> dalam container.\n"
+                "Ambil dengan: <code>docker compose cp bot:/tmp/proton-browser-debug ./debug</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+    finally:
+        # Clear chat_data so the next /genaddr can run + the cancel button
+        # in any later message becomes a no-op.
+        context.chat_data.pop("genaddr_running", None)
+        context.chat_data.pop("genaddr_cancel_event", None)
 
     final_lines = [
         f"✅ Selesai. Sukses: <b>{len(summary.created)}</b>, "
@@ -1009,7 +1032,11 @@ async def cmd_genaddr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         more = "" if len(summary.created) <= 5 else f" (+{len(summary.created) - 5} lagi)"
         final_lines.append(f"Contoh: <code>{html.escape(sample)}</code>{more}")
     final_lines.append("\n/list untuk lihat semua alamat per akun.")
-    await progress_message.edit_text("\n".join(final_lines), parse_mode=ParseMode.HTML)
+    await progress_message.edit_text(
+        "\n".join(final_lines),
+        parse_mode=ParseMode.HTML,
+        reply_markup=None,
+    )
 
 
 # --------------------------------------------------------------- callback queries
@@ -1026,6 +1053,27 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     db = _bot_db(context)
     data = query.data
     if data == CB_NOOP:
+        return
+    if data == CB_GENADDR_CANCEL:
+        cancel_event = context.chat_data.get("genaddr_cancel_event")
+        if cancel_event is None:
+            await query.answer(
+                "Tidak ada /genaddr aktif untuk dibatalkan.", show_alert=False
+            )
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            return
+        cancel_event.set()
+        await query.answer("Membatalkan setelah alamat saat ini selesai...")
+        try:
+            # Disable the button immediately so the user knows their click
+            # registered. The progress edits will still come in until the
+            # in-flight create_address resolves.
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
         return
     if data == CB_REFRESH or data == CB_BACK_TO_PRIMARIES:
         primaries = await db.list_primary_accounts(chat_id)

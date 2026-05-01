@@ -6,6 +6,7 @@ handler can stay short.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from contextlib import AbstractAsyncContextManager
@@ -76,6 +77,7 @@ async def run_batch(
     display_name_template: str | None = None,
     browser_factory: BrowserFactory | None = None,
     progress: Callable[[int, int, AddressCreationResult], Awaitable[None]] | None = None,
+    cancel_event: asyncio.Event | None = None,
 ) -> BatchSummary:
     """Drive the end-to-end ``/genaddr`` flow for one primary account.
 
@@ -115,6 +117,9 @@ async def run_batch(
     try:
         async with factory(primary.email, password) as browser:
             for index, full_email in enumerate(names, start=1):
+                if cancel_event is not None and cancel_event.is_set():
+                    summary.aborted_reason = "cancelled by user"
+                    break
                 local = full_email.split("@", 1)[0]
                 display = (
                     display_name_template.format(local=local)
