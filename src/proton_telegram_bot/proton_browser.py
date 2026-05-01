@@ -40,6 +40,8 @@ if TYPE_CHECKING:  # pragma: no cover - typing-only imports
         Playwright,
     )
 
+    from .proxy_provider import ProxyProvider
+
 
 logger = logging.getLogger(__name__)
 
@@ -261,6 +263,7 @@ class ProtonBrowser:
         user_index: int = DEFAULT_USER_INDEX,
         nav_timeout_ms: int = DEFAULT_NAV_TIMEOUT_MS,
         action_timeout_ms: int = DEFAULT_ACTION_TIMEOUT_MS,
+        proxy_provider: ProxyProvider | None = None,
     ) -> AsyncIterator[ProtonBrowser]:
         """Open a logged-in browser session and tear it down cleanly afterwards.
 
@@ -268,6 +271,11 @@ class ProtonBrowser:
         fresh login this is always ``0``. We expose the option in case a
         deployment reuses an existing storage_state with several accounts
         mounted.
+
+        ``proxy_provider``, if given, is queried for one proxy URL before
+        Chromium launches so all Proton-bound traffic is routed through a
+        rotating IP. Falls back to a direct connection if the provider
+        returns ``None`` (no working proxy found).
         """
         # Lazy import: Playwright is an optional runtime dependency. Tests that
         # don't exercise the browser path (e.g. alias_gen tests) shouldn't
@@ -275,7 +283,21 @@ class ProtonBrowser:
         from playwright.async_api import async_playwright
 
         playwright = await async_playwright().start()
-        browser = await playwright.chromium.launch(headless=headless)
+        launch_kwargs: dict[str, object] = {"headless": headless}
+        if proxy_provider is not None:
+            entry = await proxy_provider.acquire()
+            if entry is not None:
+                launch_kwargs["proxy"] = {"server": entry.server_url}
+                logger.info(
+                    "ProtonBrowser: launching Chromium via proxy %s",
+                    entry.server_url,
+                )
+            else:
+                logger.warning(
+                    "ProtonBrowser: proxy_provider returned no proxy; "
+                    "launching Chromium with direct connection"
+                )
+        browser = await playwright.chromium.launch(**launch_kwargs)
         context = await browser.new_context()
         context.set_default_timeout(action_timeout_ms)
         context.set_default_navigation_timeout(nav_timeout_ms)

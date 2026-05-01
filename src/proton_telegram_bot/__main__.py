@@ -11,6 +11,7 @@ from .config import Settings, load_settings
 from .crypto import CredentialCipher
 from .db import Database
 from .manager import ListenerManager
+from .proxy_provider import ProxyProvider
 
 LOGGER = logging.getLogger(__name__)
 
@@ -50,6 +51,16 @@ def _build_application(settings: Settings) -> Application:
     application.bot_data["db"] = db
     application.bot_data["cipher"] = cipher
     application.bot_data["manager"] = manager
+    # Optional Proton-bound proxy rotation. ``from_env`` returns ``None`` when
+    # ``PROTON_USE_PROXY=0`` so deployments can disable it without touching code.
+    proxy_provider = ProxyProvider.from_env()
+    if proxy_provider is not None:
+        LOGGER.info("proxy provider enabled for Proton-bound traffic")
+        application.bot_data["proxy_provider"] = proxy_provider
+    else:
+        LOGGER.info(
+            "proxy provider disabled (PROTON_USE_PROXY=0) — using direct connection"
+        )
     for handler in build_handlers():
         application.add_handler(handler)
     return application

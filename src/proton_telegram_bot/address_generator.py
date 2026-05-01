@@ -26,6 +26,7 @@ from .proton_browser import (
     ProtonBrowserError,
     _is_browser_closed_error,
 )
+from .proxy_provider import ProxyProvider
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +81,7 @@ async def run_batch(
     progress: Callable[[int, int, AddressCreationResult], Awaitable[None]] | None = None,
     cancel_event: asyncio.Event | None = None,
     browser_handle: dict[str, Any] | None = None,
+    proxy_provider: ProxyProvider | None = None,
 ) -> BatchSummary:
     """Drive the end-to-end ``/genaddr`` flow for one primary account.
 
@@ -115,7 +117,16 @@ async def run_batch(
         domain=domain.lstrip("@").lower(),
     )
 
-    factory = browser_factory or _default_browser_factory
+    if browser_factory is not None:
+        factory = browser_factory
+    else:
+        # Build a closure that captures ``proxy_provider`` so the default
+        # factory routes Chromium through a rotating IP without widening
+        # the public ``BrowserFactory`` signature with extra kwargs.
+        def factory(email: str, password: str):
+            return _default_browser_factory(
+                email, password, proxy_provider=proxy_provider
+            )
     try:
         async with factory(primary.email, password) as browser:
             # Expose the live browser to the caller so the bot's Cancel button
@@ -216,6 +227,13 @@ async def run_batch(
     return summary
 
 
-def _default_browser_factory(email: str, password: str):
+def _default_browser_factory(
+    email: str,
+    password: str,
+    *,
+    proxy_provider: ProxyProvider | None = None,
+):
     """Return a real :class:`ProtonBrowser` session context manager."""
-    return ProtonBrowser.session(email=email, password=password)
+    return ProtonBrowser.session(
+        email=email, password=password, proxy_provider=proxy_provider
+    )

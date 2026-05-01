@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
-from typing import cast
+from typing import Any, cast
 
 from telegram import (
     InlineKeyboardButton,
@@ -857,16 +857,76 @@ async def setpw_password(
             "Gagal menyimpan — akun mungkin sudah dihapus."
         )
         return ConversationHandler.END
+    # Mark the chosen primary as active so the next /genaddr defaults to it
+    # without the user having to also click an alias in /list. This is the
+    # "least surprising" behaviour: the account you just configured is the
+    # one we'll use.
+    await db.set_active_primary(chat.id, primary_id)
+    primary_obj = await db.get_primary_account(chat.id, primary_id)
+    active_label = (
+        f"<b>{html.escape(primary_obj.email)}</b>"
+        if primary_obj is not None
+        else "akun ini"
+    )
     await update.effective_message.reply_text(  # type: ignore[union-attr]
-        "Password Proton tersimpan terenkripsi. "
-        "<b>Sekarang hapus pesan passwordmu</b> dari chat ini. "
-        "Pakai /genaddr untuk generate alamat.",
+        f"Password Proton tersimpan terenkripsi untuk {active_label}.\n"
+        "<b>Sekarang hapus pesan passwordmu</b> dari chat ini.\n"
+        f"Akun aktif sekarang: {active_label}. Pakai /genaddr untuk "
+        "generate alamat.",
         parse_mode=ParseMode.HTML,
     )
     return ConversationHandler.END
 
 
 # --------------------------------------------------------------- /genaddr
+
+
+async def _pick_primary_for_genaddr(
+    *,
+    db: Database,
+    chat_id: int,
+    primaries: list,
+    base: str,
+) -> tuple[Any, str]:
+    """Pick which primary account ``/genaddr`` should run against.
+
+    Selection priority (most specific wins):
+
+    1. Exact local-part match against ``base`` (e.g. ``/genaddr vielz64`` on
+       a chat that owns ``vielz64@proton.me``). Most natural UX: the user's
+       first arg already names the account.
+    2. Persisted active primary (set by ``/setprotonpw`` or a previous
+       ``/genaddr``).
+    3. Active alias's primary -- legacy fallback for chats that haven't
+       picked an account yet.
+    4. First primary -- better than crashing.
+
+    Returns ``(primary, reason)`` where ``reason`` is a short Indonesian
+    label suitable for showing the user so they understand which account
+    we picked and why.
+    """
+    base_lc = base.strip().lower()
+    matches = [p for p in primaries if p.email.split("@", 1)[0].lower() == base_lc]
+    if len(matches) == 1:
+        return matches[0], "cocok dengan base"
+
+    active_primary_id = await db.get_active_primary_id(chat_id)
+    if active_primary_id is not None:
+        active = next(
+            (p for p in primaries if p.id == active_primary_id), None
+        )
+        if active is not None:
+            return active, "akun aktif"
+
+    active_alias = await db.get_active_alias(chat_id)
+    if active_alias is not None and active_alias.primary_id:
+        from_alias = next(
+            (p for p in primaries if p.id == active_alias.primary_id), None
+        )
+        if from_alias is not None:
+            return from_alias, "dari alias aktif"
+
+    return primaries[0], "default (akun pertama)"
 
 
 async def _safe_force_close(force_close) -> None:  # type: ignore[no-untyped-def]
@@ -927,18 +987,17 @@ async def cmd_genaddr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             "Belum ada akun Proton. Kirim /connect lalu /setprotonpw lebih dulu."
         )
         return
-    # Pick the active alias's primary if there is one, otherwise the first.
-    active = await db.get_active_alias(chat.id)
-    if active is not None and active.primary_id:
-        primary = next(
-            (p for p in primaries if p.id == active.primary_id), primaries[0]
-        )
-    else:
-        primary = primaries[0]
+    primary, primary_pick_reason = await _pick_primary_for_genaddr(
+        db=db, chat_id=chat.id, primaries=primaries, base=base
+    )
+    # Persist the picked primary so subsequent commands keep using the same
+    # account until the user explicitly switches via /setprotonpw or /list.
+    await db.set_active_primary(chat.id, primary.id)
     if len(primaries) > 1:
         await update.effective_message.reply_text(  # type: ignore[union-attr]
-            f"Akun yang dipakai: <b>{html.escape(primary.email)}</b>. "
-            "Pakai /list untuk pilih akun lain (klik aliasnya untuk aktifkan).",
+            f"Akun yang dipakai: <b>{html.escape(primary.email)}</b> "
+            f"({primary_pick_reason}). Ganti dengan /setprotonpw atau "
+            "klik alias di /list.",
             parse_mode=ParseMode.HTML,
         )
 
@@ -952,8 +1011,11 @@ async def cmd_genaddr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     cancel_keyboard = InlineKeyboardMarkup(
         [[InlineKeyboardButton("❌ Batalkan", callback_data=CB_GENADDR_CANCEL)]]
     )
+    proxy_provider = context.application.bot_data.get("proxy_provider")
+    proxy_note = " via proxy rotasi" if proxy_provider is not None else ""
     progress_message = await update.effective_message.reply_text(  # type: ignore[union-attr]
-        f"⏳ Menyiapkan browser & login ke {html.escape(primary.email)}...\n"
+        f"⏳ Menyiapkan browser & login ke <b>{html.escape(primary.email)}</b>"
+        f"{proxy_note}...\n"
         f"Akan membuat <b>{count}</b> alamat dengan pola "
         f"<code>{html.escape(base)}NNN@{html.escape(domain)}</code>.",
         parse_mode=ParseMode.HTML,
@@ -984,11 +1046,17 @@ async def cmd_genaddr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
         try:
             await progress_message.edit_text(
-                f"⏳ <b>{index}/{total}</b> diproses\n"
+                f"⏳ <b>{index}/{total}</b> diproses pada "
+                f"<b>{html.escape(primary.email)}</b>\n"
                 f"✅ {len(successes)} sukses · ⚠️ {len(failures)} gagal/duplikat\n"
                 f"Terakhir: <code>{html.escape(result.email)}</code> "
                 f"({html.escape(result.status.value)})",
                 parse_mode=ParseMode.HTML,
+                # Critical: re-pass the cancel keyboard on every edit.
+                # ``edit_text`` without ``reply_markup`` *removes* the
+                # inline keyboard, which is what made the Cancel button
+                # disappear after the first progress update.
+                reply_markup=cancel_keyboard,
             )
         except Exception:
             # Telegram occasionally rejects identical edits or rate-limits;
@@ -1010,6 +1078,7 @@ async def cmd_genaddr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 progress=_on_progress,
                 cancel_event=cancel_event,
                 browser_handle=browser_handle,
+                proxy_provider=proxy_provider,
             )
         except address_generator.AddressGenerationError as exc:
             await progress_message.edit_text(

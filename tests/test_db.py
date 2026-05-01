@@ -79,6 +79,51 @@ async def test_users_with_credentials(db: Database) -> None:
     assert await db.list_users_with_credentials() == [2]
 
 
+async def test_active_primary_roundtrip_and_delete_clears(db: Database) -> None:
+    """``set_active_primary`` persists, and ``delete_primary_account`` clears it.
+
+    Regression coverage for the UX bug where ``/genaddr`` ignored the user's
+    just-configured account: ``/setprotonpw`` now stores the picked primary
+    via ``set_active_primary`` so subsequent commands default to it. The
+    delete path must NULL the column so a stale id never wins later.
+    """
+    chat_id = 11
+    await db.upsert_user(chat_id)
+    assert await db.get_active_primary_id(chat_id) is None  # nothing set yet
+    p1 = await db.add_primary_account(
+        chat_id=chat_id,
+        email="alpha@proton.me",
+        host="127.0.0.1",
+        port=1143,
+        username="alpha@proton.me",
+        encrypted_password="e1",
+        use_ssl=False,
+    )
+    p2 = await db.add_primary_account(
+        chat_id=chat_id,
+        email="beta@proton.me",
+        host="127.0.0.1",
+        port=1143,
+        username="beta@proton.me",
+        encrypted_password="e2",
+        use_ssl=False,
+    )
+    await db.set_active_primary(chat_id, p2)
+    assert await db.get_active_primary_id(chat_id) == p2
+
+    # Deleting the active primary nulls out the pointer instead of leaving
+    # a dangling reference.
+    await db.delete_primary_account(chat_id, p2)
+    assert await db.get_active_primary_id(chat_id) is None
+
+    # Setting back to a still-existing primary works and survives.
+    await db.set_active_primary(chat_id, p1)
+    assert await db.get_active_primary_id(chat_id) == p1
+    # Explicitly clearing.
+    await db.set_active_primary(chat_id, None)
+    assert await db.get_active_primary_id(chat_id) is None
+
+
 async def test_multiple_primary_accounts_per_chat(db: Database) -> None:
     """Two Proton accounts on the same chat keep their aliases separated."""
     chat_id = 7
