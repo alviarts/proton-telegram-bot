@@ -233,13 +233,30 @@ class IMAPListener:
 
     @staticmethod
     def _parse_uids(lines: list[bytes | str]) -> list[int]:
+        """Extract UIDs from an IMAP SEARCH response.
+
+        Only digits that follow the "SEARCH" keyword are treated as UIDs.
+        Other untagged data (e.g. "JBND92 OK command completed in 1253 microsec",
+        "OK [HIGHESTMODSEQ 42]", "12 EXISTS") may also appear in
+        ``response.lines`` and must be ignored, otherwise we will try to fetch
+        bogus UIDs that don't exist.
+        """
         uids: list[int] = []
         for line in lines:
             if isinstance(line, bytes):
                 line = line.decode("ascii", errors="ignore")
-            for token in line.split():
+            tokens = line.split()
+            try:
+                idx = tokens.index("SEARCH")
+            except ValueError:
+                continue
+            for token in tokens[idx + 1 :]:
                 if token.isdigit():
                     uids.append(int(token))
+                else:
+                    # Stop at the first non-digit token to avoid picking up
+                    # MODSEQ values or other annotations after the UID list.
+                    break
         return uids
 
     @staticmethod

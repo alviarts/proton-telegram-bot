@@ -17,7 +17,8 @@ CREATE TABLE IF NOT EXISTS users (
     imap_port INTEGER,
     imap_username TEXT,
     imap_password_encrypted TEXT,
-    imap_use_ssl INTEGER NOT NULL DEFAULT 0
+    imap_use_ssl INTEGER NOT NULL DEFAULT 0,
+    active_alias_id INTEGER REFERENCES aliases(id) ON DELETE SET NULL
 );
 
 CREATE TABLE IF NOT EXISTS aliases (
@@ -53,7 +54,17 @@ class Database:
         self._conn.row_factory = aiosqlite.Row
         await self._conn.execute("PRAGMA foreign_keys = ON")
         await self._conn.executescript(SCHEMA)
+        await self._migrate()
         await self._conn.commit()
+
+    async def _migrate(self) -> None:
+        """Apply idempotent schema migrations for older databases."""
+        async with self.conn.execute("PRAGMA table_info(users)") as cursor:
+            cols = {row["name"] for row in await cursor.fetchall()}
+        if "active_alias_id" not in cols:
+            await self.conn.execute(
+                "ALTER TABLE users ADD COLUMN active_alias_id INTEGER"
+            )
 
     async def close(self) -> None:
         if self._conn is not None:
@@ -128,6 +139,24 @@ class Database:
         if row is None:
             return None
         return row["imap_password_encrypted"]
+
+    async def set_active_alias(self, chat_id: int, alias_id: int | None) -> None:
+        await self.upsert_user(chat_id)
+        await self.conn.execute(
+            "UPDATE users SET active_alias_id = ? WHERE chat_id = ?",
+            (alias_id, chat_id),
+        )
+        await self.conn.commit()
+
+    async def get_active_alias(self, chat_id: int) -> AliasRecord | None:
+        async with self.conn.execute(
+            "SELECT active_alias_id FROM users WHERE chat_id = ?",
+            (chat_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None or row["active_alias_id"] is None:
+            return None
+        return await self.find_alias_by_id(chat_id, row["active_alias_id"])
 
     async def list_users_with_credentials(self) -> list[int]:
         async with self.conn.execute(

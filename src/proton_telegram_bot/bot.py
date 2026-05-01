@@ -530,10 +530,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 parse_mode=ParseMode.HTML,
             )
             return
+        await db.set_active_alias(chat_id, alias.id)
         await query.message.reply_text(  # type: ignore[union-attr]
-            f"Aktif: <b>{html.escape(alias.email)}</b>\n"
-            "Kasih alamat ini ke rekan bisnismu. Aku tunggu emailnya, "
-            "dan akan kirim isinya ke sini begitu masuk.",
+            f"🔒 Aktif: <b>{html.escape(alias.email)}</b>\n"
+            "Bot sekarang <b>terkunci</b> ke alias ini — hanya email yang "
+            "dikirim ke alamat di atas yang akan diteruskan ke chat ini. "
+            "Kasih alamat ini ke rekan bisnismu, lalu tunggu emailnya.",
             parse_mode=ParseMode.HTML,
         )
         return

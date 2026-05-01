@@ -93,22 +93,38 @@ class ListenerManager:
                     "chat %s auto-added %d alias(es) from uid %s", chat_id, added, uid
                 )
 
-        available = await self._db.list_aliases(chat_id, status=AliasStatus.AVAILABLE)
-        candidate_emails = {row.email for row in available}
-        if not candidate_emails:
-            LOGGER.debug("chat %s has no available aliases; ignoring uid %s", chat_id, uid)
+        # Lock-mode: a chat only receives the inbox of its currently *active*
+        # alias. Pick one via /list before sending it to your business partner.
+        active = await self._db.get_active_alias(chat_id)
+        if active is None:
+            LOGGER.debug(
+                "chat %s has no active alias; ignoring uid %s (use /list to pick one)",
+                chat_id,
+                uid,
+            )
             return
-        matched = find_matching_alias(message, candidate_emails)
+        if active.status == AliasStatus.CONSUMED:
+            LOGGER.debug(
+                "chat %s active alias %s already consumed; ignoring uid %s",
+                chat_id,
+                active.email,
+                uid,
+            )
+            return
+        matched = find_matching_alias(message, {active.email})
         if matched is None:
-            LOGGER.debug("uid %s has no matching alias for chat %s", uid, chat_id)
-            return
-        alias = next((a for a in available if a.email == matched), None)
-        if alias is None:
+            LOGGER.debug(
+                "uid %s does not target active alias %s for chat %s",
+                uid,
+                active.email,
+                chat_id,
+            )
             return
         message_id = (message.get("Message-Id") or uid).strip()
-        await self._db.mark_consumed(alias.id, message_id)
+        await self._db.mark_consumed(active.id, message_id)
+        await self._db.set_active_alias(chat_id, None)
         summary = summarize(message)
-        await self._notifier.notify_email_received(chat_id, alias.email, summary)
+        await self._notifier.notify_email_received(chat_id, active.email, summary)
 
     async def _handle_discovered_aliases(
         self,

@@ -44,10 +44,14 @@ def _make_message(to: str = "vielz50@proton.me") -> EmailMessage:
     return parse_message(msg.as_bytes())  # type: ignore[return-value]
 
 
-async def test_handle_message_marks_alias_consumed_and_notifies(db: Database) -> None:
+async def test_handle_message_forwards_only_active_alias(db: Database) -> None:
+    """Lock-mode: only emails to the chat's *active* alias get forwarded."""
     chat_id = 100
     await db.upsert_user(chat_id)
     await db.add_aliases(chat_id, ["vielz50@proton.me", "vielz51@proton.me"])
+    active = await db.find_alias(chat_id, "vielz50@proton.me")
+    assert active is not None
+    await db.set_active_alias(chat_id, active.id)
     notifier = _RecordingNotifier()
     cipher = CredentialCipher(CredentialCipher.generate_key())
     manager = ListenerManager(db=db, cipher=cipher, notifier=notifier)
@@ -61,10 +65,12 @@ async def test_handle_message_marks_alias_consumed_and_notifies(db: Database) ->
     assert len(notifier.calls) == 1
     received_chat, received_email, _ = notifier.calls[0]
     assert (received_chat, received_email) == (chat_id, "vielz50@proton.me")
+    # Active alias is auto-released after the email is forwarded.
+    assert await db.get_active_alias(chat_id) is None
 
 
-async def test_handle_message_auto_adds_new_recipient(db: Database) -> None:
-    """An email to an unknown address auto-adds it, consumes, and notifies."""
+async def test_handle_message_ignores_when_no_active_alias(db: Database) -> None:
+    """No active alias = nothing is forwarded; new recipients are still tracked."""
     chat_id = 7
     await db.upsert_user(chat_id)
     await db.add_aliases(chat_id, ["only@proton.me"])
@@ -75,13 +81,36 @@ async def test_handle_message_auto_adds_new_recipient(db: Database) -> None:
         notifier=notifier,
     )
     await manager._handle_new_message(chat_id, _make_message("someone-else@proton.me"), "1")
-    # Auto-add creates the alias and immediately consumes it.
-    assert len(notifier.calls) == 1
-    assert notifier.calls[0][1] == "someone-else@proton.me"
+    # No notification because no alias is locked-in for this chat.
+    assert notifier.calls == []
+    # New recipient was still auto-added so /list shows it later.
     all_aliases = await db.list_aliases(chat_id)
     assert sorted(a.email for a in all_aliases) == ["only@proton.me", "someone-else@proton.me"]
-    consumed = await db.list_aliases(chat_id, status=AliasStatus.CONSUMED)
-    assert [a.email for a in consumed] == ["someone-else@proton.me"]
+    # Nothing got consumed.
+    assert await db.list_aliases(chat_id, status=AliasStatus.CONSUMED) == []
+
+
+async def test_handle_message_ignores_other_aliases_when_locked(db: Database) -> None:
+    """Email to a non-active alias must NOT be forwarded, even if the alias exists."""
+    chat_id = 200
+    await db.upsert_user(chat_id)
+    await db.add_aliases(chat_id, ["a@proton.me", "b@proton.me"])
+    active = await db.find_alias(chat_id, "a@proton.me")
+    assert active is not None
+    await db.set_active_alias(chat_id, active.id)
+    notifier = _RecordingNotifier()
+    manager = ListenerManager(
+        db=db,
+        cipher=CredentialCipher(CredentialCipher.generate_key()),
+        notifier=notifier,
+    )
+
+    await manager._handle_new_message(chat_id, _make_message("b@proton.me"), "10")
+
+    assert notifier.calls == []
+    # Active alias still locked, neither alias consumed.
+    assert (await db.get_active_alias(chat_id)).email == "a@proton.me"
+    assert await db.list_aliases(chat_id, status=AliasStatus.CONSUMED) == []
 
 
 async def test_discovered_aliases_adds_and_notifies(db: Database) -> None:
