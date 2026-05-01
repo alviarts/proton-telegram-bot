@@ -45,7 +45,11 @@ def _make_message(to: str = "vielz50@proton.me") -> EmailMessage:
 
 
 async def test_handle_message_forwards_only_active_alias(db: Database) -> None:
-    """Lock-mode: only emails to the chat's *active* alias get forwarded."""
+    """Lock-mode: only emails to the chat's *active* alias get forwarded.
+
+    The alias stays in /list (no auto-consume) and the lock is preserved so
+    follow-up emails to the same address keep being forwarded.
+    """
     chat_id = 100
     await db.upsert_user(chat_id)
     await db.add_aliases(chat_id, ["vielz50@proton.me", "vielz51@proton.me"])
@@ -57,16 +61,19 @@ async def test_handle_message_forwards_only_active_alias(db: Database) -> None:
     manager = ListenerManager(db=db, cipher=cipher, notifier=notifier)
 
     await manager._handle_new_message(chat_id, _make_message("vielz50@proton.me"), "1")
+    await manager._handle_new_message(chat_id, _make_message("vielz50@proton.me"), "2")
 
+    # Both aliases are still listed; nothing was deleted or consumed.
     available = await db.list_aliases(chat_id, status=AliasStatus.AVAILABLE)
     consumed = await db.list_aliases(chat_id, status=AliasStatus.CONSUMED)
-    assert [a.email for a in available] == ["vielz51@proton.me"]
-    assert [a.email for a in consumed] == ["vielz50@proton.me"]
-    assert len(notifier.calls) == 1
-    received_chat, received_email, _ = notifier.calls[0]
-    assert (received_chat, received_email) == (chat_id, "vielz50@proton.me")
-    # Active alias is auto-released after the email is forwarded.
-    assert await db.get_active_alias(chat_id) is None
+    assert sorted(a.email for a in available) == ["vielz50@proton.me", "vielz51@proton.me"]
+    assert consumed == []
+    # Both messages were forwarded — lock persists across emails.
+    assert len(notifier.calls) == 2
+    assert {call[1] for call in notifier.calls} == {"vielz50@proton.me"}
+    # Active alias is still locked-in.
+    current = await db.get_active_alias(chat_id)
+    assert current is not None and current.email == "vielz50@proton.me"
 
 
 async def test_handle_message_ignores_when_no_active_alias(db: Database) -> None:

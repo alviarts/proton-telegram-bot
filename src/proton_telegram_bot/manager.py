@@ -9,7 +9,6 @@ from .crypto import CredentialCipher
 from .db import Database, credentials_from_user
 from .email_parser import extract_recipients, find_matching_alias, summarize
 from .imap_listener import IMAPListener
-from .models import AliasStatus
 
 LOGGER = logging.getLogger(__name__)
 
@@ -95,19 +94,14 @@ class ListenerManager:
 
         # Lock-mode: a chat only receives the inbox of its currently *active*
         # alias. Pick one via /list before sending it to your business partner.
+        # The alias stays in /list and remains the active lock so subsequent
+        # emails to the same address keep being forwarded until the user picks
+        # a different alias (or unlocks).
         active = await self._db.get_active_alias(chat_id)
         if active is None:
             LOGGER.debug(
                 "chat %s has no active alias; ignoring uid %s (use /list to pick one)",
                 chat_id,
-                uid,
-            )
-            return
-        if active.status == AliasStatus.CONSUMED:
-            LOGGER.debug(
-                "chat %s active alias %s already consumed; ignoring uid %s",
-                chat_id,
-                active.email,
                 uid,
             )
             return
@@ -120,9 +114,6 @@ class ListenerManager:
                 chat_id,
             )
             return
-        message_id = (message.get("Message-Id") or uid).strip()
-        await self._db.mark_consumed(active.id, message_id)
-        await self._db.set_active_alias(chat_id, None)
         summary = summarize(message)
         await self._notifier.notify_email_received(chat_id, active.email, summary)
 

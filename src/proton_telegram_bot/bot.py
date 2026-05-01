@@ -84,20 +84,26 @@ def _bot_manager(context: ContextTypes.DEFAULT_TYPE) -> ListenerManager:
     return cast(ListenerManager, context.application.bot_data["manager"])
 
 
-def _build_alias_keyboard(aliases: list[AliasRecord]) -> InlineKeyboardMarkup:
+def _build_alias_keyboard(
+    aliases: list[AliasRecord],
+    active_alias_id: int | None = None,
+) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     if not aliases:
         rows.append(
-            [InlineKeyboardButton("(belum ada alias tersedia)", callback_data=CB_NOOP)]
+            [InlineKeyboardButton("(belum ada alias)", callback_data=CB_NOOP)]
         )
     else:
         for alias in aliases:
             # callback_data must be ≤ 64 bytes (Telegram API), so we use the
             # alias's numeric id rather than the email address itself.
+            label = alias.email
+            if active_alias_id is not None and alias.id == active_alias_id:
+                label = f"🔒 {label}"
             rows.append(
                 [
                     InlineKeyboardButton(
-                        alias.email, callback_data=f"{CB_PICK}:{alias.id}"
+                        label, callback_data=f"{CB_PICK}:{alias.id}"
                     )
                 ]
             )
@@ -124,7 +130,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/sync &lt;user&gt; &lt;pass&gt; — Auto-sync alias dari akun Proton\n"
         "/addalias — Tambah alias secara manual\n"
         "/removealias — Hapus alias\n"
-        "/list — Lihat alias yang masih tersedia\n"
+        "/list — Lihat semua alias dan pilih yang aktif\n"
+        "/unlock — Lepas kunci alias yang sedang aktif\n"
         "/history — Lihat alias yang sudah terpakai\n"
         "/reset — Kembalikan alias ke daftar tersedia\n"
         "/cancel — Batalkan dialog /connect"
@@ -142,10 +149,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             parse_mode=ParseMode.HTML,
         )
         return
-    aliases = await db.list_aliases(chat.id, status=AliasStatus.AVAILABLE)
+    aliases = await db.list_aliases(chat.id)
+    active = await db.get_active_alias(chat.id)
     await update.effective_message.reply_text(  # type: ignore[union-attr]
-        "Halo! Berikut alias yang masih tersedia:" + commands_help,
-        reply_markup=_build_alias_keyboard(aliases),
+        "Halo! Berikut alias-alias kamu:" + commands_help,
+        reply_markup=_build_alias_keyboard(aliases, active.id if active else None),
         parse_mode=ParseMode.HTML,
     )
 
@@ -159,10 +167,18 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if chat is None:
         return
     db = _bot_db(context)
-    aliases = await db.list_aliases(chat.id, status=AliasStatus.AVAILABLE)
+    aliases = await db.list_aliases(chat.id)
+    active = await db.get_active_alias(chat.id)
+    header = "Daftar alias kamu:"
+    if active is not None:
+        header += (
+            f"\n🔒 Aktif: <b>{html.escape(active.email)}</b> "
+            f"(kirim /unlock untuk lepas kunci)"
+        )
     await update.effective_message.reply_text(  # type: ignore[union-attr]
-        "Alias yang masih tersedia:",
-        reply_markup=_build_alias_keyboard(aliases),
+        header,
+        reply_markup=_build_alias_keyboard(aliases, active.id if active else None),
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -221,10 +237,11 @@ async def cmd_addalias(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     msg = f"Ditambahkan: {inserted} alias."
     if skipped:
         msg += f" Sudah ada sebelumnya: {skipped}."
-    aliases = await db.list_aliases(chat.id, status=AliasStatus.AVAILABLE)
+    aliases = await db.list_aliases(chat.id)
+    active = await db.get_active_alias(chat.id)
     await update.effective_message.reply_text(  # type: ignore[union-attr]
         msg,
-        reply_markup=_build_alias_keyboard(aliases),
+        reply_markup=_build_alias_keyboard(aliases, active.id if active else None),
     )
 
 
@@ -338,10 +355,11 @@ async def _sync_complete(
     msg = f"Sync selesai! Ditemukan {total} alamat.\nDitambahkan: {inserted}."
     if skipped:
         msg += f" Sudah ada: {skipped}."
-    aliases = await db.list_aliases(chat.id, status=AliasStatus.AVAILABLE)
+    aliases = await db.list_aliases(chat.id)
+    active = await db.get_active_alias(chat.id)
     await update.effective_message.reply_text(  # type: ignore[union-attr]
         msg,
-        reply_markup=_build_alias_keyboard(aliases),
+        reply_markup=_build_alias_keyboard(aliases, active.id if active else None),
     )
     return ConversationHandler.END
 
@@ -478,6 +496,27 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 @_gate
+async def cmd_unlock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Release the active-alias lock so no email is forwarded until next pick."""
+    chat = update.effective_chat
+    if chat is None:
+        return
+    db = _bot_db(context)
+    active = await db.get_active_alias(chat.id)
+    if active is None:
+        await update.effective_message.reply_text(  # type: ignore[union-attr]
+            "Tidak ada alias yang sedang aktif. Pilih satu di /list."
+        )
+        return
+    await db.set_active_alias(chat.id, None)
+    await update.effective_message.reply_text(  # type: ignore[union-attr]
+        f"🔓 Kunci dilepas dari <b>{html.escape(active.email)}</b>. "
+        "Pilih alias di /list saat siap menerima email lagi.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@_gate
 async def cmd_disconnect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat = update.effective_chat
     if chat is None:
@@ -505,10 +544,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if data == CB_NOOP:
         return
     if data == CB_REFRESH:
-        aliases = await db.list_aliases(chat_id, status=AliasStatus.AVAILABLE)
+        aliases = await db.list_aliases(chat_id)
+        active = await db.get_active_alias(chat_id)
         try:
             await query.edit_message_reply_markup(
-                reply_markup=_build_alias_keyboard(aliases)
+                reply_markup=_build_alias_keyboard(
+                    aliases, active.id if active else None
+                )
             )
         except Exception:
             pass
@@ -524,18 +566,29 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if alias is None:
             await query.edit_message_text("Alias tidak ditemukan.")
             return
-        if alias.status == AliasStatus.CONSUMED:
-            await query.edit_message_text(
-                f"Alias <b>{html.escape(alias.email)}</b> sudah dipakai.",
-                parse_mode=ParseMode.HTML,
-            )
+        # Idempotent: if the user clicks the alias that's already locked, just
+        # acknowledge without re-sending the "Aktif" announcement (the user
+        # was double-tapping otherwise — that's where the duplicate came from).
+        current = await db.get_active_alias(chat_id)
+        if current is not None and current.id == alias.id:
+            await query.answer("Sudah aktif.", show_alert=False)
             return
         await db.set_active_alias(chat_id, alias.id)
+        # Refresh the inline keyboard so the 🔒 marker moves to the new alias
+        # in-place (no second list message clutter).
+        aliases = await db.list_aliases(chat_id)
+        try:
+            await query.edit_message_reply_markup(
+                reply_markup=_build_alias_keyboard(aliases, alias.id)
+            )
+        except Exception:
+            pass
         await query.message.reply_text(  # type: ignore[union-attr]
             f"🔒 Aktif: <b>{html.escape(alias.email)}</b>\n"
             "Bot sekarang <b>terkunci</b> ke alias ini — hanya email yang "
             "dikirim ke alamat di atas yang akan diteruskan ke chat ini. "
-            "Kasih alamat ini ke rekan bisnismu, lalu tunggu emailnya.",
+            "Alias tetap di /list dan terus terima email sampai kamu pilih "
+            "alias lain atau kirim /unlock.",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -600,7 +653,11 @@ def _render_email_message(alias_email: str, summary: dict[str, str]) -> str:
         f"<b>Subjek:</b> {html.escape(summary.get('subject', ''))}\n"
         f"<b>Tanggal:</b> {html.escape(summary.get('date', ''))}\n\n"
     )
-    footer = "\n\nAlias ini sudah dihapus dari daftar. /list untuk lihat sisanya."
+    footer = (
+        "\n\n🔒 Alias masih aktif — email berikutnya ke alamat ini akan "
+        "diteruskan juga. Kirim /unlock untuk lepas kunci, atau pilih "
+        "alias lain di /list."
+    )
     overhead = len(header) + len("<pre></pre>") + len(footer)
     available = _TELEGRAM_MESSAGE_LIMIT - overhead
     truncated = False
@@ -663,6 +720,7 @@ def build_handlers() -> list:
     return [
         CommandHandler("start", cmd_start),
         CommandHandler("list", cmd_list),
+        CommandHandler("unlock", cmd_unlock),
         CommandHandler("history", cmd_history),
         CommandHandler("addalias", cmd_addalias),
         CommandHandler("removealias", cmd_removealias),
