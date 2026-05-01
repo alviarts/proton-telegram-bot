@@ -319,6 +319,33 @@ def test_parse_uids_ignores_exists_and_recent_untagged_data() -> None:
     assert IMAPListener._parse_uids(lines) == [64]
 
 
+def test_extract_rfc822_payload_strips_asterisk_form() -> None:
+    """aioimaplib strips ``* `` from the untagged FETCH header, so the data
+    line becomes ``<seq> FETCH (RFC822 {N})``. The payload sits in the next
+    element typed as ``bytearray``. Regression test for the listener
+    silently dropping every email because it expected the legacy
+    ``* <seq> FETCH (UID <uid> RFC822 ...)`` shape."""
+    payload = b"From: a@x\r\nTo: b@y\r\n\r\nbody"
+    lines: list[bytes | str] = [
+        b"67 FETCH (RFC822 {25}",
+        bytearray(payload),
+        b" UID 67)",
+        b"command completed in 1234 microsec.",
+    ]
+    assert IMAPListener._extract_rfc822_payload(lines) == payload
+
+
+def test_extract_rfc822_payload_legacy_asterisk_form() -> None:
+    """If a future aioimaplib stops stripping the asterisk, parser still works."""
+    payload = b"From: a@x\r\nTo: b@y\r\n\r\nbody"
+    lines: list[bytes | str] = [
+        b"* 67 FETCH (UID 67 RFC822 {25})",
+        payload,
+        b")",
+    ]
+    assert IMAPListener._extract_rfc822_payload(lines) == payload
+
+
 def test_parse_uids_handles_empty_search() -> None:
     assert IMAPListener._parse_uids([b""]) == []
     assert IMAPListener._parse_uids([b"", b"command completed."]) == []

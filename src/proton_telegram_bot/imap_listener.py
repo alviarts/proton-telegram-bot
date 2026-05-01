@@ -28,7 +28,9 @@ AliasDiscoveryCallback = Callable[[int, set[str]], Awaitable[None]]
 # How often the listener polls for new messages (seconds).
 POLL_INTERVAL_SECONDS = 5
 RECONNECT_BACKOFF_SECONDS = (5, 15, 30, 60, 120)
-FETCH_RESPONSE_RE = re.compile(rb"^\* \d+ FETCH ", re.IGNORECASE)
+# aioimaplib strips the leading ``* `` from untagged responses, so the FETCH
+# data line is just ``<seq> FETCH (...)``. Accept both forms defensively.
+FETCH_RESPONSE_RE = re.compile(rb"^(?:\*\s+)?\d+\s+FETCH\b", re.IGNORECASE)
 
 
 class IMAPListener:
@@ -265,12 +267,20 @@ class IMAPListener:
     @staticmethod
     def _extract_rfc822_payload(lines: list[bytes | str]) -> bytes | None:
         # aioimaplib returns the FETCH response interleaved across lines.
-        # The element immediately following a FETCH line is the literal payload.
+        # The element immediately following a FETCH line is the literal payload
+        # (typed as ``bytearray``), so coerce to ``bytes`` for downstream
+        # email parsing.
         for index, line in enumerate(lines):
-            line_bytes = line.encode() if isinstance(line, str) else line
+            if isinstance(line, str):
+                line_bytes = line.encode()
+            elif isinstance(line, (bytes, bytearray)):
+                line_bytes = bytes(line)
+            else:
+                continue
             if FETCH_RESPONSE_RE.match(line_bytes) and index + 1 < len(lines):
                 payload = lines[index + 1]
                 if isinstance(payload, str):
                     return payload.encode("utf-8", errors="replace")
-                return payload
+                if isinstance(payload, (bytes, bytearray)):
+                    return bytes(payload)
         return None
