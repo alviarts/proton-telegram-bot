@@ -96,6 +96,32 @@ def _bot_manager(context: ContextTypes.DEFAULT_TYPE) -> ListenerManager:
     return cast(ListenerManager, context.application.bot_data["manager"])
 
 
+def _bot_settings(context: ContextTypes.DEFAULT_TYPE) -> Settings:
+    return cast(Settings, context.application.bot_data["settings"])
+
+
+def _build_captcha_url(
+    context: ContextTypes.DEFAULT_TYPE,
+    challenge: object,
+) -> str:
+    """Build the URL the user should open to solve the CAPTCHA.
+
+    When ``captcha_helper_base_url`` is configured, returns a URL that
+    points to the self-hosted captcha-helper page (which embeds the Proton
+    verification iframe and exposes the hCaptcha response token for the
+    user to copy).  Otherwise falls back to the raw Proton verification
+    URL (which won't expose the token — only useful for debugging).
+    """
+    from .proton_api import CaptchaChallenge
+
+    ch = cast(CaptchaChallenge, challenge)
+    settings = _bot_settings(context)
+    base = settings.captcha_helper_base_url.rstrip("/")
+    if base:
+        return f"{base}?token={ch.token}&methods=captcha"
+    return ch.web_url
+
+
 def _build_primary_keyboard(
     primaries: list[PrimaryAccount],
     alias_counts: dict[int, int] | None = None,
@@ -388,11 +414,12 @@ async def cmd_sync(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if isinstance(result, CaptchaChallenge):
         user_data = cast(dict, context.user_data)
         user_data["sync_challenge"] = result
+        captcha_url = _build_captcha_url(context, result)
         await update.effective_message.reply_text(  # type: ignore[union-attr]
             "Proton memerlukan verifikasi CAPTCHA.\n\n"
-            f"1. Buka link ini di browser:\n{result.web_url}\n\n"
+            f"1. Buka link ini di browser:\n{captcha_url}\n\n"
             "2. Selesaikan CAPTCHA\n"
-            "3. Setelah selesai, kirim 'done' di sini.\n\n"
+            "3. Copy token yang muncul, lalu kirim (paste) ke sini.\n\n"
             "Kirim /cancel untuk membatalkan.",
         )
         return SYNC_CAPTCHA
@@ -401,32 +428,26 @@ async def cmd_sync(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def sync_captcha_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle user confirming CAPTCHA is solved."""
+    """Handle user pasting the hCaptcha response token."""
     user_data = cast(dict, context.user_data)
     challenge = user_data.pop("sync_challenge", None)
     if challenge is None:
         await update.effective_message.reply_text("Sesi sync sudah kedaluwarsa. Coba /sync lagi.")  # type: ignore[union-attr]
         return ConversationHandler.END
 
-    text = (update.effective_message.text or "").strip().lower()  # type: ignore[union-attr]
-    if text == "done":
-        # User solved CAPTCHA on the web page; retry with the original token
-        await update.effective_message.reply_text("Mencoba ulang autentikasi...")  # type: ignore[union-attr]
-        try:
-            from .proton_api import complete_auth_with_captcha
+    text = (update.effective_message.text or "").strip()  # type: ignore[union-attr]
+    if text.lower() == "done":
+        # "done" is no longer valid — the user must paste the token.
+        user_data["sync_challenge"] = challenge  # keep challenge alive
+        await update.effective_message.reply_text(  # type: ignore[union-attr]
+            "Jangan kirim 'done'. Setelah CAPTCHA selesai, <b>copy token</b> "
+            "yang muncul di halaman lalu <b>paste di sini</b>.\n\n"
+            "Kirim /cancel untuk membatalkan.",
+            parse_mode=ParseMode.HTML,
+        )
+        return SYNC_CAPTCHA
 
-            session = await asyncio.to_thread(
-                complete_auth_with_captcha, challenge, challenge.token
-            )
-        except Exception as exc:
-            LOGGER.exception("CAPTCHA auth retry failed")
-            await update.effective_message.reply_text(  # type: ignore[union-attr]
-                f"Gagal setelah CAPTCHA: {exc}\nCoba /sync lagi."
-            )
-            return ConversationHandler.END
-        return await _sync_complete(update, context, session)
-
-    # User sent a captcha response token directly
+    # User pasted the hCaptcha response token.
     await update.effective_message.reply_text("Memverifikasi token CAPTCHA...")  # type: ignore[union-attr]
     try:
         from .proton_api import complete_auth_with_captcha
