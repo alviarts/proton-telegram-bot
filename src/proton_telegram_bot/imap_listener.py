@@ -53,6 +53,9 @@ class IMAPListener:
         self._mailbox = mailbox
         self._task: asyncio.Task[None] | None = None
         self._stop_event = asyncio.Event()
+        # Poked when the user requests an immediate poll so the listener
+        # interrupts its sleep and runs a fetch right away.
+        self._poke_event = asyncio.Event()
         self._last_seen_uid: int = 0
 
     def start(self) -> None:
@@ -62,6 +65,14 @@ class IMAPListener:
         self._task = asyncio.create_task(
             self._run_forever(), name=f"imap-listener-{self.chat_id}"
         )
+
+    def poke(self) -> None:
+        """Wake the listener immediately so it polls for new mail right away.
+
+        Safe to call from any task. If the listener is currently sleeping
+        between polls, this cancels the sleep and triggers the next fetch.
+        """
+        self._poke_event.set()
 
     async def stop(self) -> None:
         self._stop_event.set()
@@ -109,15 +120,23 @@ class IMAPListener:
             await self._scan_inbox_aliases(client)
 
             seconds_since_sync = 0
-            # Poll for new messages every POLL_INTERVAL_SECONDS.
+            # Poll for new messages every POLL_INTERVAL_SECONDS, or sooner if
+            # the user pokes us via /list's "Cek email sekarang" button.
             while not self._stop_event.is_set():
+                self._poke_event.clear()
                 await self._fetch_new_messages(client)
+                stop_task = asyncio.ensure_future(self._stop_event.wait())
+                poke_task = asyncio.ensure_future(self._poke_event.wait())
                 try:
-                    await asyncio.wait_for(
-                        self._stop_event.wait(), timeout=POLL_INTERVAL_SECONDS
+                    await asyncio.wait(
+                        {stop_task, poke_task},
+                        timeout=POLL_INTERVAL_SECONDS,
+                        return_when=asyncio.FIRST_COMPLETED,
                     )
-                except TimeoutError:
-                    pass
+                finally:
+                    for task in (stop_task, poke_task):
+                        if not task.done():
+                            task.cancel()
 
                 # Re-issue NOOP to keep the connection alive and trigger
                 # server-side mailbox updates before the next search.

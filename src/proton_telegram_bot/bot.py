@@ -41,6 +41,7 @@ CB_REFRESH = "refresh"
 CB_RESET = "reset"
 CB_DELETE = "delete"
 CB_NOOP = "noop"
+CB_POLL_NOW = "poll_now"
 
 
 def _is_allowed(settings: Settings, user_id: int | None) -> bool:
@@ -107,8 +108,22 @@ def _build_alias_keyboard(
                     )
                 ]
             )
-    rows.append([InlineKeyboardButton("🔄 Refresh", callback_data=CB_REFRESH)])
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "📥 Cek email sekarang", callback_data=CB_POLL_NOW
+            )
+        ]
+    )
+    rows.append([InlineKeyboardButton("🔄 Refresh daftar", callback_data=CB_REFRESH)])
     return InlineKeyboardMarkup(rows)
+
+
+def _build_poll_now_keyboard() -> InlineKeyboardMarkup:
+    """Standalone 'check email now' button used in the lock-confirmation message."""
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("📥 Cek email sekarang", callback_data=CB_POLL_NOW)]]
+    )
 
 
 # --------------------------------------------------------------- /start
@@ -588,9 +603,22 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             "Bot sekarang <b>terkunci</b> ke alias ini — hanya email yang "
             "dikirim ke alamat di atas yang akan diteruskan ke chat ini. "
             "Alias tetap di /list dan terus terima email sampai kamu pilih "
-            "alias lain atau kirim /unlock.",
+            "alias lain atau kirim /unlock.\n\n"
+            "Klik tombol di bawah kalau email kamu belum sampai dan kamu "
+            "ingin cek manual (tanpa nunggu polling 5 detik).",
             parse_mode=ParseMode.HTML,
+            reply_markup=_build_poll_now_keyboard(),
         )
+        return
+    if data == CB_POLL_NOW:
+        manager = _bot_manager(context)
+        ok = manager.poke_user(chat_id)
+        if ok:
+            await query.answer("📥 Mengecek...", show_alert=False)
+        else:
+            await query.answer(
+                "Listener belum jalan — kirim /connect dulu.", show_alert=True
+            )
         return
 
 

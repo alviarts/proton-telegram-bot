@@ -66,6 +66,15 @@ class ListenerManager:
         async with self._lock:
             await self._stop_locked(chat_id)
 
+    def poke_user(self, chat_id: int) -> bool:
+        """Trigger an immediate IMAP poll for the given chat. Returns False if
+        no listener is running for that chat."""
+        listener = self._listeners.get(chat_id)
+        if listener is None:
+            return False
+        listener.poke()
+        return True
+
     async def stop_all(self) -> None:
         async with self._lock:
             for chat_id in list(self._listeners.keys()):
