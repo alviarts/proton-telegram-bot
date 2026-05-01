@@ -6,6 +6,7 @@ from email.message import EmailMessage
 from proton_telegram_bot.email_parser import (
     extract_recipients,
     find_matching_alias,
+    html_to_text,
     parse_message,
     summarize,
 )
@@ -93,3 +94,45 @@ def test_summarize_falls_back_to_html_when_no_text() -> None:
     summary = summarize(parsed)
     # Either the plain or html body is fine — both contain readable text.
     assert summary["body"]
+
+
+def test_html_to_text_strips_tags_and_decodes_entities() -> None:
+    src = "<div>Halo <b>dunia</b>!</div><p>Apa kabar &amp; selamat?</p>"
+    text = html_to_text(src)
+    assert "<" not in text and ">" not in text
+    assert "Halo dunia!" in text
+    assert "Apa kabar & selamat?" in text
+
+
+def test_html_to_text_preserves_paragraph_breaks() -> None:
+    src = "<p>Baris satu</p><p>Baris dua</p>"
+    text = html_to_text(src)
+    # Paragraph boundary is rendered as a newline in the plain-text output.
+    assert "Baris satu" in text and "Baris dua" in text
+    assert "\n" in text
+
+
+def test_html_to_text_drops_script_and_style() -> None:
+    src = "<style>.x{color:red}</style><script>alert(1)</script><p>Hai</p>"
+    text = html_to_text(src)
+    assert "alert" not in text
+    assert "color" not in text
+    assert "Hai" in text
+
+
+def test_summarize_html_only_returns_clean_text_no_tags() -> None:
+    """Regression: an HTML-only body must NOT leak raw <div>/<p> markup to Telegram."""
+    msg = EmailMessage()
+    msg["From"] = "partner@biz.example"
+    msg["To"] = "vielz50@proton.me"
+    msg["Subject"] = "HTML only"
+    # Deliberately do NOT call set_content() so the message is single-part HTML
+    # — this mirrors what Gmail's "rich" composer sometimes produces.
+    msg.set_payload("<div dir=\"ltr\">Halo!<br>Ini isinya.</div>")
+    msg.set_type("text/html")
+    parsed = parse_message(msg.as_bytes())
+    summary = summarize(parsed)
+    assert "<div" not in summary["body"]
+    assert "<br" not in summary["body"]
+    assert "Halo!" in summary["body"]
+    assert "Ini isinya." in summary["body"]

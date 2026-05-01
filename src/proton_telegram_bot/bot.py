@@ -1,6 +1,7 @@
 """Telegram bot wiring: handlers, menus, and notifier implementation."""
 from __future__ import annotations
 
+import asyncio
 import html
 import logging
 from typing import cast
@@ -25,18 +26,33 @@ from .config import Settings
 from .crypto import CredentialCipher
 from .db import Database
 from .manager import ListenerManager, Notifier
-from .models import AliasRecord, AliasStatus
+from .models import AliasRecord, AliasStatus, PrimaryAccount
 
 LOGGER = logging.getLogger(__name__)
 
 # Conversation states for /connect
-CONNECT_HOST, CONNECT_PORT, CONNECT_USERNAME, CONNECT_PASSWORD, CONNECT_SSL = range(5)
+(
+    CONNECT_EMAIL,
+    CONNECT_HOST,
+    CONNECT_PORT,
+    CONNECT_USERNAME,
+    CONNECT_PASSWORD,
+    CONNECT_SSL,
+) = range(6)
+
+# Conversation states for /sync
+SYNC_CAPTCHA = 10
 
 CB_PICK = "pick"
 CB_REFRESH = "refresh"
 CB_RESET = "reset"
 CB_DELETE = "delete"
 CB_NOOP = "noop"
+CB_POLL_NOW = "poll_now"
+# Two-level primary/alias UI:
+CB_PICK_PRIMARY = "pickp"
+CB_BACK_TO_PRIMARIES = "backp"
+CB_DEL_PRIMARY = "delp"
 
 
 def _is_allowed(settings: Settings, user_id: int | None) -> bool:
@@ -80,25 +96,156 @@ def _bot_manager(context: ContextTypes.DEFAULT_TYPE) -> ListenerManager:
     return cast(ListenerManager, context.application.bot_data["manager"])
 
 
-def _build_alias_keyboard(aliases: list[AliasRecord]) -> InlineKeyboardMarkup:
+def _bot_settings(context: ContextTypes.DEFAULT_TYPE) -> Settings:
+    return cast(Settings, context.application.bot_data["settings"])
+
+
+def _build_captcha_url(
+    context: ContextTypes.DEFAULT_TYPE,
+    challenge: object,
+) -> str:
+    """Build the URL the user should open to solve the CAPTCHA.
+
+    When ``captcha_helper_base_url`` is configured, returns a URL that
+    points to the self-hosted captcha-helper page (which embeds the Proton
+    verification iframe and exposes the hCaptcha response token for the
+    user to copy).  Otherwise falls back to the raw Proton verification
+    URL (which won't expose the token — only useful for debugging).
+    """
+    from .proton_api import CaptchaChallenge
+
+    ch = cast(CaptchaChallenge, challenge)
+    settings = _bot_settings(context)
+    base = settings.captcha_helper_base_url.rstrip("/")
+    if base:
+        return f"{base}?token={ch.token}&methods=captcha"
+    return ch.web_url
+
+
+def _build_primary_keyboard(
+    primaries: list[PrimaryAccount],
+    alias_counts: dict[int, int] | None = None,
+    active_primary_id: int | None = None,
+) -> InlineKeyboardMarkup:
+    """Top-level keyboard listing every Proton account a user owns.
+
+    Each row drills into the alias list of that primary. ``alias_counts``
+    annotates each label with ``(N alias)``. ``active_primary_id`` flags the
+    primary whose alias is currently locked (purely visual).
+    """
+    rows: list[list[InlineKeyboardButton]] = []
+    if not primaries:
+        rows.append(
+            [InlineKeyboardButton("(belum ada email utama)", callback_data=CB_NOOP)]
+        )
+    else:
+        for primary in primaries:
+            count = (alias_counts or {}).get(primary.id, 0)
+            marker = "🔒 " if active_primary_id == primary.id else "📧 "
+            label = f"{marker}{primary.email} ({count} alias)"
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        label,
+                        callback_data=f"{CB_PICK_PRIMARY}:{primary.id}",
+                    )
+                ]
+            )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "📥 Cek email sekarang", callback_data=CB_POLL_NOW
+            )
+        ]
+    )
+    rows.append(
+        [InlineKeyboardButton("🔄 Refresh daftar", callback_data=CB_REFRESH)]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+def _build_alias_keyboard_for_primary(
+    primary: PrimaryAccount,
+    aliases: list[AliasRecord],
+    active_alias_id: int | None = None,
+) -> InlineKeyboardMarkup:
+    """Drill-down keyboard showing aliases owned by a single primary."""
     rows: list[list[InlineKeyboardButton]] = []
     if not aliases:
         rows.append(
-            [InlineKeyboardButton("(belum ada alias tersedia)", callback_data=CB_NOOP)]
+            [InlineKeyboardButton("(belum ada alias)", callback_data=CB_NOOP)]
         )
     else:
         for alias in aliases:
             # callback_data must be ≤ 64 bytes (Telegram API), so we use the
             # alias's numeric id rather than the email address itself.
+            label = alias.email
+            if active_alias_id is not None and alias.id == active_alias_id:
+                label = f"🔒 {label}"
             rows.append(
                 [
                     InlineKeyboardButton(
-                        alias.email, callback_data=f"{CB_PICK}:{alias.id}"
+                        label, callback_data=f"{CB_PICK}:{alias.id}"
                     )
                 ]
             )
-    rows.append([InlineKeyboardButton("🔄 Refresh", callback_data=CB_REFRESH)])
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "📥 Cek email sekarang", callback_data=CB_POLL_NOW
+            ),
+            InlineKeyboardButton(
+                "← Email utama", callback_data=CB_BACK_TO_PRIMARIES
+            ),
+        ]
+    )
     return InlineKeyboardMarkup(rows)
+
+
+def _build_poll_now_keyboard() -> InlineKeyboardMarkup:
+    """Standalone 'check email now' button used in the lock-confirmation message."""
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("📥 Cek email sekarang", callback_data=CB_POLL_NOW)]]
+    )
+
+
+async def _alias_count_per_primary(
+    db: Database, chat_id: int, primaries: list[PrimaryAccount]
+) -> dict[int, int]:
+    counts: dict[int, int] = {}
+    for primary in primaries:
+        aliases = await db.list_aliases(chat_id, primary_id=primary.id)
+        counts[primary.id] = len(aliases)
+    return counts
+
+
+async def _show_primary_list(
+    update: Update, db: Database, chat_id: int
+) -> None:
+    """Render the top-level primary keyboard. Used by /list and /start."""
+    primaries = await db.list_primary_accounts(chat_id)
+    counts = await _alias_count_per_primary(db, chat_id, primaries)
+    active = await db.get_active_alias(chat_id)
+    active_primary_id = active.primary_id if active else None
+    if primaries:
+        header = f"📧 Email utama kamu ({len(primaries)}):"
+    else:
+        header = (
+            "Belum ada email utama yang terdaftar. "
+            "Kirim /connect untuk menambahkan akun Proton + Bridge."
+        )
+    if active is not None:
+        header += (
+            f"\n🔒 Alias aktif: <b>{html.escape(active.email)}</b>"
+            " — kirim /unlock untuk lepas."
+        )
+    await update.effective_message.reply_text(  # type: ignore[union-attr]
+        header,
+        reply_markup=_build_primary_keyboard(
+            primaries, counts, active_primary_id
+        ),
+        parse_mode=ParseMode.HTML,
+    )
 
 
 # --------------------------------------------------------------- /start
@@ -111,22 +258,38 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     db = _bot_db(context)
     await db.upsert_user(chat.id)
-    user = await db.get_user(chat.id)
-    if user is None or not user.has_credentials:
+    commands_help = (
+        "\n\n<b>Perintah yang tersedia:</b>\n"
+        "/start — Tampilkan pesan ini\n"
+        "/connect — Setup kredensial IMAP Proton Bridge\n"
+        "/disconnect — Hapus kredensial dan stop listener\n"
+        "/sync &lt;user&gt; &lt;pass&gt; — Auto-sync alias dari akun Proton\n"
+        "/addalias — Tambah alias secara manual\n"
+        "/removealias — Hapus alias\n"
+        "/list — Lihat semua alias dan pilih yang aktif\n"
+        "/unlock — Lepas kunci alias yang sedang aktif\n"
+        "/history — Lihat alias yang sudah terpakai\n"
+        "/reset — Kembalikan alias ke daftar tersedia\n"
+        "/cancel — Batalkan dialog /connect"
+    )
+    primaries = await db.list_primary_accounts(chat.id)
+    if not primaries:
         await update.effective_message.reply_text(  # type: ignore[union-attr]
             "Halo! Aku akan memberitahumu kalau ada email masuk ke alias Proton-mu.\n\n"
             "Langkah:\n"
-            "1) Jalankan Proton Bridge di komputermu (atau VPS).\n"
-            "2) Kirim /connect untuk memasukkan detail IMAP dari Bridge.\n"
-            "3) Kirim /addalias diikuti daftar alamat alias-mu.\n"
-            "4) Kirim /list untuk melihat alias yang masih tersedia."
+            "1) Jalankan Proton Bridge dan login akun Proton di sana.\n"
+            "2) Kirim /connect untuk daftarin akun itu ke bot.\n"
+            "3) Kamu bisa /connect lagi untuk akun Proton lain (multi-akun didukung).\n"
+            "4) Kirim /list untuk lihat semua email utama + alias-aliasnya."
+            + commands_help,
+            parse_mode=ParseMode.HTML,
         )
         return
-    aliases = await db.list_aliases(chat.id, status=AliasStatus.AVAILABLE)
     await update.effective_message.reply_text(  # type: ignore[union-attr]
-        "Halo! Berikut alias yang masih tersedia:",
-        reply_markup=_build_alias_keyboard(aliases),
+        "Halo!" + commands_help,
+        parse_mode=ParseMode.HTML,
     )
+    await _show_primary_list(update, db, chat.id)
 
 
 # --------------------------------------------------------------- /list
@@ -138,11 +301,7 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if chat is None:
         return
     db = _bot_db(context)
-    aliases = await db.list_aliases(chat.id, status=AliasStatus.AVAILABLE)
-    await update.effective_message.reply_text(  # type: ignore[union-attr]
-        "Alias yang masih tersedia:",
-        reply_markup=_build_alias_keyboard(aliases),
-    )
+    await _show_primary_list(update, db, chat.id)
 
 
 @_gate
@@ -195,16 +354,153 @@ async def cmd_addalias(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         return
     db = _bot_db(context)
-    inserted = await db.add_aliases(chat.id, valid)
+    primaries = await db.list_primary_accounts(chat.id)
+    if not primaries:
+        await update.effective_message.reply_text(  # type: ignore[union-attr]
+            "Belum ada email utama. Kirim /connect dulu untuk tambah akun Proton."
+        )
+        return
+    target_primary = primaries[0]
+    if len(primaries) > 1:
+        await update.effective_message.reply_text(  # type: ignore[union-attr]
+            f"Ada {len(primaries)} email utama — alias ini akan ditambahkan ke "
+            f"<b>{html.escape(target_primary.email)}</b> (akun pertama). "
+            "Untuk pindah ke akun lain pakai /list dulu, atau hapus + tambah "
+            "ulang via akun yang dimaksud.",
+            parse_mode=ParseMode.HTML,
+        )
+    inserted = await db.add_aliases(chat.id, valid, primary_id=target_primary.id)
     skipped = len(valid) - inserted
-    msg = f"Ditambahkan: {inserted} alias."
+    msg = (
+        f"Ditambahkan: {inserted} alias ke "
+        f"<b>{html.escape(target_primary.email)}</b>."
+    )
     if skipped:
         msg += f" Sudah ada sebelumnya: {skipped}."
-    aliases = await db.list_aliases(chat.id, status=AliasStatus.AVAILABLE)
     await update.effective_message.reply_text(  # type: ignore[union-attr]
         msg,
-        reply_markup=_build_alias_keyboard(aliases),
+        parse_mode=ParseMode.HTML,
     )
+    await _show_primary_list(update, db, chat.id)
+
+
+@_gate
+async def cmd_sync(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Fetch addresses from the Proton API and add them as aliases."""
+    chat = update.effective_chat
+    if chat is None:
+        return ConversationHandler.END
+    args = context.args or []
+    if len(args) < 2:
+        await update.effective_message.reply_text(  # type: ignore[union-attr]
+            "Pakai: /sync <username_proton> <password_proton>\n"
+            "Contoh: /sync vielz43 passwordku\n\n"
+            "Username dan password akun Proton (bukan Bridge)."
+        )
+        return ConversationHandler.END
+    username, password = args[0], " ".join(args[1:])
+    await update.effective_message.reply_text("Menghubungi Proton API...")  # type: ignore[union-attr]
+    try:
+        from .proton_api import CaptchaChallenge, start_auth
+
+        result = await asyncio.to_thread(start_auth, username, password)
+    except Exception as exc:
+        LOGGER.exception("proton API sync failed")
+        await update.effective_message.reply_text(  # type: ignore[union-attr]
+            f"Gagal mengambil alamat dari Proton: {exc}"
+        )
+        return ConversationHandler.END
+
+    if isinstance(result, CaptchaChallenge):
+        user_data = cast(dict, context.user_data)
+        user_data["sync_challenge"] = result
+        captcha_url = _build_captcha_url(context, result)
+        await update.effective_message.reply_text(  # type: ignore[union-attr]
+            "Proton memerlukan verifikasi CAPTCHA.\n\n"
+            f"1. Buka link ini di browser:\n{captcha_url}\n\n"
+            "2. Selesaikan CAPTCHA\n"
+            "3. Copy token yang muncul, lalu kirim (paste) ke sini.\n\n"
+            "Kirim /cancel untuk membatalkan.",
+        )
+        return SYNC_CAPTCHA
+
+    return await _sync_complete(update, context, result)
+
+
+async def sync_captcha_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle user pasting the hCaptcha response token."""
+    user_data = cast(dict, context.user_data)
+    challenge = user_data.pop("sync_challenge", None)
+    if challenge is None:
+        await update.effective_message.reply_text("Sesi sync sudah kedaluwarsa. Coba /sync lagi.")  # type: ignore[union-attr]
+        return ConversationHandler.END
+
+    text = (update.effective_message.text or "").strip()  # type: ignore[union-attr]
+    if text.lower() == "done":
+        # "done" is no longer valid — the user must paste the token.
+        user_data["sync_challenge"] = challenge  # keep challenge alive
+        await update.effective_message.reply_text(  # type: ignore[union-attr]
+            "Jangan kirim 'done'. Setelah CAPTCHA selesai, <b>copy token</b> "
+            "yang muncul di halaman lalu <b>paste di sini</b>.\n\n"
+            "Kirim /cancel untuk membatalkan.",
+            parse_mode=ParseMode.HTML,
+        )
+        return SYNC_CAPTCHA
+
+    # User pasted the hCaptcha response token.
+    await update.effective_message.reply_text("Memverifikasi token CAPTCHA...")  # type: ignore[union-attr]
+    try:
+        from .proton_api import complete_auth_with_captcha
+
+        session = await asyncio.to_thread(complete_auth_with_captcha, challenge, text)
+    except Exception as exc:
+        LOGGER.exception("CAPTCHA token auth failed")
+        await update.effective_message.reply_text(  # type: ignore[union-attr]
+            f"Token CAPTCHA tidak valid: {exc}\nCoba /sync lagi."
+        )
+        return ConversationHandler.END
+    return await _sync_complete(update, context, session)
+
+
+async def _sync_complete(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, session: object
+) -> int:
+    """Finish the /sync flow: fetch addresses and add as aliases."""
+    chat = update.effective_chat
+    if chat is None:
+        return ConversationHandler.END
+    try:
+        from .proton_api import fetch_addresses_from_session
+
+        addresses = await asyncio.to_thread(fetch_addresses_from_session, session)
+    except Exception as exc:
+        LOGGER.exception("address fetch failed")
+        await update.effective_message.reply_text(  # type: ignore[union-attr]
+            f"Gagal mengambil alamat: {exc}"
+        )
+        return ConversationHandler.END
+    if not addresses:
+        await update.effective_message.reply_text("Tidak ada alamat aktif di akun Proton.")  # type: ignore[union-attr]
+        return ConversationHandler.END
+    db = _bot_db(context)
+    primaries = await db.list_primary_accounts(chat.id)
+    target_primary_id = primaries[0].id if primaries else None
+    inserted = await db.add_aliases(
+        chat.id, addresses, primary_id=target_primary_id
+    )
+    total = len(addresses)
+    skipped = total - inserted
+    msg = f"Sync selesai! Ditemukan {total} alamat.\nDitambahkan: {inserted}."
+    if skipped:
+        msg += f" Sudah ada: {skipped}."
+    if primaries:
+        msg += f"\nDilampirkan ke: <b>{html.escape(primaries[0].email)}</b>"
+    await update.effective_message.reply_text(  # type: ignore[union-attr]
+        msg,
+        parse_mode=ParseMode.HTML,
+    )
+    await _show_primary_list(update, db, chat.id)
+    return ConversationHandler.END
 
 
 @_gate
@@ -241,8 +537,41 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 @_gate
 async def cmd_connect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    chat = update.effective_chat
+    if chat is None:
+        return ConversationHandler.END
+    db = _bot_db(context)
+    existing = await db.list_primary_accounts(chat.id)
+    intro = (
+        "Tambah akun Proton baru. Setiap kali /connect kamu menambahkan satu "
+        "akun email utama (multi-akun didukung)."
+    )
+    if existing:
+        emails = ", ".join(p.email for p in existing)
+        intro += (
+            f"\n\nSaat ini terdaftar: <b>{html.escape(emails)}</b>. "
+            "Kalau email yang sama dimasukkan ulang, kredensial-nya akan ditimpa."
+        )
     await update.effective_message.reply_text(  # type: ignore[union-attr]
-        "Setup Proton Bridge IMAP. Kirim host (default: 127.0.0.1):"
+        intro,
+        parse_mode=ParseMode.HTML,
+    )
+    await update.effective_message.reply_text(  # type: ignore[union-attr]
+        "Alamat email Proton akun ini? (mis. vielz43@proton.me)"
+    )
+    return CONNECT_EMAIL
+
+
+async def connect_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = (update.effective_message.text or "").strip()  # type: ignore[union-attr]
+    if "@" not in text:
+        await update.effective_message.reply_text(  # type: ignore[union-attr]
+            "Itu bukan alamat email yang valid. Masukkan email Proton-nya:"
+        )
+        return CONNECT_EMAIL
+    context.user_data["primary_email"] = text.lower()  # type: ignore[index]
+    await update.effective_message.reply_text(  # type: ignore[union-attr]
+        "Host Bridge? (default: 127.0.0.1)"
     )
     return CONNECT_HOST
 
@@ -263,16 +592,16 @@ async def connect_port(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         return CONNECT_PORT
     context.user_data["imap_port"] = int(text)  # type: ignore[index]
     await update.effective_message.reply_text(  # type: ignore[union-attr]
-        "Username Bridge? (biasanya alamat email Proton-mu)"
+        "Username IMAP Bridge? (biasanya sama dengan alamat email di atas — "
+        "tekan Enter / kirim '.' untuk pakai email yang sudah kamu kasih)"
     )
     return CONNECT_USERNAME
 
 
 async def connect_username(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = (update.effective_message.text or "").strip()  # type: ignore[union-attr]
-    if not text:
-        await update.effective_message.reply_text("Username tidak boleh kosong:")  # type: ignore[union-attr]
-        return CONNECT_USERNAME
+    if not text or text == ".":
+        text = cast(dict, context.user_data)["primary_email"]
     context.user_data["imap_username"] = text  # type: ignore[index]
     await update.effective_message.reply_text(  # type: ignore[union-attr]
         "Password yang di-generate Proton Bridge? (akan disimpan terenkripsi). "
@@ -304,8 +633,9 @@ async def connect_ssl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     manager = _bot_manager(context)
     user_data = cast(dict, context.user_data)
     encrypted = cipher.encrypt(user_data["imap_password"])
-    await db.set_credentials(
+    primary_id = await db.add_primary_account(
         chat_id=chat.id,
+        email=user_data["primary_email"],
         host=user_data["imap_host"],
         port=user_data["imap_port"],
         username=user_data["imap_username"],
@@ -314,18 +644,24 @@ async def connect_ssl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     )
     user_data.pop("imap_password", None)
     await update.effective_message.reply_text(  # type: ignore[union-attr]
-        "Kredensial disimpan. Mulai memantau inbox..."
+        f"Kredensial untuk <b>{html.escape(user_data['primary_email'])}</b> "
+        "disimpan. Mulai memantau inbox...",
+        parse_mode=ParseMode.HTML,
     )
     try:
-        await manager.start_for_user(chat.id)
+        await manager.start_for_primary(primary_id)
     except Exception as exc:
-        LOGGER.exception("failed to start listener after /connect")
+        LOGGER.exception(
+            "failed to start listener after /connect for primary %s", primary_id
+        )
         await update.effective_message.reply_text(  # type: ignore[union-attr]
-            f"Gagal terhubung ke Bridge: {exc}\nCoba /connect lagi setelah Bridge siap."
+            f"Gagal terhubung ke Bridge: {exc}\n"
+            "Coba /connect lagi setelah Bridge siap, atau /disconnect untuk hapus."
         )
         return ConversationHandler.END
     await update.effective_message.reply_text(  # type: ignore[union-attr]
-        "Tersambung. Kirim /addalias untuk daftarkan alamat alias-mu."
+        "Tersambung! Bot akan auto-discover alias dari INBOX akun ini. "
+        "Kirim /list untuk lihat semua email utama."
     )
     return ConversationHandler.END
 
@@ -339,15 +675,53 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 @_gate
+async def cmd_unlock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Release the active-alias lock so no email is forwarded until next pick."""
+    chat = update.effective_chat
+    if chat is None:
+        return
+    db = _bot_db(context)
+    active = await db.get_active_alias(chat.id)
+    if active is None:
+        await update.effective_message.reply_text(  # type: ignore[union-attr]
+            "Tidak ada alias yang sedang aktif. Pilih satu di /list."
+        )
+        return
+    await db.set_active_alias(chat.id, None)
+    await update.effective_message.reply_text(  # type: ignore[union-attr]
+        f"🔓 Kunci dilepas dari <b>{html.escape(active.email)}</b>. "
+        "Pilih alias di /list saat siap menerima email lagi.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@_gate
 async def cmd_disconnect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat = update.effective_chat
     if chat is None:
         return
     db = _bot_db(context)
-    manager = _bot_manager(context)
-    await manager.stop_for_user(chat.id)
-    await db.clear_credentials(chat.id)
-    await update.effective_message.reply_text("Kredensial dihapus dan listener dihentikan.")  # type: ignore[union-attr]
+    primaries = await db.list_primary_accounts(chat.id)
+    if not primaries:
+        await update.effective_message.reply_text(  # type: ignore[union-attr]
+            "Belum ada email utama yang terdaftar."
+        )
+        return
+    rows: list[list[InlineKeyboardButton]] = []
+    for primary in primaries:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"❌ Hapus {primary.email}",
+                    callback_data=f"{CB_DEL_PRIMARY}:{primary.id}",
+                )
+            ]
+        )
+    await update.effective_message.reply_text(  # type: ignore[union-attr]
+        "Pilih akun yang mau dihapus (listener akan dihentikan + kredensial "
+        "+ alias-aliasnya juga dihapus):",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
 
 
 # --------------------------------------------------------------- callback queries
@@ -365,11 +739,70 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     data = query.data
     if data == CB_NOOP:
         return
-    if data == CB_REFRESH:
-        aliases = await db.list_aliases(chat_id, status=AliasStatus.AVAILABLE)
+    if data == CB_REFRESH or data == CB_BACK_TO_PRIMARIES:
+        primaries = await db.list_primary_accounts(chat_id)
+        counts = await _alias_count_per_primary(db, chat_id, primaries)
+        active = await db.get_active_alias(chat_id)
         try:
             await query.edit_message_reply_markup(
-                reply_markup=_build_alias_keyboard(aliases)
+                reply_markup=_build_primary_keyboard(
+                    primaries,
+                    counts,
+                    active.primary_id if active else None,
+                )
+            )
+        except Exception:
+            pass
+        return
+    if data.startswith(f"{CB_PICK_PRIMARY}:"):
+        raw_id = data.split(":", 1)[1]
+        try:
+            primary_id = int(raw_id)
+        except ValueError:
+            await query.answer("Email utama tidak valid.", show_alert=True)
+            return
+        primary = await db.get_primary_account(chat_id, primary_id)
+        if primary is None:
+            await query.answer("Email utama tidak ditemukan.", show_alert=True)
+            return
+        aliases = await db.list_aliases(chat_id, primary_id=primary_id)
+        active = await db.get_active_alias(chat_id)
+        active_alias_id = (
+            active.id
+            if active is not None and active.primary_id == primary_id
+            else None
+        )
+        try:
+            await query.edit_message_text(
+                f"📧 Alias di <b>{html.escape(primary.email)}</b> "
+                f"({len(aliases)} alias):",
+                reply_markup=_build_alias_keyboard_for_primary(
+                    primary, aliases, active_alias_id
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+        return
+    if data.startswith(f"{CB_DEL_PRIMARY}:"):
+        raw_id = data.split(":", 1)[1]
+        try:
+            primary_id = int(raw_id)
+        except ValueError:
+            await query.answer("Email utama tidak valid.", show_alert=True)
+            return
+        primary = await db.get_primary_account(chat_id, primary_id)
+        if primary is None:
+            await query.answer("Email utama tidak ditemukan.", show_alert=True)
+            return
+        manager = _bot_manager(context)
+        await manager.stop_for_primary(primary_id)
+        await db.delete_primary_account(chat_id, primary_id)
+        try:
+            await query.edit_message_text(
+                f"❌ Akun <b>{html.escape(primary.email)}</b> + alias-aliasnya "
+                "dihapus, listener dihentikan.",
+                parse_mode=ParseMode.HTML,
             )
         except Exception:
             pass
@@ -385,18 +818,49 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if alias is None:
             await query.edit_message_text("Alias tidak ditemukan.")
             return
-        if alias.status == AliasStatus.CONSUMED:
-            await query.edit_message_text(
-                f"Alias <b>{html.escape(alias.email)}</b> sudah dipakai.",
-                parse_mode=ParseMode.HTML,
-            )
+        # Idempotent: if the user clicks the alias that's already locked, just
+        # acknowledge without re-sending the "Aktif" announcement (the user
+        # was double-tapping otherwise — that's where the duplicate came from).
+        current = await db.get_active_alias(chat_id)
+        if current is not None and current.id == alias.id:
+            await query.answer("Sudah aktif.", show_alert=False)
             return
+        await db.set_active_alias(chat_id, alias.id)
+        # Refresh the inline keyboard so the 🔒 marker moves to the new alias
+        # in-place (no second list message clutter).
+        if alias.primary_id is not None:
+            primary = await db.get_primary_account(chat_id, alias.primary_id)
+            aliases = await db.list_aliases(chat_id, primary_id=alias.primary_id)
+            if primary is not None:
+                try:
+                    await query.edit_message_reply_markup(
+                        reply_markup=_build_alias_keyboard_for_primary(
+                            primary, aliases, alias.id
+                        )
+                    )
+                except Exception:
+                    pass
         await query.message.reply_text(  # type: ignore[union-attr]
-            f"Aktif: <b>{html.escape(alias.email)}</b>\n"
-            "Kasih alamat ini ke rekan bisnismu. Aku tunggu emailnya, "
-            "dan akan kirim isinya ke sini begitu masuk.",
+            f"🔒 Aktif: <b>{html.escape(alias.email)}</b>\n"
+            "Bot sekarang <b>terkunci</b> ke alias ini — hanya email yang "
+            "dikirim ke alamat di atas yang akan diteruskan ke chat ini. "
+            "Alias tetap di /list dan terus terima email sampai kamu pilih "
+            "alias lain atau kirim /unlock.\n\n"
+            "Klik tombol di bawah kalau email kamu belum sampai dan kamu "
+            "ingin cek manual (tanpa nunggu polling 5 detik).",
             parse_mode=ParseMode.HTML,
+            reply_markup=_build_poll_now_keyboard(),
         )
+        return
+    if data == CB_POLL_NOW:
+        manager = _bot_manager(context)
+        ok = manager.poke_user(chat_id)
+        if ok:
+            await query.answer("📥 Mengecek...", show_alert=False)
+        else:
+            await query.answer(
+                "Listener belum jalan — kirim /connect dulu.", show_alert=True
+            )
         return
 
 
@@ -421,6 +885,23 @@ class TelegramNotifier(Notifier):
             parse_mode=ParseMode.HTML,
         )
 
+    async def notify_aliases_discovered(
+        self,
+        chat_id: int,
+        aliases: list[str],
+    ) -> None:
+        if not aliases:
+            return
+        lines = [f"<b>Auto-sync:</b> {len(aliases)} alias baru ditemukan:"]
+        for alias in sorted(aliases):
+            lines.append(f"• <code>{html.escape(alias)}</code>")
+        lines.append("\n/list untuk lihat semua alias.")
+        await self._application.bot.send_message(
+            chat_id=chat_id,
+            text="\n".join(lines),
+            parse_mode=ParseMode.HTML,
+        )
+
 
 # Telegram caps each message at 4096 characters; we leave headroom for the rendered
 # trailer that the helper below appends when truncating.
@@ -442,7 +923,11 @@ def _render_email_message(alias_email: str, summary: dict[str, str]) -> str:
         f"<b>Subjek:</b> {html.escape(summary.get('subject', ''))}\n"
         f"<b>Tanggal:</b> {html.escape(summary.get('date', ''))}\n\n"
     )
-    footer = "\n\nAlias ini sudah dihapus dari daftar. /list untuk lihat sisanya."
+    footer = (
+        "\n\n🔒 Alias masih aktif — email berikutnya ke alamat ini akan "
+        "diteruskan juga. Kirim /unlock untuk lepas kunci, atau pilih "
+        "alias lain di /list."
+    )
     overhead = len(header) + len("<pre></pre>") + len(footer)
     available = _TELEGRAM_MESSAGE_LIMIT - overhead
     truncated = False
@@ -479,6 +964,7 @@ def build_handlers() -> list:
     connect_conv = ConversationHandler(
         entry_points=[CommandHandler("connect", cmd_connect)],
         states={
+            CONNECT_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, connect_email)],
             CONNECT_HOST: [MessageHandler(filters.TEXT & ~filters.COMMAND, connect_host)],
             CONNECT_PORT: [MessageHandler(filters.TEXT & ~filters.COMMAND, connect_port)],
             CONNECT_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, connect_username)],
@@ -490,14 +976,28 @@ def build_handlers() -> list:
         persistent=False,
     )
 
+    sync_conv = ConversationHandler(
+        entry_points=[CommandHandler("sync", cmd_sync)],
+        states={
+            SYNC_CAPTCHA: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, sync_captcha_done),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cmd_cancel)],
+        name="sync",
+        persistent=False,
+    )
+
     return [
         CommandHandler("start", cmd_start),
         CommandHandler("list", cmd_list),
+        CommandHandler("unlock", cmd_unlock),
         CommandHandler("history", cmd_history),
         CommandHandler("addalias", cmd_addalias),
         CommandHandler("removealias", cmd_removealias),
         CommandHandler("reset", cmd_reset),
         CommandHandler("disconnect", cmd_disconnect),
         connect_conv,
+        sync_conv,
         CallbackQueryHandler(on_callback),
     ]
