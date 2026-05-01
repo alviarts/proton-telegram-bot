@@ -35,6 +35,19 @@ async def db(tmp_path: Path) -> Database:
         await d.close()
 
 
+async def _seed_primary(db: Database, chat_id: int, email: str) -> int:
+    """Helper: insert a primary account row for tests."""
+    return await db.add_primary_account(
+        chat_id=chat_id,
+        email=email,
+        host="127.0.0.1",
+        port=1143,
+        username=email,
+        encrypted_password="x" * 64,
+        use_ssl=False,
+    )
+
+
 def _make_message(to: str = "vielz50@proton.me") -> EmailMessage:
     msg = EmailMessage()
     msg["From"] = "partner@biz.example"
@@ -52,7 +65,10 @@ async def test_handle_message_forwards_only_active_alias(db: Database) -> None:
     """
     chat_id = 100
     await db.upsert_user(chat_id)
-    await db.add_aliases(chat_id, ["vielz50@proton.me", "vielz51@proton.me"])
+    primary_id = await _seed_primary(db, chat_id, "vielz43@proton.me")
+    await db.add_aliases(
+        chat_id, ["vielz50@proton.me", "vielz51@proton.me"], primary_id=primary_id
+    )
     active = await db.find_alias(chat_id, "vielz50@proton.me")
     assert active is not None
     await db.set_active_alias(chat_id, active.id)
@@ -60,8 +76,12 @@ async def test_handle_message_forwards_only_active_alias(db: Database) -> None:
     cipher = CredentialCipher(CredentialCipher.generate_key())
     manager = ListenerManager(db=db, cipher=cipher, notifier=notifier)
 
-    await manager._handle_new_message(chat_id, _make_message("vielz50@proton.me"), "1")
-    await manager._handle_new_message(chat_id, _make_message("vielz50@proton.me"), "2")
+    await manager._handle_new_message(
+        chat_id, primary_id, _make_message("vielz50@proton.me"), "1"
+    )
+    await manager._handle_new_message(
+        chat_id, primary_id, _make_message("vielz50@proton.me"), "2"
+    )
 
     # Both aliases are still listed; nothing was deleted or consumed.
     available = await db.list_aliases(chat_id, status=AliasStatus.AVAILABLE)
@@ -80,14 +100,17 @@ async def test_handle_message_ignores_when_no_active_alias(db: Database) -> None
     """No active alias = nothing is forwarded; new recipients are still tracked."""
     chat_id = 7
     await db.upsert_user(chat_id)
-    await db.add_aliases(chat_id, ["only@proton.me"])
+    primary_id = await _seed_primary(db, chat_id, "vielz43@proton.me")
+    await db.add_aliases(chat_id, ["only@proton.me"], primary_id=primary_id)
     notifier = _RecordingNotifier()
     manager = ListenerManager(
         db=db,
         cipher=CredentialCipher(CredentialCipher.generate_key()),
         notifier=notifier,
     )
-    await manager._handle_new_message(chat_id, _make_message("someone-else@proton.me"), "1")
+    await manager._handle_new_message(
+        chat_id, primary_id, _make_message("someone-else@proton.me"), "1"
+    )
     # No notification because no alias is locked-in for this chat.
     assert notifier.calls == []
     # New recipient was still auto-added so /list shows it later.
@@ -101,7 +124,10 @@ async def test_handle_message_ignores_other_aliases_when_locked(db: Database) ->
     """Email to a non-active alias must NOT be forwarded, even if the alias exists."""
     chat_id = 200
     await db.upsert_user(chat_id)
-    await db.add_aliases(chat_id, ["a@proton.me", "b@proton.me"])
+    primary_id = await _seed_primary(db, chat_id, "vielz43@proton.me")
+    await db.add_aliases(
+        chat_id, ["a@proton.me", "b@proton.me"], primary_id=primary_id
+    )
     active = await db.find_alias(chat_id, "a@proton.me")
     assert active is not None
     await db.set_active_alias(chat_id, active.id)
@@ -112,7 +138,9 @@ async def test_handle_message_ignores_other_aliases_when_locked(db: Database) ->
         notifier=notifier,
     )
 
-    await manager._handle_new_message(chat_id, _make_message("b@proton.me"), "10")
+    await manager._handle_new_message(
+        chat_id, primary_id, _make_message("b@proton.me"), "10"
+    )
 
     assert notifier.calls == []
     # Active alias still locked, neither alias consumed.
@@ -124,7 +152,10 @@ async def test_discovered_aliases_adds_and_notifies(db: Database) -> None:
     """Inbox scan discovers new addresses and notifies only the new ones."""
     chat_id = 42
     await db.upsert_user(chat_id)
-    await db.add_aliases(chat_id, ["existing@proton.me"])
+    primary_id = await _seed_primary(db, chat_id, "vielz43@proton.me")
+    await db.add_aliases(
+        chat_id, ["existing@proton.me"], primary_id=primary_id
+    )
     notifier = _RecordingNotifier()
     manager = ListenerManager(
         db=db,
@@ -132,7 +163,9 @@ async def test_discovered_aliases_adds_and_notifies(db: Database) -> None:
         notifier=notifier,
     )
     await manager._handle_discovered_aliases(
-        chat_id, {"existing@proton.me", "new1@proton.me", "new2@proton.me"}
+        chat_id,
+        primary_id,
+        {"existing@proton.me", "new1@proton.me", "new2@proton.me"},
     )
     all_aliases = await db.list_aliases(chat_id)
     assert sorted(a.email for a in all_aliases) == [
@@ -149,7 +182,8 @@ async def test_discovered_aliases_adds_and_notifies(db: Database) -> None:
 async def test_handle_message_does_not_rematch_consumed_alias(db: Database) -> None:
     chat_id = 9
     await db.upsert_user(chat_id)
-    await db.add_aliases(chat_id, ["x@proton.me"])
+    primary_id = await _seed_primary(db, chat_id, "vielz43@proton.me")
+    await db.add_aliases(chat_id, ["x@proton.me"], primary_id=primary_id)
     alias = await db.find_alias(chat_id, "x@proton.me")
     assert alias is not None
     await db.mark_consumed(alias.id, "<m1>")
@@ -159,6 +193,8 @@ async def test_handle_message_does_not_rematch_consumed_alias(db: Database) -> N
         cipher=CredentialCipher(CredentialCipher.generate_key()),
         notifier=notifier,
     )
-    await manager._handle_new_message(chat_id, _make_message("x@proton.me"), "2")
-    # Already consumed: no second notification.
+    await manager._handle_new_message(
+        chat_id, primary_id, _make_message("x@proton.me"), "2"
+    )
+    # No active alias is locked, so nothing is forwarded.
     assert notifier.calls == []

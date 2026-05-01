@@ -87,7 +87,9 @@ async def test_login_failure_still_closes_connection() -> None:
         raise AssertionError("on_new must not be called when login fails")
 
     creds = BridgeCredentials(host="127.0.0.1", port=1143, username="u", password="p")
-    listener = IMAPListener(chat_id=1, credentials=creds, on_new_message=on_new)
+    listener = IMAPListener(
+        chat_id=1, primary_id=1, credentials=creds, on_new_message=on_new
+    )
     listener._build_client = lambda: fake  # type: ignore[method-assign]
 
     with pytest.raises(RuntimeError, match="invalid credentials"):
@@ -135,13 +137,17 @@ class _FetchOnlyClient:
 
 @pytest.mark.asyncio
 async def test_fetch_new_messages_dispatches_each_uid_once() -> None:
-    received: list[tuple[int, Message, str]] = []
+    received: list[tuple[int, int, Message, str]] = []
 
-    async def on_new(chat_id: int, msg: Message, uid: str) -> None:
-        received.append((chat_id, msg, uid))
+    async def on_new(
+        chat_id: int, primary_id: int, msg: Message, uid: str
+    ) -> None:
+        received.append((chat_id, primary_id, msg, uid))
 
     creds = BridgeCredentials(host="127.0.0.1", port=1143, username="u", password="p")
-    listener = IMAPListener(chat_id=42, credentials=creds, on_new_message=on_new)
+    listener = IMAPListener(
+        chat_id=42, primary_id=1, credentials=creds, on_new_message=on_new
+    )
     listener._last_seen_uid = 5
     fake = _FetchOnlyClient(
         # Real aioimaplib returns the data line as just whitespace-separated
@@ -155,10 +161,12 @@ async def test_fetch_new_messages_dispatches_each_uid_once() -> None:
 
     await listener._fetch_new_messages(fake)  # type: ignore[arg-type]
 
-    assert [uid for _, _, uid in received] == ["6", "7"]
+    assert [uid for _, _, _, uid in received] == ["6", "7"]
     assert listener._last_seen_uid == 7
     # Subjects are correctly parsed by ``email_parser``.
-    assert [msg["Subject"] for _, msg, _ in received] == ["Hi", "Hi2"]
+    assert [msg["Subject"] for _, _, msg, _ in received] == ["Hi", "Hi2"]
+    # primary_id is propagated to the callback.
+    assert {pid for _, pid, _, _ in received} == {1}
 
 
 class _BaselineProbeClient:
@@ -181,7 +189,10 @@ async def test_baseline_is_preserved_across_reconnects() -> None:
     are silently lost (regression of Devin Review BUG_*_0001)."""
     creds = BridgeCredentials(host="127.0.0.1", port=1143, username="u", password="p")
     listener = IMAPListener(
-        chat_id=1, credentials=creds, on_new_message=lambda *_: _async_noop()
+        chat_id=1,
+        primary_id=1,
+        credentials=creds,
+        on_new_message=lambda *_: _async_noop(),
     )
 
     # First connection: empty mailbox → baseline 0.
@@ -211,11 +222,15 @@ async def _async_noop() -> None:
 async def test_fetch_skips_uids_already_seen() -> None:
     received: list[str] = []
 
-    async def on_new(_chat_id: int, _msg: Message, uid: str) -> None:
+    async def on_new(
+        _chat_id: int, _primary_id: int, _msg: Message, uid: str
+    ) -> None:
         received.append(uid)
 
     creds = BridgeCredentials(host="127.0.0.1", port=1143, username="u", password="p")
-    listener = IMAPListener(chat_id=1, credentials=creds, on_new_message=on_new)
+    listener = IMAPListener(
+        chat_id=1, primary_id=1, credentials=creds, on_new_message=on_new
+    )
     listener._last_seen_uid = 10
     fake = _FetchOnlyClient(
         search_lines=[b"7 11"],  # 7 is below the baseline; only 11 is new
@@ -259,14 +274,17 @@ class _ScanClient:
 
 @pytest.mark.asyncio
 async def test_scan_inbox_aliases_discovers_recipients() -> None:
-    discovered: list[tuple[int, set[str]]] = []
+    discovered: list[tuple[int, int, set[str]]] = []
 
-    async def on_discovery(chat_id: int, addrs: set[str]) -> None:
-        discovered.append((chat_id, addrs))
+    async def on_discovery(
+        chat_id: int, primary_id: int, addrs: set[str]
+    ) -> None:
+        discovered.append((chat_id, primary_id, addrs))
 
     creds = BridgeCredentials(host="127.0.0.1", port=1143, username="u", password="p")
     listener = IMAPListener(
         chat_id=99,
+        primary_id=1,
         credentials=creds,
         on_new_message=lambda *_: _async_noop(),
         on_aliases_discovered=on_discovery,
@@ -281,8 +299,9 @@ async def test_scan_inbox_aliases_discovers_recipients() -> None:
     await listener._scan_inbox_aliases(fake)  # type: ignore[arg-type]
 
     assert len(discovered) == 1
-    chat_id, addrs = discovered[0]
+    chat_id, primary_id, addrs = discovered[0]
     assert chat_id == 99
+    assert primary_id == 1
     assert addrs == {"alice@proton.me", "charlie@proton.me"}
 
 
@@ -358,6 +377,7 @@ async def test_scan_inbox_aliases_skipped_without_callback() -> None:
     creds = BridgeCredentials(host="127.0.0.1", port=1143, username="u", password="p")
     listener = IMAPListener(
         chat_id=1,
+        primary_id=1,
         credentials=creds,
         on_new_message=lambda *_: _async_noop(),
     )

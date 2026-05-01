@@ -19,11 +19,11 @@ from .models import BridgeCredentials
 
 LOGGER = logging.getLogger(__name__)
 
-NewMessageCallback = Callable[[int, Message, str], Awaitable[None]]
-"""Callback signature: (chat_id, parsed_message, raw_uid)."""
+NewMessageCallback = Callable[[int, int, Message, str], Awaitable[None]]
+"""Callback signature: (chat_id, primary_id, parsed_message, raw_uid)."""
 
-AliasDiscoveryCallback = Callable[[int, set[str]], Awaitable[None]]
-"""Callback signature: (chat_id, discovered_addresses)."""
+AliasDiscoveryCallback = Callable[[int, int, set[str]], Awaitable[None]]
+"""Callback signature: (chat_id, primary_id, discovered_addresses)."""
 
 # How often the listener polls for new messages (seconds).
 POLL_INTERVAL_SECONDS = 5
@@ -39,6 +39,7 @@ class IMAPListener:
     def __init__(
         self,
         chat_id: int,
+        primary_id: int,
         credentials: BridgeCredentials,
         on_new_message: NewMessageCallback,
         on_aliases_discovered: AliasDiscoveryCallback | None = None,
@@ -46,6 +47,7 @@ class IMAPListener:
         mailbox: str = "INBOX",
     ) -> None:
         self.chat_id = chat_id
+        self.primary_id = primary_id
         self._credentials = credentials
         self._on_new_message = on_new_message
         self._on_aliases_discovered = on_aliases_discovered
@@ -63,7 +65,8 @@ class IMAPListener:
             return
         self._stop_event.clear()
         self._task = asyncio.create_task(
-            self._run_forever(), name=f"imap-listener-{self.chat_id}"
+            self._run_forever(),
+            name=f"imap-listener-{self.chat_id}-p{self.primary_id}",
         )
 
     def poke(self) -> None:
@@ -215,7 +218,9 @@ class IMAPListener:
                 self.chat_id,
                 len(discovered),
             )
-            await self._on_aliases_discovered(self.chat_id, discovered)
+            await self._on_aliases_discovered(
+                self.chat_id, self.primary_id, discovered
+            )
 
     async def _fetch_headers(
         self, client: aioimaplib.IMAP4, uid: int
@@ -250,7 +255,9 @@ class IMAPListener:
             LOGGER.debug("no RFC822 payload returned for UID %s", uid)
             return
         message = parse_message(raw_message)
-        await self._on_new_message(self.chat_id, message, str(uid))
+        await self._on_new_message(
+            self.chat_id, self.primary_id, message, str(uid)
+        )
 
     @staticmethod
     def _parse_uids(lines: list[bytes | str]) -> list[int]:
