@@ -5,10 +5,24 @@ import re
 
 from proton_telegram_bot.bot import (
     _TELEGRAM_MESSAGE_LIMIT,
-    _build_alias_keyboard,
+    _build_alias_keyboard_for_primary,
+    _build_primary_keyboard,
     _render_email_message,
 )
-from proton_telegram_bot.models import AliasRecord, AliasStatus
+from proton_telegram_bot.models import AliasRecord, AliasStatus, PrimaryAccount
+
+
+def _fake_primary(pid: int = 1, email: str = "vielz43@proton.me") -> PrimaryAccount:
+    return PrimaryAccount(
+        id=pid,
+        chat_id=1,
+        email=email,
+        imap_host="127.0.0.1",
+        imap_port=1143,
+        imap_username=email,
+        imap_use_ssl=False,
+        created_at="2026-01-01",
+    )
 
 
 def test_render_short_message_includes_all_sections() -> None:
@@ -74,7 +88,7 @@ def test_alias_keyboard_callback_data_is_under_64_bytes() -> None:
         AliasRecord(id=42, chat_id=1, email=long_email, status=AliasStatus.AVAILABLE),
         AliasRecord(id=99999, chat_id=1, email="b@p.me", status=AliasStatus.AVAILABLE),
     ]
-    markup = _build_alias_keyboard(aliases)
+    markup = _build_alias_keyboard_for_primary(_fake_primary(), aliases)
     pick_buttons = [
         button
         for row in markup.inline_keyboard
@@ -89,8 +103,37 @@ def test_alias_keyboard_callback_data_is_under_64_bytes() -> None:
     assert pick_buttons[0].text == long_email
 
 
-def test_alias_keyboard_empty_state() -> None:
-    markup = _build_alias_keyboard([])
+def test_alias_keyboard_empty_state_has_back_button() -> None:
+    markup = _build_alias_keyboard_for_primary(_fake_primary(), [])
+    flat = [b for row in markup.inline_keyboard for b in row]
+    assert any("belum ada" in (b.text or "") for b in flat)
+    # Back-to-primaries button is always present so users can escape an empty
+    # alias list.
+    assert any(b.callback_data == "backp" for b in flat)
+
+
+def test_primary_keyboard_includes_alias_counts_and_active_marker() -> None:
+    p1 = _fake_primary(pid=1, email="vielz43@proton.me")
+    p2 = _fake_primary(pid=2, email="vielz22@proton.me")
+    counts = {1: 14, 2: 7}
+    markup = _build_primary_keyboard([p1, p2], counts, active_primary_id=2)
+    flat = [b for row in markup.inline_keyboard for b in row]
+    pick_buttons = [
+        b for b in flat if (b.callback_data or "").startswith("pickp:")
+    ]
+    assert len(pick_buttons) == 2
+    # Alias counts are in the labels.
+    assert any("14 alias" in (b.text or "") for b in pick_buttons)
+    assert any("7 alias" in (b.text or "") for b in pick_buttons)
+    # Active primary gets the lock marker.
+    locked_button = next(
+        b for b in pick_buttons if (b.callback_data or "") == "pickp:2"
+    )
+    assert "🔒" in (locked_button.text or "")
+
+
+def test_primary_keyboard_empty_state() -> None:
+    markup = _build_primary_keyboard([])
     flat = [b for row in markup.inline_keyboard for b in row]
     assert any("belum ada" in (b.text or "") for b in flat)
     assert any(b.callback_data == "refresh" for b in flat)
