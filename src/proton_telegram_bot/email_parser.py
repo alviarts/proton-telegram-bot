@@ -8,6 +8,7 @@ from email.message import Message
 from email.utils import getaddresses
 from html import unescape
 from html.parser import HTMLParser
+from typing import ClassVar
 
 RECIPIENT_HEADERS = ("Delivered-To", "X-Original-To", "To", "Cc", "Bcc")
 MAX_BODY_PREVIEW_CHARS = 1500
@@ -16,11 +17,11 @@ MAX_BODY_PREVIEW_CHARS = 1500
 class _HTMLToText(HTMLParser):
     """Tiny HTML-to-text extractor that preserves line breaks for common tags."""
 
-    _BLOCK_TAGS = {
+    _BLOCK_TAGS: ClassVar[frozenset[str]] = frozenset({
         "p", "div", "br", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6",
         "blockquote", "pre", "section", "article", "header", "footer",
-    }
-    _SKIP_TAGS = {"script", "style", "head", "title"}
+    })
+    _SKIP_TAGS: ClassVar[frozenset[str]] = frozenset({"script", "style", "head", "title"})
 
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
