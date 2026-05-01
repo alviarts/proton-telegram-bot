@@ -36,10 +36,7 @@ def test_aioimaplib_public_api_exists() -> None:
         "select",
         "uid_search",
         "uid",
-        "idle_start",
-        "wait_server_push",
-        "idle_done",
-        "has_pending_idle",
+        "noop",
         "logout",
     ):
         assert hasattr(aioimaplib.IMAP4, name), f"aioimaplib.IMAP4 lost {name}()"
@@ -55,10 +52,12 @@ def test_listener_does_not_use_protocol_internal_names() -> None:
     ).read_text()
     assert "has_pending_idle_command" not in src
     assert ".idle_queue" not in src
-    # And we *do* use the real ones.
-    assert "has_pending_idle()" in src
-    assert "wait_server_push" in src
-    assert "idle_done()" in src
+    # Polling mode uses noop() instead of IDLE.
+    assert "noop()" in src
+    assert "POLL_INTERVAL_SECONDS" in src
+    # Alias auto-discovery via inbox scan.
+    assert "_scan_inbox_aliases" in src
+    assert "extract_recipients" in src
 
 
 # --------------------------------------------------------------------------- #
@@ -88,7 +87,9 @@ async def test_login_failure_still_closes_connection() -> None:
         raise AssertionError("on_new must not be called when login fails")
 
     creds = BridgeCredentials(host="127.0.0.1", port=1143, username="u", password="p")
-    listener = IMAPListener(chat_id=1, credentials=creds, on_new_message=on_new)
+    listener = IMAPListener(
+        chat_id=1, primary_id=1, credentials=creds, on_new_message=on_new
+    )
     listener._build_client = lambda: fake  # type: ignore[method-assign]
 
     with pytest.raises(RuntimeError, match="invalid credentials"):
@@ -136,16 +137,22 @@ class _FetchOnlyClient:
 
 @pytest.mark.asyncio
 async def test_fetch_new_messages_dispatches_each_uid_once() -> None:
-    received: list[tuple[int, Message, str]] = []
+    received: list[tuple[int, int, Message, str]] = []
 
-    async def on_new(chat_id: int, msg: Message, uid: str) -> None:
-        received.append((chat_id, msg, uid))
+    async def on_new(
+        chat_id: int, primary_id: int, msg: Message, uid: str
+    ) -> None:
+        received.append((chat_id, primary_id, msg, uid))
 
     creds = BridgeCredentials(host="127.0.0.1", port=1143, username="u", password="p")
-    listener = IMAPListener(chat_id=42, credentials=creds, on_new_message=on_new)
+    listener = IMAPListener(
+        chat_id=42, primary_id=1, credentials=creds, on_new_message=on_new
+    )
     listener._last_seen_uid = 5
     fake = _FetchOnlyClient(
-        search_lines=[b"6 7"],
+        # Real aioimaplib returns the data line as just whitespace-separated
+        # digits, followed by an OK status line like 'command completed ...'.
+        search_lines=[b"6 7", b"command completed in 303 microsec."],
         fetch_payloads={
             6: b"From: a@x.example\r\nTo: target@proton.me\r\nSubject: Hi\r\n\r\nbody-6",
             7: b"From: b@x.example\r\nTo: other@proton.me\r\nSubject: Hi2\r\n\r\nbody-7",
@@ -154,10 +161,12 @@ async def test_fetch_new_messages_dispatches_each_uid_once() -> None:
 
     await listener._fetch_new_messages(fake)  # type: ignore[arg-type]
 
-    assert [uid for _, _, uid in received] == ["6", "7"]
+    assert [uid for _, _, _, uid in received] == ["6", "7"]
     assert listener._last_seen_uid == 7
     # Subjects are correctly parsed by ``email_parser``.
-    assert [msg["Subject"] for _, msg, _ in received] == ["Hi", "Hi2"]
+    assert [msg["Subject"] for _, _, msg, _ in received] == ["Hi", "Hi2"]
+    # primary_id is propagated to the callback.
+    assert {pid for _, pid, _, _ in received} == {1}
 
 
 class _BaselineProbeClient:
@@ -180,7 +189,10 @@ async def test_baseline_is_preserved_across_reconnects() -> None:
     are silently lost (regression of Devin Review BUG_*_0001)."""
     creds = BridgeCredentials(host="127.0.0.1", port=1143, username="u", password="p")
     listener = IMAPListener(
-        chat_id=1, credentials=creds, on_new_message=lambda *_: _async_noop()
+        chat_id=1,
+        primary_id=1,
+        credentials=creds,
+        on_new_message=lambda *_: _async_noop(),
     )
 
     # First connection: empty mailbox → baseline 0.
@@ -210,11 +222,15 @@ async def _async_noop() -> None:
 async def test_fetch_skips_uids_already_seen() -> None:
     received: list[str] = []
 
-    async def on_new(_chat_id: int, _msg: Message, uid: str) -> None:
+    async def on_new(
+        _chat_id: int, _primary_id: int, _msg: Message, uid: str
+    ) -> None:
         received.append(uid)
 
     creds = BridgeCredentials(host="127.0.0.1", port=1143, username="u", password="p")
-    listener = IMAPListener(chat_id=1, credentials=creds, on_new_message=on_new)
+    listener = IMAPListener(
+        chat_id=1, primary_id=1, credentials=creds, on_new_message=on_new
+    )
     listener._last_seen_uid = 10
     fake = _FetchOnlyClient(
         search_lines=[b"7 11"],  # 7 is below the baseline; only 11 is new
@@ -227,3 +243,143 @@ async def test_fetch_skips_uids_already_seen() -> None:
 
     assert received == ["11"]
     assert listener._last_seen_uid == 11
+
+
+# --------------------------------------------------------------------------- #
+# 5. Inbox alias scan: discovers recipient addresses from existing messages.
+# --------------------------------------------------------------------------- #
+
+
+class _ScanClient:
+    """Stub that supports uid_search ALL + uid fetch BODY.PEEK[HEADER]."""
+
+    def __init__(self, headers: dict[int, bytes]) -> None:
+        self._headers = headers
+
+    async def uid_search(self, criteria: str) -> _Response:
+        uids = b" ".join(str(u).encode() for u in self._headers)
+        return _Response("OK", [uids, b"command completed in 222 microsec."])
+
+    async def uid(self, command: str, uid: str, *_: Any) -> _Response:
+        payload = self._headers[int(uid)]
+        return _Response(
+            "OK",
+            [
+                f"* {uid} FETCH (UID {uid} BODY[HEADER] {{{len(payload)}}})".encode(),
+                payload,
+                b")",
+            ],
+        )
+
+
+@pytest.mark.asyncio
+async def test_scan_inbox_aliases_discovers_recipients() -> None:
+    discovered: list[tuple[int, int, set[str]]] = []
+
+    async def on_discovery(
+        chat_id: int, primary_id: int, addrs: set[str]
+    ) -> None:
+        discovered.append((chat_id, primary_id, addrs))
+
+    creds = BridgeCredentials(host="127.0.0.1", port=1143, username="u", password="p")
+    listener = IMAPListener(
+        chat_id=99,
+        primary_id=1,
+        credentials=creds,
+        on_new_message=lambda *_: _async_noop(),
+        on_aliases_discovered=on_discovery,
+    )
+    fake = _ScanClient(
+        headers={
+            1: b"To: alice@proton.me\r\nFrom: bob@example.com\r\n\r\n",
+            2: b"To: charlie@proton.me\r\nCc: alice@proton.me\r\nFrom: dave@example.com\r\n\r\n",
+        },
+    )
+
+    await listener._scan_inbox_aliases(fake)  # type: ignore[arg-type]
+
+    assert len(discovered) == 1
+    chat_id, primary_id, addrs = discovered[0]
+    assert chat_id == 99
+    assert primary_id == 1
+    assert addrs == {"alice@proton.me", "charlie@proton.me"}
+
+
+def test_parse_uids_ignores_status_line_with_microsec_count() -> None:
+    """Regression: Proton Bridge OK status line ``command completed in 1253
+    microsec.`` was being parsed as UID 1253 by the previous greedy digit
+    extractor, which made the listener chase ghost UIDs that don't exist
+    and silently drop real ones.
+
+    aioimaplib strips the leading ``* SEARCH`` from the response, so what
+    actually appears in ``response.lines`` is the bare data line followed
+    by the status line."""
+    lines: list[bytes | str] = [
+        b"63 64",
+        b"command completed in 1253 microsec.",
+    ]
+    assert IMAPListener._parse_uids(lines) == [63, 64]
+
+
+def test_parse_uids_accepts_legacy_search_prefix() -> None:
+    """If aioimaplib stops stripping the SEARCH keyword, parser still works."""
+    assert IMAPListener._parse_uids([b"SEARCH 1 2 3"]) == [1, 2, 3]
+
+
+def test_parse_uids_ignores_exists_and_recent_untagged_data() -> None:
+    """Untagged ``* 64 EXISTS`` / ``* 1 RECENT`` lines must not be UIDs.
+    They are mixed-content (digit + word), so the parser drops them."""
+    lines: list[bytes | str] = [
+        b"64 EXISTS",
+        b"1 RECENT",
+        b"OK [HIGHESTMODSEQ 9999]",
+        b"64",  # the real SEARCH data line
+    ]
+    assert IMAPListener._parse_uids(lines) == [64]
+
+
+def test_extract_rfc822_payload_strips_asterisk_form() -> None:
+    """aioimaplib strips ``* `` from the untagged FETCH header, so the data
+    line becomes ``<seq> FETCH (RFC822 {N})``. The payload sits in the next
+    element typed as ``bytearray``. Regression test for the listener
+    silently dropping every email because it expected the legacy
+    ``* <seq> FETCH (UID <uid> RFC822 ...)`` shape."""
+    payload = b"From: a@x\r\nTo: b@y\r\n\r\nbody"
+    lines: list[bytes | str] = [
+        b"67 FETCH (RFC822 {25}",
+        bytearray(payload),
+        b" UID 67)",
+        b"command completed in 1234 microsec.",
+    ]
+    assert IMAPListener._extract_rfc822_payload(lines) == payload
+
+
+def test_extract_rfc822_payload_legacy_asterisk_form() -> None:
+    """If a future aioimaplib stops stripping the asterisk, parser still works."""
+    payload = b"From: a@x\r\nTo: b@y\r\n\r\nbody"
+    lines: list[bytes | str] = [
+        b"* 67 FETCH (UID 67 RFC822 {25})",
+        payload,
+        b")",
+    ]
+    assert IMAPListener._extract_rfc822_payload(lines) == payload
+
+
+def test_parse_uids_handles_empty_search() -> None:
+    assert IMAPListener._parse_uids([b""]) == []
+    assert IMAPListener._parse_uids([b"", b"command completed."]) == []
+    assert IMAPListener._parse_uids([]) == []
+
+
+@pytest.mark.asyncio
+async def test_scan_inbox_aliases_skipped_without_callback() -> None:
+    """When no discovery callback is set, _scan_inbox_aliases is a no-op."""
+    creds = BridgeCredentials(host="127.0.0.1", port=1143, username="u", password="p")
+    listener = IMAPListener(
+        chat_id=1,
+        primary_id=1,
+        credentials=creds,
+        on_new_message=lambda *_: _async_noop(),
+    )
+    # Should not raise even with a None callback.
+    await listener._scan_inbox_aliases(object())  # type: ignore[arg-type]

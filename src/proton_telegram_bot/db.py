@@ -7,7 +7,7 @@ from pathlib import Path
 
 import aiosqlite
 
-from .models import AliasRecord, AliasStatus, BridgeCredentials, UserRecord
+from .models import AliasRecord, AliasStatus, BridgeCredentials, PrimaryAccount, UserRecord
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -17,7 +17,8 @@ CREATE TABLE IF NOT EXISTS users (
     imap_port INTEGER,
     imap_username TEXT,
     imap_password_encrypted TEXT,
-    imap_use_ssl INTEGER NOT NULL DEFAULT 0
+    imap_use_ssl INTEGER NOT NULL DEFAULT 0,
+    active_alias_id INTEGER REFERENCES aliases(id) ON DELETE SET NULL
 );
 
 CREATE TABLE IF NOT EXISTS aliases (
@@ -28,11 +29,27 @@ CREATE TABLE IF NOT EXISTS aliases (
     created_at TEXT NOT NULL,
     consumed_at TEXT,
     last_message_id TEXT,
+    primary_id INTEGER,
+    UNIQUE(chat_id, email),
+    FOREIGN KEY(chat_id) REFERENCES users(chat_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS primary_accounts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    email TEXT NOT NULL,
+    imap_host TEXT NOT NULL,
+    imap_port INTEGER NOT NULL,
+    imap_username TEXT NOT NULL,
+    imap_password_encrypted TEXT NOT NULL,
+    imap_use_ssl INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
     UNIQUE(chat_id, email),
     FOREIGN KEY(chat_id) REFERENCES users(chat_id) ON DELETE CASCADE
 );
 
 CREATE INDEX IF NOT EXISTS idx_aliases_chat_status ON aliases(chat_id, status);
+CREATE INDEX IF NOT EXISTS idx_primary_chat ON primary_accounts(chat_id);
 """
 
 
@@ -53,7 +70,82 @@ class Database:
         self._conn.row_factory = aiosqlite.Row
         await self._conn.execute("PRAGMA foreign_keys = ON")
         await self._conn.executescript(SCHEMA)
+        await self._migrate()
         await self._conn.commit()
+
+    async def _migrate(self) -> None:
+        """Apply idempotent schema migrations for older databases."""
+        async with self.conn.execute("PRAGMA table_info(users)") as cursor:
+            user_cols = {row["name"] for row in await cursor.fetchall()}
+        if "active_alias_id" not in user_cols:
+            await self.conn.execute(
+                "ALTER TABLE users ADD COLUMN active_alias_id INTEGER"
+            )
+        async with self.conn.execute("PRAGMA table_info(aliases)") as cursor:
+            alias_cols = {row["name"] for row in await cursor.fetchall()}
+        if "primary_id" not in alias_cols:
+            await self.conn.execute(
+                "ALTER TABLE aliases ADD COLUMN primary_id INTEGER"
+            )
+        await self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_aliases_primary ON aliases(primary_id)"
+        )
+        await self._backfill_primary_accounts_from_legacy_users()
+
+    async def _backfill_primary_accounts_from_legacy_users(self) -> None:
+        """Promote legacy ``users.imap_*`` credentials into ``primary_accounts``.
+
+        The original schema stored a single Bridge login per chat directly on
+        the ``users`` row. The new model allows multiple primaries per chat,
+        each with its own listener. For backwards compatibility we promote
+        any chat whose ``users`` row has credentials but no matching
+        ``primary_accounts`` row, then link its existing aliases to the new
+        primary. Idempotent — running this on an already-migrated DB is a
+        no-op.
+        """
+        async with self.conn.execute(
+            "SELECT chat_id, imap_host, imap_port, imap_username, "
+            "imap_password_encrypted, imap_use_ssl, created_at FROM users "
+            "WHERE imap_password_encrypted IS NOT NULL"
+        ) as cursor:
+            legacy_rows = await cursor.fetchall()
+        for row in legacy_rows:
+            chat_id = row["chat_id"]
+            email = (row["imap_username"] or "").strip().lower()
+            if not email:
+                continue
+            async with self.conn.execute(
+                "SELECT id FROM primary_accounts WHERE chat_id = ? AND email = ?",
+                (chat_id, email),
+            ) as existing:
+                already = await existing.fetchone()
+            if already is not None:
+                primary_id = already["id"]
+            else:
+                cursor = await self.conn.execute(
+                    "INSERT INTO primary_accounts "
+                    "(chat_id, email, imap_host, imap_port, imap_username, "
+                    "imap_password_encrypted, imap_use_ssl, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        chat_id,
+                        email,
+                        row["imap_host"],
+                        row["imap_port"],
+                        row["imap_username"],
+                        row["imap_password_encrypted"],
+                        row["imap_use_ssl"] or 0,
+                        row["created_at"] or _utcnow(),
+                    ),
+                )
+                primary_id = cursor.lastrowid
+            # Link any orphan aliases for this chat to the just-created primary.
+            await self.conn.execute(
+                "UPDATE aliases SET primary_id = ? "
+                "WHERE chat_id = ? AND primary_id IS NULL",
+                (primary_id, chat_id),
+            )
+        await self.conn.commit()
 
     async def close(self) -> None:
         if self._conn is not None:
@@ -129,6 +221,24 @@ class Database:
             return None
         return row["imap_password_encrypted"]
 
+    async def set_active_alias(self, chat_id: int, alias_id: int | None) -> None:
+        await self.upsert_user(chat_id)
+        await self.conn.execute(
+            "UPDATE users SET active_alias_id = ? WHERE chat_id = ?",
+            (alias_id, chat_id),
+        )
+        await self.conn.commit()
+
+    async def get_active_alias(self, chat_id: int) -> AliasRecord | None:
+        async with self.conn.execute(
+            "SELECT active_alias_id FROM users WHERE chat_id = ?",
+            (chat_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None or row["active_alias_id"] is None:
+            return None
+        return await self.find_alias_by_id(chat_id, row["active_alias_id"])
+
     async def list_users_with_credentials(self) -> list[int]:
         async with self.conn.execute(
             "SELECT chat_id FROM users WHERE imap_password_encrypted IS NOT NULL"
@@ -136,10 +246,137 @@ class Database:
             rows = await cursor.fetchall()
         return [row["chat_id"] for row in rows]
 
+    # ----------------------------------------------------- primary_accounts
+
+    async def add_primary_account(
+        self,
+        chat_id: int,
+        email: str,
+        host: str,
+        port: int,
+        username: str,
+        encrypted_password: str,
+        use_ssl: bool,
+    ) -> int:
+        """Insert (or update if it already exists) a primary account.
+
+        Returns the ``primary_accounts.id``.
+        """
+        await self.upsert_user(chat_id)
+        normalized = email.strip().lower()
+        await self.conn.execute(
+            "INSERT INTO primary_accounts "
+            "(chat_id, email, imap_host, imap_port, imap_username, "
+            "imap_password_encrypted, imap_use_ssl, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(chat_id, email) DO UPDATE SET "
+            "imap_host = excluded.imap_host, imap_port = excluded.imap_port, "
+            "imap_username = excluded.imap_username, "
+            "imap_password_encrypted = excluded.imap_password_encrypted, "
+            "imap_use_ssl = excluded.imap_use_ssl",
+            (
+                chat_id,
+                normalized,
+                host,
+                port,
+                username,
+                encrypted_password,
+                1 if use_ssl else 0,
+                _utcnow(),
+            ),
+        )
+        await self.conn.commit()
+        # ``cursor.lastrowid`` is unreliable for UPSERT — SQLite may keep a
+        # stale value from a prior INSERT on the same connection. Always look
+        # the row up by its natural key instead.
+        async with self.conn.execute(
+            "SELECT id FROM primary_accounts WHERE chat_id = ? AND email = ?",
+            (chat_id, normalized),
+        ) as cur:
+            row = await cur.fetchone()
+        assert row is not None
+        return row["id"]
+
+    async def list_primary_accounts(self, chat_id: int) -> list[PrimaryAccount]:
+        async with self.conn.execute(
+            "SELECT id, chat_id, email, imap_host, imap_port, imap_username, "
+            "imap_use_ssl, created_at FROM primary_accounts "
+            "WHERE chat_id = ? ORDER BY email",
+            (chat_id,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [_row_to_primary(row) for row in rows]
+
+    async def get_primary_account(
+        self, chat_id: int, primary_id: int
+    ) -> PrimaryAccount | None:
+        async with self.conn.execute(
+            "SELECT id, chat_id, email, imap_host, imap_port, imap_username, "
+            "imap_use_ssl, created_at FROM primary_accounts "
+            "WHERE chat_id = ? AND id = ?",
+            (chat_id, primary_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return _row_to_primary(row) if row is not None else None
+
+    async def get_primary_account_by_id(
+        self, primary_id: int
+    ) -> PrimaryAccount | None:
+        async with self.conn.execute(
+            "SELECT id, chat_id, email, imap_host, imap_port, imap_username, "
+            "imap_use_ssl, created_at FROM primary_accounts WHERE id = ?",
+            (primary_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return _row_to_primary(row) if row is not None else None
+
+    async def get_primary_encrypted_password(self, primary_id: int) -> str | None:
+        async with self.conn.execute(
+            "SELECT imap_password_encrypted FROM primary_accounts WHERE id = ?",
+            (primary_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return row["imap_password_encrypted"] if row is not None else None
+
+    async def delete_primary_account(self, chat_id: int, primary_id: int) -> bool:
+        # Aliases reference primary_accounts but the column is nullable and the
+        # table has no FK cascade (older DBs were created before the column
+        # existed). Delete dependents explicitly so /disconnect doesn't leave
+        # orphan aliases for an account the user just removed.
+        await self.conn.execute(
+            "DELETE FROM aliases WHERE chat_id = ? AND primary_id = ?",
+            (chat_id, primary_id),
+        )
+        cursor = await self.conn.execute(
+            "DELETE FROM primary_accounts WHERE chat_id = ? AND id = ?",
+            (chat_id, primary_id),
+        )
+        await self.conn.commit()
+        return (cursor.rowcount or 0) > 0
+
+    async def list_all_primary_ids(self) -> list[int]:
+        """Return every primary id across all chats — used by ListenerManager
+        to spin up listeners on startup."""
+        async with self.conn.execute(
+            "SELECT id FROM primary_accounts ORDER BY id"
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [row["id"] for row in rows]
+
     # ---------------------------------------------------------------- aliases
 
-    async def add_aliases(self, chat_id: int, emails: Sequence[str]) -> int:
-        """Insert aliases ignoring duplicates. Returns the number of new rows."""
+    async def add_aliases(
+        self,
+        chat_id: int,
+        emails: Sequence[str],
+        primary_id: int | None = None,
+    ) -> int:
+        """Insert aliases ignoring duplicates. Returns the number of new rows.
+
+        ``primary_id`` ties each new alias to a specific primary account so
+        the two-level UI can group them. ``None`` is permitted for legacy
+        callers but new code should always pass a primary id.
+        """
         await self.upsert_user(chat_id)
         inserted = 0
         for email in emails:
@@ -147,11 +384,26 @@ class Database:
             if not normalized:
                 continue
             cursor = await self.conn.execute(
-                "INSERT OR IGNORE INTO aliases (chat_id, email, status, created_at) "
-                "VALUES (?, ?, ?, ?)",
-                (chat_id, normalized, AliasStatus.AVAILABLE.value, _utcnow()),
+                "INSERT OR IGNORE INTO aliases "
+                "(chat_id, email, status, created_at, primary_id) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    chat_id,
+                    normalized,
+                    AliasStatus.AVAILABLE.value,
+                    _utcnow(),
+                    primary_id,
+                ),
             )
             inserted += cursor.rowcount or 0
+            # If a row already existed without a primary (migrated from the
+            # legacy single-primary world), backfill its primary_id.
+            if primary_id is not None and (cursor.rowcount or 0) == 0:
+                await self.conn.execute(
+                    "UPDATE aliases SET primary_id = ? "
+                    "WHERE chat_id = ? AND email = ? AND primary_id IS NULL",
+                    (primary_id, chat_id, normalized),
+                )
         await self.conn.commit()
         return inserted
 
@@ -164,30 +416,26 @@ class Database:
         return (cursor.rowcount or 0) > 0
 
     async def list_aliases(
-        self, chat_id: int, status: AliasStatus | None = None
+        self,
+        chat_id: int,
+        status: AliasStatus | None = None,
+        primary_id: int | None = None,
     ) -> list[AliasRecord]:
         query = (
-            "SELECT id, chat_id, email, status, consumed_at, last_message_id FROM aliases "
-            "WHERE chat_id = ?"
+            "SELECT id, chat_id, email, status, consumed_at, last_message_id, "
+            "primary_id FROM aliases WHERE chat_id = ?"
         )
         params: list[object] = [chat_id]
         if status is not None:
             query += " AND status = ?"
             params.append(status.value)
+        if primary_id is not None:
+            query += " AND primary_id = ?"
+            params.append(primary_id)
         query += " ORDER BY email"
         async with self.conn.execute(query, params) as cursor:
             rows = await cursor.fetchall()
-        return [
-            AliasRecord(
-                id=row["id"],
-                chat_id=row["chat_id"],
-                email=row["email"],
-                status=AliasStatus(row["status"]),
-                consumed_at=row["consumed_at"],
-                last_message_id=row["last_message_id"],
-            )
-            for row in rows
-        ]
+        return [_row_to_alias(row) for row in rows]
 
     async def find_alias(self, chat_id: int, email: str) -> AliasRecord | None:
         return await self._find_alias(
@@ -201,25 +449,26 @@ class Database:
             (chat_id, alias_id),
         )
 
+    async def find_alias_for_primary(
+        self, primary_id: int, email: str
+    ) -> AliasRecord | None:
+        """Look up an alias scoped to a specific primary account (used by the
+        listener when deciding whether to forward an incoming email)."""
+        return await self._find_alias(
+            "WHERE primary_id = ? AND email = ?",
+            (primary_id, email.strip().lower()),
+        )
+
     async def _find_alias(
         self, where_clause: str, params: tuple[object, ...]
     ) -> AliasRecord | None:
         query = (
-            "SELECT id, chat_id, email, status, consumed_at, last_message_id FROM aliases "
-            f"{where_clause}"
+            "SELECT id, chat_id, email, status, consumed_at, last_message_id, "
+            f"primary_id FROM aliases {where_clause}"
         )
         async with self.conn.execute(query, params) as cursor:
             row = await cursor.fetchone()
-        if row is None:
-            return None
-        return AliasRecord(
-            id=row["id"],
-            chat_id=row["chat_id"],
-            email=row["email"],
-            status=AliasStatus(row["status"]),
-            consumed_at=row["consumed_at"],
-            last_message_id=row["last_message_id"],
-        )
+        return _row_to_alias(row) if row is not None else None
 
     async def mark_consumed(self, alias_id: int, message_id: str | None) -> None:
         await self.conn.execute(
@@ -248,4 +497,41 @@ def credentials_from_user(user: UserRecord, plaintext_password: str) -> BridgeCr
         username=user.imap_username,
         password=plaintext_password,
         use_ssl=user.imap_use_ssl,
+    )
+
+
+def credentials_from_primary(
+    primary: PrimaryAccount, plaintext_password: str
+) -> BridgeCredentials:
+    return BridgeCredentials(
+        host=primary.imap_host,
+        port=primary.imap_port,
+        username=primary.imap_username,
+        password=plaintext_password,
+        use_ssl=primary.imap_use_ssl,
+    )
+
+
+def _row_to_alias(row: aiosqlite.Row) -> AliasRecord:
+    return AliasRecord(
+        id=row["id"],
+        chat_id=row["chat_id"],
+        email=row["email"],
+        status=AliasStatus(row["status"]),
+        consumed_at=row["consumed_at"],
+        last_message_id=row["last_message_id"],
+        primary_id=row["primary_id"] if "primary_id" in row.keys() else None,
+    )
+
+
+def _row_to_primary(row: aiosqlite.Row) -> PrimaryAccount:
+    return PrimaryAccount(
+        id=row["id"],
+        chat_id=row["chat_id"],
+        email=row["email"],
+        imap_host=row["imap_host"],
+        imap_port=row["imap_port"],
+        imap_username=row["imap_username"],
+        imap_use_ssl=bool(row["imap_use_ssl"]),
+        created_at=row["created_at"],
     )

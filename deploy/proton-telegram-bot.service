@@ -1,0 +1,23 @@
+[Unit]
+Description=Proton Telegram Bot
+After=network.target
+
+[Service]
+Type=simple
+User=botuser
+Group=botuser
+WorkingDirectory=/opt/proton-telegram-bot
+EnvironmentFile=/opt/proton-telegram-bot/.env
+ExecStart=/opt/proton-telegram-bot/.venv/bin/python -m proton_telegram_bot
+Restart=on-failure
+RestartSec=10
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/proton-telegram-bot/data
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

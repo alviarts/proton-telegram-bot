@@ -1,0 +1,15 @@
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - bot-data:/app/data
+    # Proton Bridge biasanya berjalan di host pada 127.0.0.1:1143.
+    # network_mode: host memungkinkan bot mengakses Bridge tanpa konfigurasi
+    # tambahan. Jika Bridge berjalan di mesin lain, hapus baris ini dan
+    # atur IMAP host yang sesuai saat /connect.
+    network_mode: host
+
+volumes:
+  bot-data:
