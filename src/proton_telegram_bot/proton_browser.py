@@ -80,10 +80,18 @@ DEFAULT_ACTION_TIMEOUT_MS = 60_000
 # How many proxy candidates to try before giving up and going direct.
 # Each attempt does a launch + warm-up goto, so this caps the worst case
 # at ``DEFAULT_PROXY_RETRIES * (launch + goto_timeout)``.
-DEFAULT_PROXY_RETRIES = 3
+DEFAULT_PROXY_RETRIES = 5
+# Warm-up nav uses a tighter budget than the regular nav timeout because a
+# slow free proxy is functionally equivalent to a dead one for our use case
+# -- 30s x 3 retries blocks the user for nearly two minutes, while
+# 12s x 3 = 36s is bearable. Real Proton login from a healthy connection is
+# usually <5s.
+WARMUP_NAV_TIMEOUT_MS = 12_000
 # Network errors that almost always mean the proxy itself is broken
-# (vs. an actual problem with the destination). When we see one of these
-# during the warm-up navigation we mark the proxy as failed and rotate.
+# (vs. an actual problem with the destination). Currently kept for
+# documentation/future use; the warm-up loop in
+# :func:`_launch_with_proxy_retry` is intentionally aggressive and
+# treats any warm-up exception as a proxy failure.
 PROXY_FAILURE_MARKERS = (
     "ERR_SOCKS_CONNECTION_FAILED",
     "ERR_PROXY_CONNECTION_FAILED",
@@ -96,6 +104,7 @@ PROXY_FAILURE_MARKERS = (
     "ERR_CERT_AUTHORITY_INVALID",  # MITM proxy or expired cert
     "ERR_HTTP_RESPONSE_CODE_FAILURE",
     "ERR_NO_SUPPORTED_PROXIES",
+    "Timeout",  # Playwright "Timeout NNNms exceeded"
 )
 LOGIN_OUTCOME_TIMEOUT_MS = 90_000
 
@@ -742,18 +751,6 @@ async def _dump_page_state(page: Page, label: str) -> Path | None:
 # ----------------------------------------------------------------- proxy retry
 
 
-def _is_proxy_failure(exc: BaseException) -> bool:
-    """Did Chromium fail because the proxy itself is broken?
-
-    We pattern-match the message because Playwright wraps these in a
-    generic ``Page.goto: net::ERR_FOO`` string. Conservative — when in
-    doubt, returns ``False`` so we don't blacklist a working proxy on a
-    transient hiccup.
-    """
-    msg = str(exc)
-    return any(marker in msg for marker in PROXY_FAILURE_MARKERS)
-
-
 async def _launch_with_proxy_retry(
     *,
     playwright: Playwright,
@@ -818,29 +815,31 @@ async def _launch_with_proxy_retry(
         try:
             # Warm up: confirm the proxy can actually reach Proton. This
             # surfaces ``ERR_SOCKS_CONNECTION_FAILED`` and friends BEFORE
-            # we ever type a password into a half-loaded page.
-            await page.goto(LOGIN_URL, timeout=nav_timeout_ms)
+            # we ever type a password into a half-loaded page. Use a
+            # tight timeout (``WARMUP_NAV_TIMEOUT_MS``) so a slow proxy
+            # rotates fast.
+            await page.goto(LOGIN_URL, timeout=WARMUP_NAV_TIMEOUT_MS)
         except Exception as exc:
-            if _is_proxy_failure(exc):
-                logger.warning(
-                    "ProtonBrowser: proxy %s failed warm-up (%s); blacklisting",
-                    entry.server_url,
-                    type(exc).__name__,
-                )
-                if proxy_provider is not None:
-                    proxy_provider.mark_failed(entry)
-                with contextlib.suppress(Exception):
-                    await context.close()
-                with contextlib.suppress(Exception):
-                    await browser.close()
-                continue
-            # Non-proxy failure (e.g. Proton itself is down) -- close and
-            # re-raise so the caller doesn't silently retry on a real bug.
+            # Be aggressive: ANY exception during the very first network
+            # call through the proxy is treated as proxy failure. The
+            # alternative -- trying to distinguish proxy-layer failures
+            # from "Proton is down" -- is unreliable in practice (we just
+            # saw a Playwright ``Timeout`` mask a hung SOCKS handshake).
+            # If Proton itself is down, the eventual direct-connection
+            # fallback will surface that cleanly to the caller.
+            logger.warning(
+                "ProtonBrowser: proxy %s failed warm-up (%s: %s); blacklisting",
+                entry.server_url,
+                type(exc).__name__,
+                str(exc).splitlines()[0] if str(exc) else "",
+            )
+            if proxy_provider is not None:
+                proxy_provider.mark_failed(entry)
             with contextlib.suppress(Exception):
                 await context.close()
             with contextlib.suppress(Exception):
                 await browser.close()
-            raise
+            continue
         logger.info(
             "ProtonBrowser: warm-up via %s succeeded; proceeding with login",
             entry.server_url,
