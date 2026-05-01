@@ -7,6 +7,7 @@ from pathlib import Path
 
 import aiosqlite
 
+from .alias_gen import GenState
 from .models import AliasRecord, AliasStatus, BridgeCredentials, PrimaryAccount, UserRecord
 
 SCHEMA = """
@@ -43,8 +44,23 @@ CREATE TABLE IF NOT EXISTS primary_accounts (
     imap_username TEXT NOT NULL,
     imap_password_encrypted TEXT NOT NULL,
     imap_use_ssl INTEGER NOT NULL DEFAULT 0,
+    proton_password_encrypted TEXT,
     created_at TEXT NOT NULL,
     UNIQUE(chat_id, email),
+    FOREIGN KEY(chat_id) REFERENCES users(chat_id) ON DELETE CASCADE
+);
+
+-- Tracks the next ``(suffix, number)`` cursor that ``/genaddr`` should emit
+-- for each ``(chat_id, primary_id, base)``. See ``alias_gen.py`` for the
+-- pattern logic.
+CREATE TABLE IF NOT EXISTS alias_generator_state (
+    chat_id INTEGER NOT NULL,
+    primary_id INTEGER NOT NULL,
+    base TEXT NOT NULL,
+    next_suffix TEXT NOT NULL DEFAULT '',
+    next_number INTEGER NOT NULL DEFAULT 1,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (chat_id, primary_id, base),
     FOREIGN KEY(chat_id) REFERENCES users(chat_id) ON DELETE CASCADE
 );
 
@@ -90,6 +106,15 @@ class Database:
         await self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_aliases_primary ON aliases(primary_id)"
         )
+        async with self.conn.execute("PRAGMA table_info(primary_accounts)") as cursor:
+            primary_cols = {row["name"] for row in await cursor.fetchall()}
+        if "proton_password_encrypted" not in primary_cols:
+            # Older DBs predate /setprotonpw — add the column nullable so the
+            # migration is non-destructive. Users top-up the value via the new
+            # command before /genaddr can run.
+            await self.conn.execute(
+                "ALTER TABLE primary_accounts ADD COLUMN proton_password_encrypted TEXT"
+            )
         await self._backfill_primary_accounts_from_legacy_users()
 
     async def _backfill_primary_accounts_from_legacy_users(self) -> None:
@@ -362,6 +387,94 @@ class Database:
         ) as cursor:
             rows = await cursor.fetchall()
         return [row["id"] for row in rows]
+
+    # ---------------------------------------------------------------- proton master password
+
+    async def set_proton_password(
+        self,
+        chat_id: int,
+        primary_id: int,
+        encrypted_password: str,
+    ) -> bool:
+        """Persist the Proton master password for a primary account.
+
+        This password is what /genaddr uses to drive the Proton web UI via
+        Playwright. It is stored Fernet-encrypted (callers must encrypt
+        before passing). Returns ``True`` if the row was found and updated.
+        """
+        cursor = await self.conn.execute(
+            "UPDATE primary_accounts SET proton_password_encrypted = ? "
+            "WHERE chat_id = ? AND id = ?",
+            (encrypted_password, chat_id, primary_id),
+        )
+        await self.conn.commit()
+        return (cursor.rowcount or 0) > 0
+
+    async def clear_proton_password(self, chat_id: int, primary_id: int) -> bool:
+        cursor = await self.conn.execute(
+            "UPDATE primary_accounts SET proton_password_encrypted = NULL "
+            "WHERE chat_id = ? AND id = ?",
+            (chat_id, primary_id),
+        )
+        await self.conn.commit()
+        return (cursor.rowcount or 0) > 0
+
+    async def get_proton_password_encrypted(self, primary_id: int) -> str | None:
+        async with self.conn.execute(
+            "SELECT proton_password_encrypted FROM primary_accounts WHERE id = ?",
+            (primary_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        return row["proton_password_encrypted"]
+
+    # ---------------------------------------------------------------- alias generator state
+
+    async def get_generator_state(
+        self, chat_id: int, primary_id: int, base: str
+    ) -> GenState:
+        """Return the next ``(suffix, number)`` cursor for ``base``.
+
+        If no row exists yet, the cursor defaults to ``GenState("", 1)`` —
+        i.e. the first generated name will be ``base001``.
+        """
+        async with self.conn.execute(
+            "SELECT next_suffix, next_number FROM alias_generator_state "
+            "WHERE chat_id = ? AND primary_id = ? AND base = ?",
+            (chat_id, primary_id, base.strip().lower()),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return GenState("", 1)
+        return GenState(row["next_suffix"] or "", int(row["next_number"]))
+
+    async def save_generator_state(
+        self,
+        chat_id: int,
+        primary_id: int,
+        base: str,
+        state: GenState,
+    ) -> None:
+        """Upsert the generator cursor for ``(chat_id, primary_id, base)``."""
+        await self.conn.execute(
+            "INSERT INTO alias_generator_state "
+            "(chat_id, primary_id, base, next_suffix, next_number, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(chat_id, primary_id, base) DO UPDATE SET "
+            "next_suffix = excluded.next_suffix, "
+            "next_number = excluded.next_number, "
+            "updated_at = excluded.updated_at",
+            (
+                chat_id,
+                primary_id,
+                base.strip().lower(),
+                state.suffix,
+                state.number,
+                _utcnow(),
+            ),
+        )
+        await self.conn.commit()
 
     # ---------------------------------------------------------------- aliases
 
