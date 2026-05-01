@@ -24,6 +24,7 @@ from .proton_browser import (
     LoginFailedError,
     ProtonBrowser,
     ProtonBrowserError,
+    _is_browser_closed_error,
 )
 
 logger = logging.getLogger(__name__)
@@ -78,6 +79,7 @@ async def run_batch(
     browser_factory: BrowserFactory | None = None,
     progress: Callable[[int, int, AddressCreationResult], Awaitable[None]] | None = None,
     cancel_event: asyncio.Event | None = None,
+    browser_handle: dict[str, Any] | None = None,
 ) -> BatchSummary:
     """Drive the end-to-end ``/genaddr`` flow for one primary account.
 
@@ -116,6 +118,11 @@ async def run_batch(
     factory = browser_factory or _default_browser_factory
     try:
         async with factory(primary.email, password) as browser:
+            # Expose the live browser to the caller so the bot's Cancel button
+            # can ``force_close()`` it and abort an in-flight create_address
+            # without waiting for the Playwright timeout to fire.
+            if browser_handle is not None:
+                browser_handle["browser"] = browser
             for index, full_email in enumerate(names, start=1):
                 if cancel_event is not None and cancel_event.is_set():
                     summary.aborted_reason = "cancelled by user"
@@ -142,6 +149,26 @@ async def run_batch(
                 except ProtonBrowserError as exc:
                     summary.aborted_reason = f"browser error at {local}: {exc}"
                     break
+                except asyncio.CancelledError:
+                    # Cooperative cancellation path: the bot cancelled our
+                    # task. Record the outcome and let the context manager
+                    # close the browser, then re-raise so asyncio's
+                    # cancellation contract is honoured upstream.
+                    summary.aborted_reason = f"cancelled by user at {local}"
+                    raise
+                except Exception as exc:
+                    # Force-close path: the bot closed the browser via
+                    # ``ProtonBrowser.force_close()`` while we were awaiting
+                    # a Playwright call. Detect this and surface it as a
+                    # clean cancellation instead of a generic crash.
+                    if (
+                        cancel_event is not None
+                        and cancel_event.is_set()
+                        and _is_browser_closed_error(exc)
+                    ):
+                        summary.aborted_reason = f"cancelled by user at {local}"
+                        break
+                    raise
 
                 summary.results.append(result)
                 if result.status is CreationStatus.SUCCESS:
@@ -162,6 +189,12 @@ async def run_batch(
         summary.aborted_reason = (
             f"captcha required at login: {exc.page_url}"
         )
+    finally:
+        # The browser is gone once we leave the ``async with`` block above.
+        # Drop the handle so a stale Cancel click can't act on a closed
+        # browser.
+        if browser_handle is not None:
+            browser_handle.pop("browser", None)
 
     # Persist the cursor advanced by however many names Proton ACCEPTED
     # (success or already-exists). Names that errored aren't consumed, so a

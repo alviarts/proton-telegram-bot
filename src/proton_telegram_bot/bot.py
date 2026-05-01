@@ -869,6 +869,19 @@ async def setpw_password(
 # --------------------------------------------------------------- /genaddr
 
 
+async def _safe_force_close(force_close) -> None:  # type: ignore[no-untyped-def]
+    """Run ``ProtonBrowser.force_close()`` from the cancel callback.
+
+    Wraps the call in a broad ``try/except`` because the callback fires it
+    off as a fire-and-forget task — an unhandled exception there would only
+    surface as a noisy "Task exception was never retrieved" warning.
+    """
+    try:
+        await force_close()
+    except Exception:
+        LOGGER.exception("force_close raised while cancelling /genaddr")
+
+
 @_gate
 async def cmd_genaddr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Generate N Proton addresses by driving the account web UI.
@@ -948,8 +961,14 @@ async def cmd_genaddr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
     cancel_event = asyncio.Event()
+    # ``browser_handle`` is shared between this handler and the cancel
+    # callback. ``run_batch`` populates it with the live ProtonBrowser the
+    # moment the session is open, so the callback can ``force_close()`` it
+    # mid-iteration instead of waiting for Playwright's per-step 60s timeout.
+    browser_handle: dict[str, object] = {}
     context.chat_data["genaddr_running"] = True
     context.chat_data["genaddr_cancel_event"] = cancel_event
+    context.chat_data["genaddr_browser_handle"] = browser_handle
 
     successes: list[str] = []
     failures: list[tuple[str, str]] = []
@@ -990,6 +1009,7 @@ async def cmd_genaddr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 browser_factory=context.application.bot_data.get("browser_factory"),
                 progress=_on_progress,
                 cancel_event=cancel_event,
+                browser_handle=browser_handle,
             )
         except address_generator.AddressGenerationError as exc:
             await progress_message.edit_text(
@@ -1014,6 +1034,8 @@ async def cmd_genaddr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         # in any later message becomes a no-op.
         context.chat_data.pop("genaddr_running", None)
         context.chat_data.pop("genaddr_cancel_event", None)
+        context.chat_data.pop("genaddr_browser_handle", None)
+        context.chat_data.pop("genaddr_force_close_task", None)
 
     final_lines = [
         f"✅ Selesai. Sukses: <b>{len(summary.created)}</b>, "
@@ -1066,7 +1088,27 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 pass
             return
         cancel_event.set()
-        await query.answer("Membatalkan setelah alamat saat ini selesai...")
+        # Force-close the live browser so any in-flight Playwright await
+        # (``page.click``, ``wait_for_url``, …) raises ``TargetClosedError``
+        # right now instead of running the rest of its 60s timeout.
+        # ``force_close`` itself is best-effort + bounded, so we fire it
+        # off in a background task to keep this callback snappy.
+        browser_handle = context.chat_data.get("genaddr_browser_handle")
+        browser = (
+            browser_handle.get("browser")
+            if isinstance(browser_handle, dict)
+            else None
+        )
+        force_close = getattr(browser, "force_close", None) if browser else None
+        if callable(force_close):
+            # Hold a reference on chat_data so the GC doesn't collect the
+            # task before it finishes (RUF006). The handler's ``finally``
+            # clears chat_data, which is fine — by then the task is done
+            # or the next /genaddr will overwrite the slot.
+            context.chat_data["genaddr_force_close_task"] = asyncio.create_task(
+                _safe_force_close(force_close)
+            )
+        await query.answer("Membatalkan & menutup browser...")
         try:
             # Disable the button immediately so the user knows their click
             # registered. The progress edits will still come in until the

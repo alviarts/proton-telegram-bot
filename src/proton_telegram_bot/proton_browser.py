@@ -23,6 +23,7 @@ import asyncio
 import logging
 import os
 import re
+import signal
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -240,6 +241,7 @@ class ProtonBrowser:
         self._page = page
         self._user_index = user_index
         self._email = email
+        self._closed = False
 
     @property
     def page(self) -> Page:
@@ -294,8 +296,11 @@ class ProtonBrowser:
             except Exception:
                 # Capture the page state on any error from the caller
                 # (e.g. address-modal timeout) so operators can diagnose
-                # without a second run.
-                await instance._dump_debug("session-error")
+                # without a second run. Skip when the browser was already
+                # force-closed (Cancel button) — the page is gone and
+                # screenshotting it would just log noise.
+                if not instance._closed:
+                    await instance._dump_debug("session-error")
                 raise
         finally:
             await instance.close()
@@ -306,6 +311,9 @@ class ProtonBrowser:
 
     async def close(self) -> None:
         """Best-effort cleanup. Swallows individual close errors."""
+        if self._closed:
+            return
+        self._closed = True
         for closer in (
             self._context.close,
             self._browser.close,
@@ -315,6 +323,48 @@ class ProtonBrowser:
                 await closer()
             except Exception:  # pragma: no cover - defensive
                 logger.exception("error during ProtonBrowser shutdown")
+
+    async def force_close(self, *, step_timeout: float = 3.0) -> None:
+        """Aggressively shut the browser down so an in-flight ``create_address``
+        await raises immediately.
+
+        Used by ``/genaddr``'s Cancel button: closing the context makes any
+        pending Playwright call (``page.click``, ``wait_for_url``, …) raise
+        ``TargetClosedError`` instead of running until its 60s timeout. If a
+        step itself stalls, we SIGKILL the underlying Chromium process so the
+        bot doesn't deadlock waiting on a wedged renderer.
+        """
+        if self._closed:
+            return
+        self._closed = True
+
+        chromium_pid: int | None = None
+        try:
+            proc = getattr(self._browser, "process", None)
+            if proc is not None:
+                chromium_pid = getattr(proc, "pid", None)
+        except Exception:  # pragma: no cover - defensive
+            chromium_pid = None
+
+        for label, closer in (
+            ("context", self._context.close),
+            ("browser", self._browser.close),
+            ("playwright", self._playwright.stop),
+        ):
+            try:
+                await asyncio.wait_for(closer(), timeout=step_timeout)
+            except TimeoutError:
+                logger.warning(
+                    "force_close: %s did not finish within %.1fs; will fall back to SIGKILL",
+                    label,
+                    step_timeout,
+                )
+                break
+            except Exception:
+                logger.exception("force_close: error while closing %s", label)
+
+        if chromium_pid:
+            _kill_pid(chromium_pid)
 
     # ------------------------------------------------------------------ login
 
@@ -537,6 +587,42 @@ class ProtonBrowser:
 
 def _addresses_url(user_index: int) -> str:
     return ADDRESSES_URL_TEMPLATE.format(user_index=user_index)
+
+
+def _kill_pid(pid: int) -> None:
+    """Send SIGKILL to ``pid`` if the process still exists.
+
+    Best-effort: never raises. Used as the last-resort fallback in
+    :meth:`ProtonBrowser.force_close` when a Playwright ``close()`` step does
+    not return within the per-step timeout (a wedged Chromium renderer).
+    """
+    try:
+        os.kill(pid, signal.SIGKILL)
+        logger.warning("force_close: SIGKILL sent to chromium pid=%d", pid)
+    except ProcessLookupError:
+        pass
+    except Exception:  # pragma: no cover - defensive
+        logger.exception("force_close: failed to SIGKILL chromium pid=%d", pid)
+
+
+def _is_browser_closed_error(exc: BaseException) -> bool:
+    """Best-effort detection of the Playwright "target closed" family.
+
+    Used by :func:`address_generator.run_batch` to recognise the exception
+    raised when the Cancel button force-closes the browser mid-flight, so we
+    can surface a clean "cancelled by user" outcome instead of a generic
+    crash.
+    """
+    name = type(exc).__name__
+    if name in {"TargetClosedError", "BrowserClosedError"}:
+        return True
+    msg = str(exc).lower()
+    return (
+        "target page, context or browser has been closed" in msg
+        or "target closed" in msg
+        or "browser has been closed" in msg
+        or "browser closed" in msg
+    )
 
 
 def _classify_error(text: str) -> CreationStatus:

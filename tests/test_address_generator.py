@@ -6,6 +6,7 @@ test script the outcome of each call.
 """
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -446,3 +447,151 @@ async def test_corrupted_proton_password_raises(
             domain="proton.me",
             browser_factory=factory,
         )
+
+
+# ---------------------------------------------------------------- cancellation paths
+
+
+@dataclass
+class HangingBrowser:
+    """Simulates a long-running ``create_address`` that the bot must abort.
+
+    The first ``hang_at`` calls succeed instantly; the next call blocks on an
+    asyncio Event indefinitely. Tests can either set ``cancel_event`` (the
+    cooperative path) or call ``force_close`` (the aggressive path). When
+    ``force_close`` runs we raise an exception that mimics Playwright's
+    ``TargetClosedError`` so the orchestrator sees the same shape it would
+    in production.
+    """
+
+    hang_at: int
+    statuses_before_hang: list[CreationStatus] | None = None
+    calls: list[str] = field(default_factory=list)
+    _hang_event: asyncio.Event = field(default_factory=asyncio.Event)
+    _force_closed: bool = False
+
+    async def create_address(
+        self, *, local: str, domain: str, **_: object
+    ) -> AddressCreationResult:
+        self.calls.append(local)
+        if len(self.calls) <= self.hang_at:
+            statuses = self.statuses_before_hang or [CreationStatus.SUCCESS]
+            status = statuses[len(self.calls) - 1] if len(self.calls) - 1 < len(statuses) else CreationStatus.SUCCESS
+            return AddressCreationResult(local=local, domain=domain, status=status)
+        # Block until either the test releases the event (cancel_event path)
+        # or force_close is triggered (force-close path).
+        await self._hang_event.wait()
+        if self._force_closed:
+            raise RuntimeError("Target page, context or browser has been closed")
+        return AddressCreationResult(local=local, domain=domain, status=CreationStatus.SUCCESS)
+
+    async def force_close(self) -> None:
+        self._force_closed = True
+        self._hang_event.set()
+
+
+async def test_cancel_event_aborts_between_iterations(
+    db_and_primary, cipher: CredentialCipher
+) -> None:
+    """Setting ``cancel_event`` between iterations stops the loop cleanly."""
+    db, chat_id, primary = db_and_primary
+    _, factory = _factory([CreationStatus.SUCCESS] * 5)
+    cancel = asyncio.Event()
+
+    async def stop_after_first(index: int, total: int, result: AddressCreationResult) -> None:
+        if index == 1:
+            cancel.set()
+
+    summary = await run_batch(
+        db=db,
+        cipher=cipher,
+        chat_id=chat_id,
+        primary=primary,
+        base="vielz",
+        count=5,
+        domain="proton.me",
+        browser_factory=factory,
+        progress=stop_after_first,
+        cancel_event=cancel,
+    )
+
+    assert len(summary.created) == 1
+    assert summary.aborted_reason == "cancelled by user"
+
+
+async def test_force_close_aborts_in_flight_create_address(
+    db_and_primary, cipher: CredentialCipher
+) -> None:
+    """The Cancel button's force-close path must abort a hanging Playwright call.
+
+    This is the regression we're fixing: previously ``cancel_event`` only
+    stopped the *next* iteration; if the in-flight ``create_address`` was
+    blocked (e.g. waiting on Proton's modal), the user would wait up to 60s
+    for the Playwright timeout to fire. With ``browser_handle`` exposed and
+    ``force_close`` available, the bot can abort *now*.
+    """
+    db, chat_id, primary = db_and_primary
+    hanging = HangingBrowser(
+        hang_at=1,
+        statuses_before_hang=[CreationStatus.SUCCESS],
+    )
+
+    @asynccontextmanager
+    async def factory(email: str, password: str):
+        yield hanging
+
+    cancel = asyncio.Event()
+    handle: dict[str, object] = {}
+
+    async def trip_cancel(index: int, total: int, result: AddressCreationResult) -> None:
+        # After the first address succeeds, simulate the user pressing Cancel.
+        if index == 1:
+            cancel.set()
+            browser = handle.get("browser")
+            assert browser is hanging
+            await browser.force_close()  # type: ignore[union-attr]
+
+    summary = await run_batch(
+        db=db,
+        cipher=cipher,
+        chat_id=chat_id,
+        primary=primary,
+        base="vielz",
+        count=5,
+        domain="proton.me",
+        browser_factory=factory,
+        progress=trip_cancel,
+        cancel_event=cancel,
+        browser_handle=handle,
+    )
+
+    # First address succeeded; second was hanging when the bot force-closed
+    # the browser, so it surfaces as a cancellation rather than a crash.
+    assert len(summary.created) == 1
+    assert summary.aborted_reason is not None
+    assert "cancelled by user" in summary.aborted_reason
+    # ``browser_handle`` is cleared on exit so a stray Cancel click can't act
+    # on a closed browser.
+    assert "browser" not in handle
+
+
+async def test_browser_handle_cleared_on_normal_completion(
+    db_and_primary, cipher: CredentialCipher
+) -> None:
+    db, chat_id, primary = db_and_primary
+    _, factory = _factory([CreationStatus.SUCCESS] * 2)
+    handle: dict[str, object] = {}
+
+    await run_batch(
+        db=db,
+        cipher=cipher,
+        chat_id=chat_id,
+        primary=primary,
+        base="vielz",
+        count=2,
+        domain="proton.me",
+        browser_factory=factory,
+        browser_handle=handle,
+    )
+
+    assert "browser" not in handle
