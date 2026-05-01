@@ -22,11 +22,13 @@ from telegram.ext import (
     filters,
 )
 
+from . import address_generator
 from .config import Settings
 from .crypto import CredentialCipher
 from .db import Database
 from .manager import ListenerManager, Notifier
 from .models import AliasRecord, AliasStatus, PrimaryAccount
+from .proton_browser import CreationStatus
 
 LOGGER = logging.getLogger(__name__)
 
@@ -42,6 +44,17 @@ LOGGER = logging.getLogger(__name__)
 
 # Conversation states for /sync
 SYNC_CAPTCHA = 10
+
+# Conversation states for /setprotonpw
+SETPW_PICK_PRIMARY, SETPW_PASSWORD = 20, 21
+
+# Throttle: at most one progress edit every N addresses to stay well under
+# Telegram's edit_message rate limit during long /genaddr runs.
+GENADDR_PROGRESS_EVERY = 1
+
+# Limits applied at the bot layer (the alias generator has its own MAX_BATCH).
+GENADDR_DEFAULT_DOMAIN = "proton.me"
+GENADDR_MAX_COUNT = 200
 
 CB_PICK = "pick"
 CB_REFRESH = "refresh"
@@ -238,6 +251,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/connect — Setup kredensial IMAP Proton Bridge\n"
         "/disconnect — Hapus kredensial dan stop listener\n"
         "/sync &lt;user&gt; &lt;pass&gt; — Auto-sync alias dari akun Proton\n"
+        "/accounts — Daftar akun Proton (sama dgn /list)\n"
+        "/setprotonpw — Simpan password master Proton untuk /genaddr\n"
+        "/genaddr &lt;base&gt; &lt;count&gt; [@domain] — Otomatis buat N alamat lewat browser\n"
         "/addalias — Tambah alias secara manual\n"
         "/removealias — Hapus alias\n"
         "/list — Lihat semua alias dan pilih yang aktif\n"
@@ -642,6 +658,19 @@ async def connect_ssl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         "Tersambung! Bot akan auto-discover alias dari INBOX akun ini. "
         "Kirim /list untuk lihat semua email utama."
     )
+    # Auto-prompt: brand-new primaries usually start with zero aliases. Nudge
+    # the user toward /setprotonpw + /genaddr so they don't have to discover
+    # the feature from /start.
+    aliases = await db.list_aliases(chat.id, primary_id=primary_id)
+    if not aliases:
+        await update.effective_message.reply_text(  # type: ignore[union-attr]
+            f"ℹ️ Belum ada alias di <b>{html.escape(user_data['primary_email'])}</b>.\n\n"  # noqa: RUF001
+            "Mau aku generate sekaligus? Langkahnya:\n"
+            "1) <code>/setprotonpw</code> — simpan password master Proton (sekali aja)\n"
+            "2) <code>/genaddr vielz 10</code> — buat 10 alamat <code>vielz001..vielz010@proton.me</code>\n\n"
+            "Aku jalankan otomatis lewat browser headless di sisi server.",
+            parse_mode=ParseMode.HTML,
+        )
     return ConversationHandler.END
 
 
@@ -701,6 +730,280 @@ async def cmd_disconnect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         "+ alias-aliasnya juga dihapus):",
         reply_markup=InlineKeyboardMarkup(rows),
     )
+
+
+# --------------------------------------------------------------- /accounts
+
+
+@_gate
+async def cmd_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Shortcut for /list — same UI, kept as a separate command so users
+    discover the multi-account feature more naturally."""
+    chat = update.effective_chat
+    if chat is None:
+        return
+    db = _bot_db(context)
+    await _show_primary_list(update, db, chat.id)
+
+
+# --------------------------------------------------------------- /setprotonpw
+
+
+@_gate
+async def cmd_setprotonpw(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Store the Proton master password used by /genaddr to drive the web UI.
+
+    Single-primary chats skip the picker; multi-primary chats list every
+    account so the user can pick which one to attach the password to.
+    """
+    chat = update.effective_chat
+    if chat is None:
+        return ConversationHandler.END
+    db = _bot_db(context)
+    primaries = await db.list_primary_accounts(chat.id)
+    if not primaries:
+        await update.effective_message.reply_text(  # type: ignore[union-attr]
+            "Belum ada akun Proton. Kirim /connect dulu sebelum /setprotonpw."
+        )
+        return ConversationHandler.END
+
+    if len(primaries) == 1:
+        target = primaries[0]
+        cast(dict, context.user_data)["setpw_primary_id"] = target.id
+        await update.effective_message.reply_text(  # type: ignore[union-attr]
+            f"Akan menyimpan password Proton untuk <b>{html.escape(target.email)}</b>.\n\n"
+            "Kirim password Proton (master password) sekarang. "
+            "<b>Hapus pesan password setelah aku konfirmasi</b> untuk mengurangi "
+            "risiko kalau riwayat chat bocor.",
+            parse_mode=ParseMode.HTML,
+        )
+        return SETPW_PASSWORD
+
+    rows: list[list[InlineKeyboardButton]] = []
+    for primary in primaries:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"📧 {primary.email}",
+                    callback_data=f"setpw:{primary.id}",
+                )
+            ]
+        )
+    await update.effective_message.reply_text(  # type: ignore[union-attr]
+        "Pilih akun Proton yang mau di-set passwordnya:",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+    return SETPW_PICK_PRIMARY
+
+
+async def setpw_pick_primary(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    query = update.callback_query
+    if query is None or query.data is None:
+        return ConversationHandler.END
+    await query.answer()
+    if not query.data.startswith("setpw:"):
+        return ConversationHandler.END
+    try:
+        primary_id = int(query.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        return ConversationHandler.END
+    chat_id = query.message.chat_id if query.message else None
+    if chat_id is None:
+        return ConversationHandler.END
+    db = _bot_db(context)
+    primary = await db.get_primary_account_by_id(primary_id)
+    if primary is None or primary.chat_id != chat_id:
+        if query.message is not None:
+            await query.message.reply_text("Akun tidak ditemukan.")
+        return ConversationHandler.END
+    cast(dict, context.user_data)["setpw_primary_id"] = primary.id
+    if query.message is not None:
+        await query.message.reply_text(
+            f"Akan menyimpan password Proton untuk <b>{html.escape(primary.email)}</b>.\n\n"
+            "Kirim password Proton (master password) sekarang. "
+            "<b>Hapus pesan password setelah aku konfirmasi</b>.",
+            parse_mode=ParseMode.HTML,
+        )
+    return SETPW_PASSWORD
+
+
+async def setpw_password(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    chat = update.effective_chat
+    if chat is None:
+        return ConversationHandler.END
+    text = (update.effective_message.text or "").strip()  # type: ignore[union-attr]
+    if not text:
+        await update.effective_message.reply_text("Password tidak boleh kosong.")  # type: ignore[union-attr]
+        return SETPW_PASSWORD
+    user_data = cast(dict, context.user_data)
+    primary_id = user_data.pop("setpw_primary_id", None)
+    if primary_id is None:
+        await update.effective_message.reply_text(  # type: ignore[union-attr]
+            "Sesi /setprotonpw kedaluwarsa. Mulai lagi."
+        )
+        return ConversationHandler.END
+
+    db = _bot_db(context)
+    cipher = _bot_cipher(context)
+    encrypted = cipher.encrypt(text)
+    ok = await db.set_proton_password(chat.id, primary_id, encrypted)
+    if not ok:
+        await update.effective_message.reply_text(  # type: ignore[union-attr]
+            "Gagal menyimpan — akun mungkin sudah dihapus."
+        )
+        return ConversationHandler.END
+    await update.effective_message.reply_text(  # type: ignore[union-attr]
+        "Password Proton tersimpan terenkripsi. "
+        "<b>Sekarang hapus pesan passwordmu</b> dari chat ini. "
+        "Pakai /genaddr untuk generate alamat.",
+        parse_mode=ParseMode.HTML,
+    )
+    return ConversationHandler.END
+
+
+# --------------------------------------------------------------- /genaddr
+
+
+@_gate
+async def cmd_genaddr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Generate N Proton addresses by driving the account web UI.
+
+    Usage: ``/genaddr <base> <count> [@domain]`` — e.g. ``/genaddr vielz 10``.
+    Defaults to ``@proton.me``. Aborts with a clear error if the account has
+    no Proton master password stored yet.
+    """
+    chat = update.effective_chat
+    if chat is None:
+        return
+    args = list(context.args or [])
+    if len(args) < 2:
+        await update.effective_message.reply_text(  # type: ignore[union-attr]
+            "Pakai: <code>/genaddr &lt;base&gt; &lt;count&gt; [@domain]</code>\n"
+            "Contoh: <code>/genaddr vielz 10</code> → buat vielz001..vielz010 di @proton.me\n\n"
+            f"Maksimal <b>{GENADDR_MAX_COUNT}</b> per perintah. Jalankan /setprotonpw "
+            "dulu kalau belum.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    base = args[0]
+    try:
+        count = int(args[1])
+    except ValueError:
+        await update.effective_message.reply_text(  # type: ignore[union-attr]
+            "Argumen kedua harus angka (jumlah alamat)."
+        )
+        return
+    if count < 1 or count > GENADDR_MAX_COUNT:
+        await update.effective_message.reply_text(  # type: ignore[union-attr]
+            f"Jumlah harus 1..{GENADDR_MAX_COUNT}."
+        )
+        return
+    domain = args[2] if len(args) >= 3 else GENADDR_DEFAULT_DOMAIN
+    domain = domain.lstrip("@")
+
+    db = _bot_db(context)
+    cipher = _bot_cipher(context)
+    primaries = await db.list_primary_accounts(chat.id)
+    if not primaries:
+        await update.effective_message.reply_text(  # type: ignore[union-attr]
+            "Belum ada akun Proton. Kirim /connect lalu /setprotonpw lebih dulu."
+        )
+        return
+    # Pick the active alias's primary if there is one, otherwise the first.
+    active = await db.get_active_alias(chat.id)
+    if active is not None and active.primary_id:
+        primary = next(
+            (p for p in primaries if p.id == active.primary_id), primaries[0]
+        )
+    else:
+        primary = primaries[0]
+    if len(primaries) > 1:
+        await update.effective_message.reply_text(  # type: ignore[union-attr]
+            f"Akun yang dipakai: <b>{html.escape(primary.email)}</b>. "
+            "Pakai /list untuk pilih akun lain (klik aliasnya untuk aktifkan).",
+            parse_mode=ParseMode.HTML,
+        )
+
+    progress_message = await update.effective_message.reply_text(  # type: ignore[union-attr]
+        f"⏳ Menyiapkan browser & login ke {html.escape(primary.email)}...\n"
+        f"Akan membuat <b>{count}</b> alamat dengan pola "
+        f"<code>{html.escape(base)}NNN@{html.escape(domain)}</code>.",
+        parse_mode=ParseMode.HTML,
+    )
+
+    successes: list[str] = []
+    failures: list[tuple[str, str]] = []
+
+    async def _on_progress(index: int, total: int, result) -> None:
+        # ``result`` is an AddressCreationResult — deliberately untyped here
+        # to avoid widening the bot.py imports; we only use a few fields.
+        if result.status is CreationStatus.SUCCESS:
+            successes.append(result.email)
+        else:
+            failures.append((result.email, result.status.value))
+        if index % GENADDR_PROGRESS_EVERY != 0 and index != total:
+            return
+        try:
+            await progress_message.edit_text(
+                f"⏳ <b>{index}/{total}</b> diproses\n"
+                f"✅ {len(successes)} sukses · ⚠️ {len(failures)} gagal/duplikat\n"
+                f"Terakhir: <code>{html.escape(result.email)}</code> "
+                f"({html.escape(result.status.value)})",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            # Telegram occasionally rejects identical edits or rate-limits;
+            # losing a progress update is fine, the final summary is what
+            # matters.
+            LOGGER.debug("genaddr progress edit failed", exc_info=True)
+
+    try:
+        summary = await address_generator.run_batch(
+            db=db,
+            cipher=cipher,
+            chat_id=chat.id,
+            primary=primary,
+            base=base,
+            count=count,
+            domain=domain,
+            browser_factory=context.application.bot_data.get("browser_factory"),
+            progress=_on_progress,
+        )
+    except address_generator.AddressGenerationError as exc:
+        await progress_message.edit_text(
+            f"❌ Tidak bisa mulai: {html.escape(str(exc))}\n\n"
+            "Kalau belum, set password Proton dengan /setprotonpw."
+        )
+        return
+    except Exception:
+        LOGGER.exception("genaddr crashed")
+        await progress_message.edit_text(
+            "❌ Browser otomasi crash. Cek log bot di server."
+        )
+        return
+
+    final_lines = [
+        f"✅ Selesai. Sukses: <b>{len(summary.created)}</b>, "
+        f"sudah ada: <b>{len(summary.already_existing)}</b>, "
+        f"gagal: <b>{len(summary.failed)}</b>.",
+    ]
+    if summary.captcha_interrupted_at:
+        final_lines.append(
+            f"⚠️ Berhenti di <code>{html.escape(summary.captcha_interrupted_at)}</code> "
+            "karena CAPTCHA. Solve manual lalu jalankan ulang /genaddr."
+        )
+    if summary.aborted_reason and not summary.captcha_interrupted_at:
+        final_lines.append(f"ℹ️ {html.escape(summary.aborted_reason)}")  # noqa: RUF001
+    if summary.created:
+        sample = ", ".join(r.email for r in summary.created[:5])
+        more = "" if len(summary.created) <= 5 else f" (+{len(summary.created) - 5} lagi)"
+        final_lines.append(f"Contoh: <code>{html.escape(sample)}</code>{more}")
+    final_lines.append("\n/list untuk lihat semua alamat per akun.")
+    await progress_message.edit_text("\n".join(final_lines), parse_mode=ParseMode.HTML)
 
 
 # --------------------------------------------------------------- callback queries
@@ -967,16 +1270,34 @@ def build_handlers() -> list:
         persistent=False,
     )
 
+    setpw_conv = ConversationHandler(
+        entry_points=[CommandHandler("setprotonpw", cmd_setprotonpw)],
+        states={
+            SETPW_PICK_PRIMARY: [
+                CallbackQueryHandler(setpw_pick_primary, pattern=r"^setpw:\d+$"),
+            ],
+            SETPW_PASSWORD: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, setpw_password),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cmd_cancel)],
+        name="setprotonpw",
+        persistent=False,
+    )
+
     return [
         CommandHandler("start", cmd_start),
         CommandHandler("list", cmd_list),
+        CommandHandler("accounts", cmd_accounts),
         CommandHandler("unlock", cmd_unlock),
         CommandHandler("history", cmd_history),
         CommandHandler("addalias", cmd_addalias),
         CommandHandler("removealias", cmd_removealias),
         CommandHandler("reset", cmd_reset),
         CommandHandler("disconnect", cmd_disconnect),
+        CommandHandler("genaddr", cmd_genaddr),
         connect_conv,
         sync_conv,
+        setpw_conv,
         CallbackQueryHandler(on_callback),
     ]

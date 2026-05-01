@@ -171,9 +171,41 @@ and note the credentials it provides:
 | `/sync user password` | Auto-sync all addresses from your Proton account. |
 | `/removealias a@b.com` | Forget an alias entirely. |
 | `/list` | Show available aliases as inline buttons. |
+| `/accounts` | Shortcut for `/list`. |
 | `/history` | Show aliases that already received their email. |
 | `/reset a@b.com` | Move an alias back to "available". |
-| `/cancel` | Abort the current `/connect` dialog. |
+| `/setprotonpw` | Store your Proton master password (used by `/genaddr`). |
+| `/genaddr <base> <count> [@domain]` | Auto-create N addresses on Proton via headless browser. |
+| `/cancel` | Abort the current `/connect` / `/setprotonpw` dialog. |
+
+### Bulk address creation (`/genaddr`)
+
+Drives the official Proton account UI through a headless Chromium so
+the address-key cryptography is performed by Proton's own JavaScript —
+the bot never touches your private keys. Names are generated
+deterministically:
+
+```
+/genaddr vielz 10
+# → vielz001 … vielz010 @ proton.me
+
+/genaddr vielz 50 @proton.me
+# resumes from the last successful number; on overflow appends a
+#   letter suffix (vielz999 → vielza001 → … → vielzz999 → vielzaa001).
+```
+
+Prerequisites:
+
+1. `/connect` an account first (Bridge credentials).
+2. `/setprotonpw` to store the Proton **master** password (Fernet-encrypted
+   alongside Bridge credentials). This is required because
+   address-key generation in the web UI needs it.
+3. Make sure your Proton plan permits enough addresses (Business / Mail
+   Plus / Unlimited). Already-existing names are detected and skipped.
+
+If Proton presents a CAPTCHA mid-batch the bot stops and tells you which
+name it stopped on; solve in the browser, then re-run `/genaddr` with
+the same arguments — the cursor resumes where it left off.
 
 ## Development
 
@@ -192,6 +224,13 @@ state is fully isolated.
 
 - Bridge passwords are encrypted at rest with `cryptography.Fernet`.
   Lose the `ENCRYPTION_KEY` and you will need to `/connect` again.
+- The Proton **master password** stored by `/setprotonpw` is encrypted
+  the same way, but unlike a Bridge password it cannot be revoked
+  per-device — anyone with both your `.env` (containing the
+  `ENCRYPTION_KEY`) **and** the SQLite DB can sign in to your Proton
+  account fully. Only enable `/setprotonpw` on a host you treat as
+  authoritative, and rotate the Proton password if the host is ever
+  compromised.
 - Telegram message bodies may contain sensitive content. Treat the
   chat history as you would your inbox.
 - Never commit your `.env` or the SQLite database. Both are excluded
