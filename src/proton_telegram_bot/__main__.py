@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from telegram import BotCommand
 from telegram.ext import Application, ApplicationBuilder
 
 from .bot import TelegramNotifier, build_handlers
@@ -15,10 +16,38 @@ from .proxy_provider import ProxyProvider
 
 LOGGER = logging.getLogger(__name__)
 
+# Commands surfaced as the slash-menu in Telegram (the popup that appears
+# next to the chat box). Order = display order. Keep the descriptions
+# short — Telegram clips them in the menu UI.
+BOT_COMMAND_MENU: list[tuple[str, str]] = [
+    ("start", "Mulai & lihat panduan singkat"),
+    ("connect", "Tambah akun Proton baru"),
+    ("list", "Daftar email utama & alias"),
+    ("accounts", "Daftar akun Proton"),
+    ("setprotonpw", "Simpan password master Proton"),
+    ("genaddr", "Generate alamat (cth: /genaddr vielz 10)"),
+    ("addalias", "Tambah alias manual"),
+    ("removealias", "Hapus alias"),
+    ("history", "Alias yang sudah terpakai"),
+    ("reset", "Kembalikan alias ke daftar tersedia"),
+    ("unlock", "Lepas kunci alias aktif"),
+    ("disconnect", "Hapus akun + stop listener"),
+    ("sync", "Auto-sync alias dari akun Proton"),
+    ("cancel", "Batalkan dialog yang sedang jalan"),
+]
+
 
 async def _post_init(application: Application) -> None:
     manager: ListenerManager = application.bot_data["manager"]
     await manager.restore_all()
+    # Push the slash-menu so users see a clickable command list in
+    # Telegram's chat-box UI instead of having to memorise commands.
+    try:
+        await application.bot.set_my_commands(
+            [BotCommand(name, description) for name, description in BOT_COMMAND_MENU]
+        )
+    except Exception:
+        LOGGER.exception("failed to publish bot command menu")
 
 
 async def _post_shutdown(application: Application) -> None:
