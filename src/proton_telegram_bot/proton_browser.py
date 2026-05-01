@@ -675,14 +675,41 @@ def _is_browser_closed_error(exc: BaseException) -> bool:
 
 
 def _classify_error(text: str) -> CreationStatus:
-    """Map a Proton toast message to one of the canonical error statuses."""
+    """Map a Proton toast message to one of the canonical error statuses.
+
+    Matches both English and Indonesian phrasings since the user's Proton
+    locale flips the toast strings (e.g. "maximum" -> "maksimum",
+    "already exists" -> "sudah ada").
+    """
     if not text:
         return CreationStatus.ERROR
-    if "already" in text or "exists" in text or "taken" in text or "sudah ada" in text:
+    lowered = text.lower()
+    if (
+        "already" in lowered
+        or "exists" in lowered
+        or "taken" in lowered
+        or "sudah ada" in lowered
+        or "sudah terdaftar" in lowered
+    ):
         return CreationStatus.ALREADY_EXISTS
-    if "limit" in text or "quota" in text or "maximum" in text:
+    if (
+        "limit" in lowered
+        or "quota" in lowered
+        or "maximum" in lowered
+        or "maksimum" in lowered
+        or "maksimal" in lowered
+        or "sudah penuh" in lowered
+        or "telah mencapai" in lowered
+        or "sudah mencapai" in lowered
+    ):
         return CreationStatus.LIMIT_REACHED
-    if "password" in text or "credentials" in text or "auth" in text:
+    if (
+        "password" in lowered
+        or "credentials" in lowered
+        or "auth" in lowered
+        or "kata sandi" in lowered
+        or "sandi salah" in lowered
+    ):
         return CreationStatus.AUTH_FAILED
     return CreationStatus.ERROR
 
