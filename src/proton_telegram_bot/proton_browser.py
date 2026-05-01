@@ -20,6 +20,7 @@ changes.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import re
@@ -40,7 +41,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing-only imports
         Playwright,
     )
 
-    from .proxy_provider import ProxyProvider
+    from .proxy_provider import ProxyEntry, ProxyProvider
 
 
 logger = logging.getLogger(__name__)
@@ -76,6 +77,26 @@ DEFAULT_USER_INDEX = 0
 # in the browser which is CPU-bound.
 DEFAULT_NAV_TIMEOUT_MS = 30_000
 DEFAULT_ACTION_TIMEOUT_MS = 60_000
+# How many proxy candidates to try before giving up and going direct.
+# Each attempt does a launch + warm-up goto, so this caps the worst case
+# at ``DEFAULT_PROXY_RETRIES * (launch + goto_timeout)``.
+DEFAULT_PROXY_RETRIES = 3
+# Network errors that almost always mean the proxy itself is broken
+# (vs. an actual problem with the destination). When we see one of these
+# during the warm-up navigation we mark the proxy as failed and rotate.
+PROXY_FAILURE_MARKERS = (
+    "ERR_SOCKS_CONNECTION_FAILED",
+    "ERR_PROXY_CONNECTION_FAILED",
+    "ERR_TUNNEL_CONNECTION_FAILED",
+    "ERR_CONNECTION_TIMED_OUT",
+    "ERR_CONNECTION_REFUSED",
+    "ERR_CONNECTION_RESET",
+    "ERR_NAME_NOT_RESOLVED",
+    "ERR_EMPTY_RESPONSE",
+    "ERR_CERT_AUTHORITY_INVALID",  # MITM proxy or expired cert
+    "ERR_HTTP_RESPONSE_CODE_FAILURE",
+    "ERR_NO_SUPPORTED_PROXIES",
+)
 LOGIN_OUTCOME_TIMEOUT_MS = 90_000
 
 # Where to dump screenshots + HTML when a flow fails in an unexpected way.
@@ -283,25 +304,17 @@ class ProtonBrowser:
         from playwright.async_api import async_playwright
 
         playwright = await async_playwright().start()
-        launch_kwargs: dict[str, object] = {"headless": headless}
-        if proxy_provider is not None:
-            entry = await proxy_provider.acquire()
-            if entry is not None:
-                launch_kwargs["proxy"] = {"server": entry.server_url}
-                logger.info(
-                    "ProtonBrowser: launching Chromium via proxy %s",
-                    entry.server_url,
-                )
-            else:
-                logger.warning(
-                    "ProtonBrowser: proxy_provider returned no proxy; "
-                    "launching Chromium with direct connection"
-                )
-        browser = await playwright.chromium.launch(**launch_kwargs)
-        context = await browser.new_context()
-        context.set_default_timeout(action_timeout_ms)
-        context.set_default_navigation_timeout(nav_timeout_ms)
-        page = await context.new_page()
+        # Open Chromium with proxy rotation: try a handful of probed proxies
+        # in order, marking each one as failed in the provider so the next
+        # call doesn't pick the same dead proxy. Falls back to a direct
+        # connection if every proxy fails.
+        browser, context, page, used_proxy = await _launch_with_proxy_retry(
+            playwright=playwright,
+            headless=headless,
+            nav_timeout_ms=nav_timeout_ms,
+            action_timeout_ms=action_timeout_ms,
+            proxy_provider=proxy_provider,
+        )
 
         instance = cls(
             playwright=playwright,
@@ -312,7 +325,7 @@ class ProtonBrowser:
             email=email,
         )
         try:
-            await instance.login(password=password)
+            await instance.login(password=password, skip_initial_goto=used_proxy is not None)
             try:
                 yield instance
             except Exception:
@@ -390,16 +403,21 @@ class ProtonBrowser:
 
     # ------------------------------------------------------------------ login
 
-    async def login(self, password: str) -> None:
+    async def login(self, password: str, *, skip_initial_goto: bool = False) -> None:
         """Log into account.proton.me with the configured email + password.
 
         Raises :class:`LoginFailedError` on bad credentials, or
         :class:`CaptchaInterruptError` when Proton's anti-bot challenges the
         login form. Successful login resolves once the account dashboard is
         rendered.
+
+        ``skip_initial_goto=True`` lets callers (specifically
+        :meth:`session`) re-use a page that already navigated to the
+        login URL during proxy warm-up, avoiding a redundant nav.
         """
         page = self._page
-        await page.goto(LOGIN_URL)
+        if not skip_initial_goto:
+            await page.goto(LOGIN_URL)
 
         await page.fill(SELECTORS["login_email"], self._email)
         await page.fill(SELECTORS["login_password"], password)
@@ -719,3 +737,120 @@ async def _dump_page_state(page: Page, label: str) -> Path | None:
         page.url,
     )
     return DEBUG_DUMP_DIR
+
+
+# ----------------------------------------------------------------- proxy retry
+
+
+def _is_proxy_failure(exc: BaseException) -> bool:
+    """Did Chromium fail because the proxy itself is broken?
+
+    We pattern-match the message because Playwright wraps these in a
+    generic ``Page.goto: net::ERR_FOO`` string. Conservative — when in
+    doubt, returns ``False`` so we don't blacklist a working proxy on a
+    transient hiccup.
+    """
+    msg = str(exc)
+    return any(marker in msg for marker in PROXY_FAILURE_MARKERS)
+
+
+async def _launch_with_proxy_retry(
+    *,
+    playwright: Playwright,
+    headless: bool,
+    nav_timeout_ms: int,
+    action_timeout_ms: int,
+    proxy_provider: ProxyProvider | None,
+    retries: int = DEFAULT_PROXY_RETRIES,
+) -> tuple[Browser, BrowserContext, Page, ProxyEntry | None]:
+    """Launch Chromium with retry-with-rotated-proxy semantics.
+
+    Strategy:
+
+    1. Ask the provider for ``retries`` candidate proxies (already
+       probed at TCP level).
+    2. For each: launch Chromium with ``proxy={"server": ...}``, open
+       a context+page, do a warm-up ``page.goto(LOGIN_URL)``.
+    3. If the goto fails with a proxy-layer error
+       (``ERR_SOCKS_CONNECTION_FAILED`` &c.), mark the proxy as failed
+       in the provider, tear the browser down, try the next candidate.
+    4. If every proxy fails (or the provider returns nothing), fall
+       back to a direct connection.
+
+    Returns ``(browser, context, page, used_proxy)`` where
+    ``used_proxy`` is the entry the caller should pass back to
+    ``provider.mark_failed`` if a *later* navigation reveals the proxy
+    is bad. ``None`` means we're on a direct connection.
+    """
+    candidates: list[ProxyEntry] = []
+    if proxy_provider is not None:
+        candidates = await proxy_provider.acquire_many(retries)
+        if not candidates:
+            logger.warning(
+                "ProtonBrowser: proxy_provider returned no candidates; "
+                "launching Chromium with direct connection"
+            )
+
+    for entry in candidates:
+        logger.info(
+            "ProtonBrowser: trying proxy %s (source=%s)",
+            entry.server_url,
+            entry.source,
+        )
+        try:
+            browser = await playwright.chromium.launch(
+                headless=headless, proxy={"server": entry.server_url}
+            )
+        except Exception as exc:
+            logger.warning(
+                "ProtonBrowser: launch with %s failed (%s); trying next",
+                entry.server_url,
+                exc,
+            )
+            if proxy_provider is not None:
+                proxy_provider.mark_failed(entry)
+            continue
+
+        context = await browser.new_context()
+        context.set_default_timeout(action_timeout_ms)
+        context.set_default_navigation_timeout(nav_timeout_ms)
+        page = await context.new_page()
+        try:
+            # Warm up: confirm the proxy can actually reach Proton. This
+            # surfaces ``ERR_SOCKS_CONNECTION_FAILED`` and friends BEFORE
+            # we ever type a password into a half-loaded page.
+            await page.goto(LOGIN_URL, timeout=nav_timeout_ms)
+        except Exception as exc:
+            if _is_proxy_failure(exc):
+                logger.warning(
+                    "ProtonBrowser: proxy %s failed warm-up (%s); blacklisting",
+                    entry.server_url,
+                    type(exc).__name__,
+                )
+                if proxy_provider is not None:
+                    proxy_provider.mark_failed(entry)
+                with contextlib.suppress(Exception):
+                    await context.close()
+                with contextlib.suppress(Exception):
+                    await browser.close()
+                continue
+            # Non-proxy failure (e.g. Proton itself is down) -- close and
+            # re-raise so the caller doesn't silently retry on a real bug.
+            with contextlib.suppress(Exception):
+                await context.close()
+            with contextlib.suppress(Exception):
+                await browser.close()
+            raise
+        logger.info(
+            "ProtonBrowser: warm-up via %s succeeded; proceeding with login",
+            entry.server_url,
+        )
+        return browser, context, page, entry
+
+    # Either no proxy was configured, or every candidate failed -- direct.
+    browser = await playwright.chromium.launch(headless=headless)
+    context = await browser.new_context()
+    context.set_default_timeout(action_timeout_ms)
+    context.set_default_navigation_timeout(nav_timeout_ms)
+    page = await context.new_page()
+    return browser, context, page, None

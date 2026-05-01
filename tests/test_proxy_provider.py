@@ -199,6 +199,114 @@ def test_from_env_enabled_by_default(monkeypatch) -> None:
     assert isinstance(provider, ProxyProvider)
 
 
+@pytest.mark.asyncio
+async def test_acquire_many_returns_n_fastest_sorted(monkeypatch) -> None:
+    """``acquire_many(n)`` returns up to n live proxies, ordered by probe time."""
+    provider = ProxyProvider(probe_timeout=0.5, max_probes=4, allowed_protocols=("http",))
+    fake = [
+        ProxyEntry(protocol="http", host=f"h{i}", port=i, response_time_ms=i * 10)
+        for i in range(1, 5)
+    ]
+
+    async def fake_fetch_all() -> list[ProxyEntry]:
+        return fake
+
+    provider._fetch_all = fake_fetch_all  # type: ignore[assignment]
+
+    async def fake_probe(entry: ProxyEntry, *, timeout: float):
+        from proton_telegram_bot.proxy_provider import _Probe
+
+        # Smaller port -> faster probe response.
+        return _Probe(entry=entry, ms=float(entry.port * 10))
+
+    provider._probe = fake_probe  # type: ignore[assignment]
+    result = await provider.acquire_many(2)
+    assert len(result) == 2
+    assert result[0].host == "h1"
+    assert result[1].host == "h2"
+
+
+@pytest.mark.asyncio
+async def test_mark_failed_blacklists_entry(monkeypatch) -> None:
+    """``mark_failed`` keeps the same proxy from being returned again."""
+    provider = ProxyProvider(probe_timeout=0.5, allowed_protocols=("http",))
+    fake = [
+        ProxyEntry(protocol="http", host="bad", port=1, response_time_ms=10),
+        ProxyEntry(protocol="http", host="good", port=2, response_time_ms=20),
+    ]
+
+    async def fake_fetch_all() -> list[ProxyEntry]:
+        return fake
+
+    provider._fetch_all = fake_fetch_all  # type: ignore[assignment]
+
+    async def fake_probe(entry: ProxyEntry, *, timeout: float):
+        from proton_telegram_bot.proxy_provider import _Probe
+
+        return _Probe(entry=entry, ms=10.0)
+
+    provider._probe = fake_probe  # type: ignore[assignment]
+
+    first = await provider.acquire()
+    assert first is not None and first.host == "bad"
+    provider.mark_failed(first)
+    second = await provider.acquire()
+    assert second is not None and second.host == "good"
+
+
+@pytest.mark.asyncio
+async def test_socks_filtered_out_by_default(monkeypatch) -> None:
+    """SOCKS proxies are filtered by default to avoid lossy free-list entries."""
+    provider = ProxyProvider(probe_timeout=0.5)  # default allowed protocols
+    fake = [
+        ProxyEntry(protocol="socks5", host="s5", port=1, response_time_ms=10),
+        ProxyEntry(protocol="socks4", host="s4", port=2, response_time_ms=20),
+        ProxyEntry(protocol="http", host="h", port=3, response_time_ms=30),
+    ]
+
+    async def fake_fetch_all() -> list[ProxyEntry]:
+        return fake
+
+    provider._fetch_all = fake_fetch_all  # type: ignore[assignment]
+
+    async def fake_probe(entry: ProxyEntry, *, timeout: float):
+        from proton_telegram_bot.proxy_provider import _Probe
+
+        return _Probe(entry=entry, ms=10.0)
+
+    provider._probe = fake_probe  # type: ignore[assignment]
+    got = await provider.acquire_many(5)
+    # SOCKS entries dropped before probing; only the http one comes back.
+    assert [e.host for e in got] == ["h"]
+
+
+@pytest.mark.asyncio
+async def test_socks_allowed_when_explicitly_enabled(monkeypatch) -> None:
+    provider = ProxyProvider(
+        probe_timeout=0.5, allowed_protocols=("http", "socks5")
+    )
+    fake = [
+        ProxyEntry(protocol="socks5", host="s5", port=1, response_time_ms=10),
+        ProxyEntry(protocol="socks4", host="s4", port=2, response_time_ms=20),
+        ProxyEntry(protocol="http", host="h", port=3, response_time_ms=30),
+    ]
+
+    async def fake_fetch_all() -> list[ProxyEntry]:
+        return fake
+
+    provider._fetch_all = fake_fetch_all  # type: ignore[assignment]
+
+    async def fake_probe(entry: ProxyEntry, *, timeout: float):
+        from proton_telegram_bot.proxy_provider import _Probe
+
+        return _Probe(entry=entry, ms=10.0)
+
+    provider._probe = fake_probe  # type: ignore[assignment]
+    got = await provider.acquire_many(5)
+    assert sorted(e.host for e in got) == ["h", "s5"]
+    assert "s4" not in [e.host for e in got]  # socks4 still blocked
+
+
 def test_proxy_entry_parse_rejects_invalid() -> None:
     assert ProxyEntry.parse("not a url") is None
     assert ProxyEntry.parse("ftp://x:21") is None  # unsupported scheme
@@ -219,4 +327,5 @@ def _no_real_env(monkeypatch):
     monkeypatch.delenv("PROTON_PROXY_LIST_URLS", raising=False)
     monkeypatch.delenv("PROTON_PROXY_PROBE_TIMEOUT", raising=False)
     monkeypatch.delenv("PROTON_PROXY_MAX_PROBES", raising=False)
+    monkeypatch.delenv("PROTON_PROXY_PROTOCOLS", raising=False)
     yield

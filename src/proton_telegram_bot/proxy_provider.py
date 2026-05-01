@@ -67,8 +67,12 @@ DEFAULT_LIST_TTL_SECONDS = 600.0
 DEFAULT_PROBE_TIMEOUT = 3.0
 DEFAULT_MAX_PROBES = 10
 ACCEPTABLE_PROTOCOLS = ("http", "https", "socks4", "socks5")
-# Playwright Chromium only supports HTTP and SOCKS5 cleanly; deprioritise the
-# other protocols by giving them a high sort key so they sit at the end.
+# Playwright Chromium handles HTTP/HTTPS proxies most reliably. SOCKS5 works
+# but free SOCKS5 entries are very lossy (lots of ``ERR_SOCKS_CONNECTION_FAILED``
+# in production). SOCKS4 is essentially unusable. Default protocol filter
+# excludes SOCKS to keep ``/genaddr`` from stalling on dead SOCKS proxies;
+# override via ``PROTON_PROXY_PROTOCOLS=http,https,socks5``.
+DEFAULT_ALLOWED_PROTOCOLS = ("http", "https")
 PROTOCOL_SORT_RANK = {"http": 0, "https": 1, "socks5": 2, "socks4": 3}
 
 
@@ -138,6 +142,7 @@ class ProxyProvider:
         ttl_seconds: float = DEFAULT_LIST_TTL_SECONDS,
         probe_timeout: float | None = None,
         max_probes: int | None = None,
+        allowed_protocols: tuple[str, ...] | None = None,
     ) -> None:
         if list_urls is None:
             env_urls = os.environ.get("PROTON_PROXY_LIST_URLS")
@@ -162,8 +167,24 @@ class ProxyProvider:
             if max_probes is not None
             else int(os.environ.get("PROTON_PROXY_MAX_PROBES", DEFAULT_MAX_PROBES))
         )
+        if allowed_protocols is None:
+            env_protos = os.environ.get("PROTON_PROXY_PROTOCOLS")
+            if env_protos:
+                allowed_protocols = tuple(
+                    p.strip().lower()
+                    for p in env_protos.split(",")
+                    if p.strip()
+                )
+            else:
+                allowed_protocols = DEFAULT_ALLOWED_PROTOCOLS
+        self._allowed_protocols = allowed_protocols
         self._lock = asyncio.Lock()
         self._cache: _Cache | None = None
+        # Proxies that have caused a downstream failure (e.g. Playwright
+        # ``ERR_SOCKS_CONNECTION_FAILED``). They stay blacklisted for the
+        # life of the provider so a single bad proxy doesn't keep getting
+        # picked as the "fastest" one.
+        self._blacklist: set[tuple[str, str, int]] = set()
 
     @classmethod
     def from_env(cls) -> ProxyProvider | None:
@@ -183,63 +204,108 @@ class ProxyProvider:
             return None
         return cls()
 
+    def mark_failed(self, entry: ProxyEntry) -> None:
+        """Record a proxy that downstream code has confirmed is broken.
+
+        Called by :class:`ProtonBrowser` when Chromium reports
+        ``ERR_SOCKS_CONNECTION_FAILED`` / ``ERR_PROXY_CONNECTION_FAILED``
+        / ``ERR_TUNNEL_CONNECTION_FAILED`` / ``ERR_CONNECTION_TIMED_OUT``.
+        Once blacklisted, an entry is never returned again from
+        :meth:`acquire` or :meth:`acquire_many`.
+        """
+        self._blacklist.add((entry.protocol, entry.host, entry.port))
+
     async def acquire(self) -> ProxyEntry | None:
         """Return the fastest probably-alive proxy, or ``None`` on total failure.
 
-        When ``PROTON_PROXY_URL`` is set we always return that one without
-        probing -- a paid proxy is the user's problem to maintain.
+        Convenience wrapper around :meth:`acquire_many` for callers that
+        only want a single proxy and have no retry logic of their own.
+        """
+        candidates = await self.acquire_many(1)
+        return candidates[0] if candidates else None
+
+    async def acquire_many(self, n: int) -> list[ProxyEntry]:
+        """Return up to ``n`` proxies that pass the TCP probe, fastest first.
+
+        ``ProtonBrowser`` uses this to retry login through a different
+        proxy when Chromium fails the connection at the network layer
+        (very common with free SOCKS lists).
+
+        Returned ordering: probe-ms ascending. Proxies in :attr:`_blacklist`
+        and proxies with a disallowed protocol are filtered out before
+        probing so they never come back here.
         """
         if self._explicit_proxy:
             entry = ProxyEntry.parse(self._explicit_proxy, source="env")
             if entry is not None:
-                return entry
+                return [entry]
             logger.warning(
                 "PROTON_PROXY_URL=%r could not be parsed; falling back to direct",
                 self._explicit_proxy,
             )
-            return None
+            return []
 
         async with self._lock:
             entries = await self._get_entries_locked()
 
-        if not entries:
-            logger.warning("proxy provider: no entries available; falling back to direct")
-            return None
+        # Filter out blacklisted entries and protocols the deployment has
+        # opted out of. Both filters are cheap and the list is short enough
+        # to do this on every ``acquire_many`` call.
+        usable = [
+            e
+            for e in entries
+            if e.protocol in self._allowed_protocols
+            and (e.protocol, e.host, e.port) not in self._blacklist
+        ]
+        if not usable:
+            logger.warning(
+                "proxy provider: no usable entries (after blacklist=%d, "
+                "protocol filter=%s); falling back to direct",
+                len(self._blacklist),
+                ",".join(self._allowed_protocols),
+            )
+            return []
 
-        # Take the top ``max_probes`` candidates (already sorted by reported
-        # latency + protocol rank) and probe them in parallel. Whoever
-        # finishes first AND succeeds wins -- that's the fastest live proxy
-        # we can confirm without doing a full HTTPS handshake here.
-        candidates = entries[: self._max_probes]
+        # Probe more than ``n`` so we have a safety margin: probes complete
+        # in any order, and we want to keep the n fastest, not the n we
+        # happened to schedule first.
+        candidates = usable[: max(self._max_probes, n)]
         probes = [
             asyncio.create_task(self._probe(c, timeout=self._probe_timeout))
             for c in candidates
         ]
+        successes: list[_Probe] = []
         try:
             for future in asyncio.as_completed(probes):
                 probe = await future
                 if probe.ms is not None:
-                    logger.info(
-                        "proxy provider: using %s (source=%s, probe=%.0fms, "
-                        "reported=%s, out of %d probed)",
-                        probe.entry.server_url,
-                        probe.entry.source,
-                        probe.ms,
-                        f"{probe.entry.response_time_ms:.0f}ms"
-                        if probe.entry.response_time_ms is not None
-                        else "n/a",
-                        len(candidates),
-                    )
-                    return probe.entry
+                    successes.append(probe)
+                    if len(successes) >= n:
+                        break
         finally:
             for task in probes:
                 if not task.done():
                     task.cancel()
-        logger.warning(
-            "proxy provider: all %d probed candidates failed; falling back to direct",
-            len(candidates),
-        )
-        return None
+        successes.sort(key=lambda p: p.ms or float("inf"))
+        if not successes:
+            logger.warning(
+                "proxy provider: all %d probed candidates failed; "
+                "falling back to direct",
+                len(candidates),
+            )
+            return []
+        for probe in successes:
+            logger.info(
+                "proxy provider: candidate %s (source=%s, probe=%.0fms, "
+                "reported=%s)",
+                probe.entry.server_url,
+                probe.entry.source,
+                probe.ms,
+                f"{probe.entry.response_time_ms:.0f}ms"
+                if probe.entry.response_time_ms is not None
+                else "n/a",
+            )
+        return [p.entry for p in successes]
 
     async def _get_entries_locked(self) -> list[ProxyEntry]:
         now = time.monotonic()
