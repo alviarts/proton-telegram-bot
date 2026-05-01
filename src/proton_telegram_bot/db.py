@@ -49,7 +49,6 @@ CREATE TABLE IF NOT EXISTS primary_accounts (
 );
 
 CREATE INDEX IF NOT EXISTS idx_aliases_chat_status ON aliases(chat_id, status);
-CREATE INDEX IF NOT EXISTS idx_aliases_primary ON aliases(primary_id);
 CREATE INDEX IF NOT EXISTS idx_primary_chat ON primary_accounts(chat_id);
 """
 
@@ -88,6 +87,9 @@ class Database:
             await self.conn.execute(
                 "ALTER TABLE aliases ADD COLUMN primary_id INTEGER"
             )
+        await self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_aliases_primary ON aliases(primary_id)"
+        )
         await self._backfill_primary_accounts_from_legacy_users()
 
     async def _backfill_primary_accounts_from_legacy_users(self) -> None:
