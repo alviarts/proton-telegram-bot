@@ -145,3 +145,144 @@ async def test_multiple_primary_accounts_per_chat(db: Database) -> None:
     assert await db.list_aliases(chat_id, primary_id=p1) == []
     assert len(await db.list_aliases(chat_id)) == 1
     assert [p.id for p in await db.list_primary_accounts(chat_id)] == [p2]
+
+
+# ---------------------------------------------------------------- proton master password
+
+
+async def test_proton_password_lifecycle(db: Database) -> None:
+    chat_id = 999
+    primary_id = await db.add_primary_account(
+        chat_id=chat_id,
+        email="vielz45@proton.me",
+        host="127.0.0.1",
+        port=1143,
+        username="vielz45@proton.me",
+        encrypted_password="bridge-pw",
+        use_ssl=False,
+    )
+    # Default: no proton password until /setprotonpw runs.
+    assert await db.get_proton_password_encrypted(primary_id) is None
+
+    assert await db.set_proton_password(chat_id, primary_id, "fernet-encrypted") is True
+    assert await db.get_proton_password_encrypted(primary_id) == "fernet-encrypted"
+
+    # Updating overwrites the previous value.
+    assert await db.set_proton_password(chat_id, primary_id, "rotated") is True
+    assert await db.get_proton_password_encrypted(primary_id) == "rotated"
+
+    # Wrong chat_id must not silently mutate the row.
+    assert (
+        await db.set_proton_password(chat_id + 1, primary_id, "attacker") is False
+    )
+    assert await db.get_proton_password_encrypted(primary_id) == "rotated"
+
+    assert await db.clear_proton_password(chat_id, primary_id) is True
+    assert await db.get_proton_password_encrypted(primary_id) is None
+
+
+# ---------------------------------------------------------------- alias generator state
+
+
+async def test_generator_state_default_and_save(db: Database) -> None:
+    from proton_telegram_bot.alias_gen import GenState
+
+    chat_id = 42
+    primary_id = await db.add_primary_account(
+        chat_id=chat_id,
+        email="vielz45@proton.me",
+        host="127.0.0.1",
+        port=1143,
+        username="vielz45@proton.me",
+        encrypted_password="bridge-pw",
+        use_ssl=False,
+    )
+
+    # Default cursor is GenState("", 1) when nothing has been saved yet.
+    assert await db.get_generator_state(chat_id, primary_id, "vielz") == GenState("", 1)
+
+    await db.save_generator_state(chat_id, primary_id, "vielz", GenState("", 50))
+    assert await db.get_generator_state(chat_id, primary_id, "vielz") == GenState("", 50)
+
+    # Distinct bases keep separate cursors.
+    await db.save_generator_state(chat_id, primary_id, "alt", GenState("a", 7))
+    assert await db.get_generator_state(chat_id, primary_id, "alt") == GenState("a", 7)
+    assert await db.get_generator_state(chat_id, primary_id, "vielz") == GenState("", 50)
+
+    # Base lookup is case-insensitive — saving "Vielz" must match reads of "vielz".
+    await db.save_generator_state(chat_id, primary_id, "Vielz", GenState("b", 3))
+    assert await db.get_generator_state(chat_id, primary_id, "vielz") == GenState("b", 3)
+
+
+async def test_proton_password_column_is_nullable_for_legacy_rows(tmp_path) -> None:
+    """Existing primary_accounts rows from before the migration must keep working."""
+    import aiosqlite
+
+    db_path = tmp_path / "legacy.sqlite3"
+
+    # Build an old-shape DB by hand (no proton_password_encrypted column).
+    # The ``users`` table must include the legacy single-account columns so
+    # the backfill query in ``_backfill_primary_accounts_from_legacy_users``
+    # can run cleanly even when no legacy rows exist.
+    legacy_schema = """
+    CREATE TABLE users (
+        chat_id INTEGER PRIMARY KEY,
+        created_at TEXT NOT NULL,
+        imap_host TEXT,
+        imap_port INTEGER,
+        imap_username TEXT,
+        imap_password_encrypted TEXT,
+        imap_use_ssl INTEGER NOT NULL DEFAULT 0,
+        active_alias_id INTEGER
+    );
+    CREATE TABLE aliases (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id INTEGER NOT NULL,
+        email TEXT NOT NULL,
+        status TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        consumed_at TEXT,
+        last_message_id TEXT,
+        primary_id INTEGER,
+        UNIQUE(chat_id, email)
+    );
+    CREATE TABLE primary_accounts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id INTEGER NOT NULL,
+        email TEXT NOT NULL,
+        imap_host TEXT NOT NULL,
+        imap_port INTEGER NOT NULL,
+        imap_username TEXT NOT NULL,
+        imap_password_encrypted TEXT NOT NULL,
+        imap_use_ssl INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        UNIQUE(chat_id, email)
+    );
+    """
+    async with aiosqlite.connect(db_path) as conn:
+        await conn.executescript(legacy_schema)
+        await conn.execute(
+            "INSERT INTO users (chat_id, created_at) VALUES (1, '2026-01-01T00:00:00+00:00')"
+        )
+        await conn.execute(
+            "INSERT INTO primary_accounts "
+            "(chat_id, email, imap_host, imap_port, imap_username, "
+            "imap_password_encrypted, imap_use_ssl, created_at) "
+            "VALUES (1, 'old@proton.me', '127.0.0.1', 1143, 'old@proton.me', "
+            "'enc', 0, '2026-01-01T00:00:00+00:00')"
+        )
+        await conn.commit()
+
+    # Open via the new Database — migration should add the new column.
+    database = Database(db_path)
+    await database.connect()
+    try:
+        primaries = await database.list_primary_accounts(1)
+        assert len(primaries) == 1
+        # New column is nullable; legacy row reads as None.
+        assert await database.get_proton_password_encrypted(primaries[0].id) is None
+        # And we can subsequently write to it.
+        assert await database.set_proton_password(1, primaries[0].id, "new-pw") is True
+        assert await database.get_proton_password_encrypted(primaries[0].id) == "new-pw"
+    finally:
+        await database.close()
