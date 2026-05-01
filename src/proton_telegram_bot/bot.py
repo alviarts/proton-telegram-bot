@@ -976,13 +976,19 @@ async def cmd_genaddr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     except address_generator.AddressGenerationError as exc:
         await progress_message.edit_text(
             f"❌ Tidak bisa mulai: {html.escape(str(exc))}\n\n"
-            "Kalau belum, set password Proton dengan /setprotonpw."
+            "Kalau belum, set password Proton dengan /setprotonpw.",
+            parse_mode=ParseMode.HTML,
         )
         return
-    except Exception:
+    except Exception as exc:
         LOGGER.exception("genaddr crashed")
         await progress_message.edit_text(
-            "❌ Browser otomasi crash. Cek log bot di server."
+            "❌ Browser otomasi crash.\n"
+            f"Detail: <code>{html.escape(str(exc) or type(exc).__name__)}</code>\n\n"
+            "Screenshot + HTML halaman terakhir disimpan di "
+            "<code>/tmp/proton-browser-debug/</code> dalam container.\n"
+            "Ambil dengan: <code>docker compose cp bot:/tmp/proton-browser-debug ./debug</code>",
+            parse_mode=ParseMode.HTML,
         )
         return
 

@@ -21,10 +21,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import re
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from enum import StrEnum
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # pragma: no cover - typing-only imports
@@ -44,6 +48,13 @@ logger = logging.getLogger(__name__)
 LOGIN_URL = "https://account.proton.me/login"
 ADDRESSES_URL_TEMPLATE = "https://account.proton.me/u/{user_index}/mail/identity-addresses"
 
+# Regex that matches the post-login URL Proton redirects to. After a
+# successful login the path picks up a ``/u/<index>/`` segment regardless of
+# which dashboard the user lands on, so this is the most reliable sentinel
+# we have for "login succeeded". Failures keep us on ``/login`` (or push us
+# to ``/login?error=...``).
+LOGGED_IN_URL_RE = re.compile(r"https://account\.proton\.me/u/\d+/")
+
 # Default user_index in the Proton URL. The web UI renumbers logged-in
 # accounts in the order they were added; a fresh login lands at /u/0.
 DEFAULT_USER_INDEX = 0
@@ -53,6 +64,12 @@ DEFAULT_USER_INDEX = 0
 # in the browser which is CPU-bound.
 DEFAULT_NAV_TIMEOUT_MS = 30_000
 DEFAULT_ACTION_TIMEOUT_MS = 60_000
+LOGIN_OUTCOME_TIMEOUT_MS = 90_000
+
+# Where to dump screenshots + HTML when a flow fails in an unexpected way.
+# Operators can mount this to a host volume (or set the env var) for
+# postmortem analysis of UI changes Proton ships.
+DEBUG_DUMP_DIR = Path(os.environ.get("PROTON_BROWSER_DUMP_DIR", "/tmp/proton-browser-debug"))
 
 
 # -------------------------------------------------------------------- selectors
@@ -65,9 +82,18 @@ SELECTORS = {
     "login_email": "input[name='username'], input#username",
     "login_password": "input[name='password'], input#password",
     "login_submit": "button[type='submit']",
-    # Once logged in the dashboard chrome shows a top-bar or sidebar that we
-    # use as a "logged in" sentinel.
-    "logged_in_sentinel": "[data-testid='heading:userdropdown'], [data-testid='topnav-link:settings']",
+    # Once logged in the dashboard chrome shows a top-bar or sidebar with one
+    # of these elements. We keep them as a fallback for the URL check below;
+    # Proton has shipped enough renames over the years that the URL is the
+    # single most reliable signal.
+    "logged_in_sentinel": (
+        "[data-testid='heading:userdropdown'], "
+        "[data-testid='topnav-link:settings'], "
+        "[data-testid='user-dropdown'], "
+        "[data-testid='heading:dashboard'], "
+        "button[aria-label='User menu'], "
+        "a[href*='/dashboard']"
+    ),
     # Address listing page
     "add_address_button": "button:has-text('Add address'), button:has-text('Tambah alamat')",
     # Add address modal
@@ -213,6 +239,10 @@ class ProtonBrowser:
         finally:
             await instance.close()
 
+    async def _dump_debug(self, label: str) -> None:
+        """Drop a screenshot + HTML snapshot to :data:`DEBUG_DUMP_DIR`."""
+        await _dump_page_state(self._page, label)
+
     async def close(self) -> None:
         """Best-effort cleanup. Swallows individual close errors."""
         for closer in (
@@ -242,9 +272,14 @@ class ProtonBrowser:
         await page.fill(SELECTORS["login_password"], password)
         await page.click(SELECTORS["login_submit"])
 
-        # We race three outcomes: dashboard sentinel = success, error toast =
-        # bad credentials, captcha iframe = anti-bot challenge.
-        await self._wait_for_login_outcome()
+        # We race four outcomes: URL switching to ``/u/<N>/`` = success,
+        # dashboard DOM sentinel = success (fallback for URL races), error
+        # toast = bad credentials, captcha iframe = anti-bot challenge.
+        try:
+            await self._wait_for_login_outcome()
+        except ProtonBrowserError:
+            await self._dump_debug("login-failed")
+            raise
 
     async def _wait_for_login_outcome(self) -> None:
         page = self._page
@@ -252,28 +287,49 @@ class ProtonBrowser:
         captcha = page.locator(SELECTORS["captcha_iframe"]).first
         error_toast = page.locator(SELECTORS["error_notification"]).first
 
-        # Use Playwright's builtin race via wait_for + return_when=FIRST_COMPLETED.
-        tasks = [
-            asyncio.create_task(sentinel.wait_for(state="visible")),
-            asyncio.create_task(captcha.wait_for(state="visible")),
-            asyncio.create_task(error_toast.wait_for(state="visible")),
-        ]
+        async def _wait_for_logged_in_url() -> None:
+            await page.wait_for_url(LOGGED_IN_URL_RE, timeout=LOGIN_OUTCOME_TIMEOUT_MS)
+
+        # Use Playwright's builtin race via wait + return_when=FIRST_COMPLETED.
+        url_task = asyncio.create_task(_wait_for_logged_in_url())
+        sentinel_task = asyncio.create_task(
+            sentinel.wait_for(state="visible", timeout=LOGIN_OUTCOME_TIMEOUT_MS)
+        )
+        captcha_task = asyncio.create_task(
+            captcha.wait_for(state="visible", timeout=LOGIN_OUTCOME_TIMEOUT_MS)
+        )
+        error_task = asyncio.create_task(
+            error_toast.wait_for(state="visible", timeout=LOGIN_OUTCOME_TIMEOUT_MS)
+        )
+        tasks = [url_task, sentinel_task, captcha_task, error_task]
         try:
             await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         finally:
             for task in tasks:
                 if not task.done():
                     task.cancel()
+            # Drain cancellations so we don't print "Task exception was never
+            # retrieved" warnings about Playwright timeouts on the cancelled
+            # branches.
+            for task in tasks:
+                with _SuppressCancelledOrTimeout():
+                    await task
 
-        # Whichever locator resolved first decides the outcome.
-        if await sentinel.is_visible():
+        # Whichever signal fired first decides the outcome. URL match wins
+        # by default because it's the most reliable; we fall through to
+        # captcha / error / sentinel checks for older Proton flows.
+        if LOGGED_IN_URL_RE.search(page.url):
             return
         if await captcha.is_visible():
             raise CaptchaInterruptError(page_url=page.url)
         if await error_toast.is_visible():
             text = (await error_toast.text_content()) or "login rejected"
             raise LoginFailedError(text.strip())
-        raise ProtonBrowserError("login flow did not produce a recognised outcome")
+        if await sentinel.is_visible():
+            return
+        raise ProtonBrowserError(
+            f"login flow did not produce a recognised outcome (page.url={page.url!r})"
+        )
 
     # ------------------------------------------------------------------ create address
 
@@ -386,3 +442,64 @@ def _classify_error(text: str) -> CreationStatus:
     if "password" in text or "credentials" in text or "auth" in text:
         return CreationStatus.AUTH_FAILED
     return CreationStatus.ERROR
+
+
+class _SuppressCancelledOrTimeout:
+    """Context manager that swallows ``CancelledError`` and Playwright timeouts.
+
+    Used when draining the losing branches of an ``asyncio.wait`` race so they
+    don't print noisy "Task exception was never retrieved" warnings.
+    """
+
+    def __enter__(self) -> _SuppressCancelledOrTimeout:
+        return self
+
+    def __exit__(self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: object) -> bool:
+        if exc_type is None:
+            return False
+        if issubclass(exc_type, asyncio.CancelledError):
+            return True
+        # Playwright raises its own ``TimeoutError``; matching by name keeps us
+        # decoupled from the optional dependency at import time.
+        if exc_type.__name__ == "TimeoutError":
+            return True
+        return False
+
+
+# -------------------------------------------------------------------- debug dump
+
+
+async def _dump_page_state(page: Page, label: str) -> Path | None:
+    """Best-effort screenshot + HTML dump for postmortem debugging.
+
+    Returns the directory the artefacts were written to, or ``None`` when
+    capture failed (we never raise — the caller has its own error to surface).
+    """
+    try:
+        DEBUG_DUMP_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        logger.exception("could not create debug dump dir %s", DEBUG_DUMP_DIR)
+        return None
+
+    stamp = time.strftime("%Y%m%dT%H%M%S")
+    base = DEBUG_DUMP_DIR / f"{label}-{stamp}"
+    png_path = base.with_suffix(".png")
+    html_path = base.with_suffix(".html")
+    try:
+        await page.screenshot(path=str(png_path), full_page=True)
+    except Exception:
+        logger.exception("could not capture screenshot to %s", png_path)
+    try:
+        html = await page.content()
+        html_path.write_text(html, encoding="utf-8")
+    except Exception:
+        logger.exception("could not capture html to %s", html_path)
+    logger.warning(
+        "proton_browser %s — debug artefacts saved under %s (screenshot=%s, html=%s, url=%s)",
+        label,
+        DEBUG_DUMP_DIR,
+        png_path.name,
+        html_path.name,
+        page.url,
+    )
+    return DEBUG_DUMP_DIR
