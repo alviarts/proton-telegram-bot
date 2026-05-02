@@ -161,6 +161,14 @@ def _parse_uids(lines: list[bytes | str]) -> list[int]:
 
 
 _TOKEN_IN_SUBJECT_RE = re.compile(rb"\[health-check\]\s+([0-9a-f]{16})", re.IGNORECASE)
+# Pair a token with the UID marker that comes right after it inside the
+# same FETCH chunk. ``[\s\S]*?`` is non-greedy so each match stops at
+# the first ``UID <n>`` after the token, which corresponds to the same
+# message even when several FETCHes are concatenated together.
+_TOKEN_UID_PAIR_RE = re.compile(
+    rb"\[health-check\]\s+([0-9a-f]{16})[\s\S]*?UID\s+(\d+)",
+    re.IGNORECASE,
+)
 
 
 def _extract_token_from_header_blob(blob: bytes) -> str | None:
@@ -174,6 +182,21 @@ def _extract_token_from_header_blob(blob: bytes) -> str | None:
     if match is None:
         return None
     return match.group(1).decode().lower()
+
+
+def _coerce_to_bytes(raw: object) -> bytes:
+    """Normalise an aioimaplib FETCH response line into ``bytes``.
+
+    aioimaplib returns mixed types (``bytes`` for protocol lines,
+    ``bytearray`` for literal payloads, occasionally ``str``). The
+    ``isinstance(_, bytes)`` check alone misses ``bytearray`` because
+    it isn't a subclass of ``bytes``.
+    """
+    if isinstance(raw, (bytes, bytearray)):
+        return bytes(raw)
+    if isinstance(raw, str):
+        return raw.encode("utf-8", errors="replace")
+    return b""
 
 
 async def _open_imap(
@@ -197,6 +220,14 @@ async def _scan_inbox_for_tokens(
 ) -> dict[str, int]:
     """Search INBOX for health-check messages newer than ``baseline_uid``
     and return ``{token: uid}`` for every one we recognise.
+
+    The parser tolerates the way aioimaplib hands FETCH responses back:
+    each FETCH chunk is split across several entries in
+    ``response.lines`` (a header line, then a literal ``bytearray`` for
+    the payload, then a closing line containing ``UID <n>)``). Joining
+    everything into a single blob and matching ``[health-check] <token>
+    ... UID <uid>`` non-greedily pairs each token with its own UID even
+    when chunk boundaries shift between Bridge versions.
     """
     response = await client.uid_search(
         f"UID {baseline_uid + 1}:*"
@@ -207,28 +238,26 @@ async def _scan_inbox_for_tokens(
     if not uids:
         return {}
     # Fetch only the Subject header for matching UIDs in one round trip.
+    # ``BODY.PEEK`` instead of ``BODY`` so we don't accidentally mark
+    # the messages \\Seen — strict lock-mode in the listener already
+    # filters them, but staying read-only is the safer default.
     uid_set = ",".join(str(u) for u in uids)
     fetch_resp = await client.uid(
-        "fetch", uid_set, "(BODY.PEEK[HEADER.FIELDS (SUBJECT)])"
+        "fetch", uid_set, "(BODY.PEEK[HEADER.FIELDS (SUBJECT)] UID)"
     )
     if fetch_resp.result != "OK":
         return {}
+    blob = b"\n".join(_coerce_to_bytes(raw) for raw in fetch_resp.lines)
     found: dict[str, int] = {}
-    current_uid: int | None = None
-    for raw in fetch_resp.lines:
-        line = raw if isinstance(raw, bytes) else raw.encode()
-        m = re.match(rb"\* (\d+) FETCH ", line)
-        if m:
-            try:
-                current_uid = int(m.group(1))
-            except ValueError:
-                current_uid = None
+    for m in _TOKEN_UID_PAIR_RE.finditer(blob):
+        token = m.group(1).decode().lower()
+        try:
+            uid = int(m.group(2))
+        except ValueError:
             continue
-        if current_uid is None:
-            continue
-        token = _extract_token_from_header_blob(line)
-        if token is not None:
-            found[token] = current_uid
+        # First match wins — every alias has a unique token so this
+        # only matters if Bridge somehow returns duplicates.
+        found.setdefault(token, uid)
     return found
 
 
@@ -313,7 +342,37 @@ async def run_health_check(
         )
         return
 
-    # 1. "Started" header — kept above the rolling line so the user has
+    # 1. Pre-flight IMAP login check. Do this *before* sending the
+    # "started" header so a stale Bridge session never leaves the user
+    # staring at a "dimulai" message that will never make progress.
+    # The dedicated IMAP connection is also captured here so the
+    # health-check polling loop reuses the exact session the login
+    # check just succeeded on.
+    try:
+        imap = await _open_imap(
+            host=BRIDGE_IMAP_HOST,
+            port=BRIDGE_IMAP_PORT,
+            use_ssl=BRIDGE_IMAP_USE_SSL,
+            username=creds.imap_username,
+            password=creds.imap_password,
+        )
+    except Exception as exc:
+        LOGGER.exception("health check: pre-flight IMAP login failed")
+        await bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"❌ Login Bridge IMAP gagal untuk "
+                f"<code>{primary.email}</code>:\n"
+                f"<code>{exc!s}</code>\n\n"
+                f"Bridge mungkin perlu unlock atau kredensial sudah expired. "
+                f"Coba <b>/connect {primary.email}</b> lagi untuk relogin "
+                f"(bot akan reuse cookie/SRP yang ada kalau masih valid)."
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # 2. "Started" header — kept above the rolling line so the user has
     # context that doesn't get overwritten.
     await bot.send_message(
         chat_id=chat_id,
@@ -326,7 +385,7 @@ async def run_health_check(
         parse_mode=ParseMode.HTML,
     )
 
-    # 2. Rolling progress message — edited in place from now on.
+    # 3. Rolling progress message — edited in place from now on.
     confirmed: set[str] = set()
     failed: set[str] = set()
     progress_lock = asyncio.Lock()
@@ -370,30 +429,10 @@ async def run_health_check(
                     "health check: edit_message_text failed", exc_info=True
                 )
 
-    # 3. Open the dedicated IMAP connection up front, capture the
-    # current high-water UID so we only consider messages that arrive
-    # after we start sending. Bridge accepts concurrent connections;
-    # this is independent of the always-on listener.
     try:
-        imap = await _open_imap(
-            host=BRIDGE_IMAP_HOST,
-            port=BRIDGE_IMAP_PORT,
-            use_ssl=BRIDGE_IMAP_USE_SSL,
-            username=creds.imap_username,
-            password=creds.imap_password,
-        )
-    except Exception as exc:
-        LOGGER.exception("health check: failed to open IMAP session")
-        await bot.send_message(
-            chat_id=chat_id,
-            text=(
-                f"❌ Gagal buka IMAP ke Bridge: {exc!s}\n"
-                f"Bridge mungkin belum running atau kredensial salah."
-            ),
-        )
-        return
-
-    try:
+        # Capture the current high-water UID so we only consider messages
+        # that arrive after we start sending. Bridge accepts concurrent
+        # connections; this is independent of the always-on listener.
         baseline_resp = await imap.uid_search("ALL")
         baseline_uids = (
             _parse_uids(baseline_resp.lines)

@@ -255,6 +255,18 @@ class IMAPListener:
             LOGGER.debug("no RFC822 payload returned for UID %s", uid)
             return
         message = parse_message(raw_message)
+        # /cekimap puts ``[health-check]`` in the Subject of every probe
+        # email. Those probes need to land in the primary INBOX (so the
+        # health-check polling task can see them) but the user must not
+        # be notified about them — they're internal noise.
+        subject_header = message.get("Subject") or ""
+        if "[health-check]" in subject_header.lower():
+            LOGGER.debug(
+                "skipping forward of health-check probe UID %s (%r)",
+                uid,
+                subject_header,
+            )
+            return
         await self._on_new_message(
             self.chat_id, self.primary_id, message, str(uid)
         )

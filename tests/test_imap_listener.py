@@ -383,3 +383,75 @@ async def test_scan_inbox_aliases_skipped_without_callback() -> None:
     )
     # Should not raise even with a None callback.
     await listener._scan_inbox_aliases(object())  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_fetch_and_dispatch_skips_health_check_probes() -> None:
+    """``/cekimap`` writes ``[health-check] <token> <alias>`` into the
+    Subject of every probe email. The listener has to land them in the
+    primary INBOX (so the polling task can SEARCH for the tokens) but
+    must not forward them to the user — they're internal traffic.
+    """
+    received: list[str] = []
+
+    async def on_new(
+        _chat_id: int, _primary_id: int, msg: Message, uid: str
+    ) -> None:
+        received.append(uid + ":" + (msg["Subject"] or ""))
+
+    creds = BridgeCredentials(host="127.0.0.1", port=1143, username="u", password="p")
+    listener = IMAPListener(
+        chat_id=1, primary_id=1, credentials=creds, on_new_message=on_new
+    )
+
+    fake = _FetchOnlyClient(
+        search_lines=[b""],  # not used here
+        fetch_payloads={
+            42: (
+                b"From: vielz001@proton.me\r\n"
+                b"To: vielz@proton.me\r\n"
+                b"Subject: [health-check] abc1234567890def vielz001@proton.me\r\n"
+                b"\r\nhealth-check probe body"
+            ),
+        },
+    )
+
+    await listener._fetch_and_dispatch(fake, 42)  # type: ignore[arg-type]
+
+    assert received == [], (
+        "[health-check] probes must be silently dropped, not forwarded"
+    )
+
+
+@pytest.mark.asyncio
+async def test_fetch_and_dispatch_forwards_normal_mail() -> None:
+    """Sanity check the [health-check] filter doesn't accidentally swallow
+    real user mail.
+    """
+    received: list[str] = []
+
+    async def on_new(
+        _chat_id: int, _primary_id: int, msg: Message, uid: str
+    ) -> None:
+        received.append(uid + ":" + (msg["Subject"] or ""))
+
+    creds = BridgeCredentials(host="127.0.0.1", port=1143, username="u", password="p")
+    listener = IMAPListener(
+        chat_id=1, primary_id=1, credentials=creds, on_new_message=on_new
+    )
+
+    fake = _FetchOnlyClient(
+        search_lines=[b""],
+        fetch_payloads={
+            42: (
+                b"From: friend@example.com\r\n"
+                b"To: vielz@proton.me\r\n"
+                b"Subject: Hello there\r\n"
+                b"\r\nbody"
+            ),
+        },
+    )
+
+    await listener._fetch_and_dispatch(fake, 42)  # type: ignore[arg-type]
+
+    assert received == ["42:Hello there"]

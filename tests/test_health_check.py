@@ -270,10 +270,15 @@ class _FakeImap:
                 subject = self._messages.get(uid)
                 if subject is None:
                     continue
-                # Imitate aioimaplib's per-FETCH framing.
-                lines.append(f"* {uid} FETCH (BODY[HEADER.FIELDS (SUBJECT)] {{}}".encode())
+                # Imitate aioimaplib's per-FETCH framing. The closing
+                # line carries ``UID <n>)`` because the production
+                # parser pairs each token with the UID that follows
+                # it inside the same FETCH chunk.
+                lines.append(
+                    f"* {uid} FETCH (BODY[HEADER.FIELDS (SUBJECT)] {{}}".encode()
+                )
                 lines.append(b"Subject: " + subject)
-                lines.append(b")")
+                lines.append(f" UID {uid})".encode())
             lines.append(b"OK FETCH completed")
             return _ImapResp("OK", lines)
         if command == "store":
@@ -574,3 +579,33 @@ def test_extract_token_from_header_blob(
     token only when the blob looks like a health-check tag.
     """
     assert health_check._extract_token_from_header_blob(blob) == expected
+
+
+def test_token_uid_pair_re_matches_real_aioimaplib_wire_format() -> None:
+    """Regression for production /cekimap returning 0/N: aioimaplib
+    splits each FETCH into a header line, a ``bytearray`` literal
+    payload, and a closing line containing ``UID <n>)``. The previous
+    parser required ``* `` at the start of the line and looked for the
+    Subject blob in a separate iteration step, which silently dropped
+    every match. The regex must pair token → UID across the joined
+    blob regardless of how aioimaplib slices the response.
+    """
+    fetch_lines: list[bytes | bytearray] = [
+        b"3 FETCH (BODY[HEADER.FIELDS (SUBJECT)] {63}",
+        bytearray(
+            b"Subject: [health-check] ce819f05206f43d0 vielz883@proton.me\r\n\r\n"
+        ),
+        b" UID 3)",
+        b"4 FETCH (BODY[HEADER.FIELDS (SUBJECT)] {66}",
+        bytearray(
+            b"Subject: [health-check] 4001997d9e931de6 vielz883001@proton.me\r\n\r\n"
+        ),
+        b" UID 4)",
+        b"OK FETCH completed.",
+    ]
+    blob = b"\n".join(health_check._coerce_to_bytes(line) for line in fetch_lines)
+    matches = list(health_check._TOKEN_UID_PAIR_RE.finditer(blob))
+    assert [(m.group(1).decode(), int(m.group(2))) for m in matches] == [
+        ("ce819f05206f43d0", 3),
+        ("4001997d9e931de6", 4),
+    ]
