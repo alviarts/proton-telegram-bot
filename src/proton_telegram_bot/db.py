@@ -400,17 +400,38 @@ class Database:
         return row["imap_password_encrypted"] if row is not None else None
 
     async def delete_primary_account(self, chat_id: int, primary_id: int) -> bool:
-        # Aliases reference primary_accounts but the column is nullable and the
-        # table has no FK cascade (older DBs were created before the column
-        # existed). Delete dependents explicitly so /disconnect doesn't leave
-        # orphan aliases for an account the user just removed.
+        """Hard-delete a primary account and every dependent row.
+
+        Performs a clean-slate purge so a future /connect for the same email
+        starts fresh: aliases, generator state, active-alias / active-primary
+        pointers, and (when this is the last primary) the legacy per-user
+        IMAP credentials are all wiped. ``ON DELETE`` cascades exist on new
+        schemas but migrated DBs may have been created before the FKs were
+        added, so the deletes are explicit for safety.
+        """
+        # Aliases for this primary.
         await self.conn.execute(
             "DELETE FROM aliases WHERE chat_id = ? AND primary_id = ?",
             (chat_id, primary_id),
         )
+        # /genaddr cursor state for this (chat, primary).
+        await self.conn.execute(
+            "DELETE FROM alias_generator_state "
+            "WHERE chat_id = ? AND primary_id = ?",
+            (chat_id, primary_id),
+        )
+        # Clear the chat's active-alias pointer if it referenced an alias of
+        # the primary we just deleted. Old DBs added active_alias_id without
+        # the ``ON DELETE SET NULL`` FK so do it explicitly.
+        await self.conn.execute(
+            "UPDATE users SET active_alias_id = NULL "
+            "WHERE chat_id = ? AND active_alias_id NOT IN ("
+            "    SELECT id FROM aliases WHERE chat_id = ?"
+            ")",
+            (chat_id, chat_id),
+        )
         # Clear ``active_primary_id`` if it points at the row we're about to
-        # delete. The schema added a FK with ``ON DELETE SET NULL`` but
-        # migrated DBs added the column without an FK, so do it explicitly.
+        # delete. Same FK caveat as above.
         await self.conn.execute(
             "UPDATE users SET active_primary_id = NULL "
             "WHERE chat_id = ? AND active_primary_id = ?",
@@ -420,6 +441,21 @@ class Database:
             "DELETE FROM primary_accounts WHERE chat_id = ? AND id = ?",
             (chat_id, primary_id),
         )
+        # If the user has no primaries left, also purge the legacy per-user
+        # IMAP fields on the ``users`` row (pre-multi-primary schema). This
+        # ensures a future /connect cannot accidentally reuse stale creds.
+        async with self.conn.execute(
+            "SELECT COUNT(*) AS n FROM primary_accounts WHERE chat_id = ?",
+            (chat_id,),
+        ) as count_cursor:
+            count_row = await count_cursor.fetchone()
+        if count_row is not None and count_row["n"] == 0:
+            await self.conn.execute(
+                "UPDATE users SET imap_host = NULL, imap_port = NULL, "
+                "imap_username = NULL, imap_password_encrypted = NULL, "
+                "imap_use_ssl = 0 WHERE chat_id = ?",
+                (chat_id,),
+            )
         await self.conn.commit()
         return (cursor.rowcount or 0) > 0
 
