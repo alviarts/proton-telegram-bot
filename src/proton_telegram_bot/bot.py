@@ -826,8 +826,8 @@ def _build_post_connect_keyboard(primary_id: int) -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
-                    "✨ Generate 10 alamat sekarang",
-                    callback_data=f"{CB_QUICK_GENADDR}:{primary_id}:10",
+                    "✨ Generate 20 alamat sekarang",
+                    callback_data=f"{CB_QUICK_GENADDR}:{primary_id}:20",
                 )
             ],
             [
@@ -1154,8 +1154,10 @@ async def _finalize_connect(
             "<b>Cara cepat bikin alias:</b>\n"
             "1️⃣  Klik <b>🔐 Simpan password Proton</b> — sekali aja, "
             "buat akun ini.\n"
-            "2️⃣  Klik <b>✨ Generate 10 alamat sekarang</b> — bot bikin "
-            "10 alias <code>vielz001..vielz010</code> otomatis.\n"
+            "2️⃣  Klik <b>✨ Generate 20 alamat sekarang</b> — bot bikin "
+            "20 alias <code>vielz001..vielz020</code> otomatis di background.\n"
+            "   Bot kirim update tiap 5 alias (5/20, 10/20, ...) dan kamu "
+            "tetap bisa pakai perintah lain sambil generate jalan.\n"
             "3️⃣  Pakai <b>🩺 Cek IMAP listener</b> kapan aja buat "
             "validasi semua alias bisa terima email.",
             parse_mode=ParseMode.HTML,
@@ -2321,13 +2323,33 @@ async def cmd_genaddr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
     proxy_provider = context.application.bot_data.get("proxy_provider")
     proxy_note = " via proxy rotasi" if proxy_provider is not None else ""
+    # Quick-action button (CB_QUICK_GENADDR) sets this flag in user_data
+    # before delegating to cmd_genaddr so its batch uses the random-suffix
+    # naming scheme ("vielz88311 / vielz88347 / …") the user requested.
+    # The plain /genaddr command keeps the legacy sequential cursor.
+    random_suffix = bool(context.user_data.pop("genaddr_random_suffix", False))
+    if random_suffix:
+        # Match the digit width that ``random_suffix_names`` will pick for
+        # this batch so the example shown to the user lines up with what
+        # actually shows up in their inbox. ``max(2, len(str(count - 1)))``
+        # mirrors the formula in alias_gen.random_suffix_names — kept here
+        # so the start-message string can render an accurate placeholder.
+        random_digits = max(2, len(str(max(count - 1, 1))))
+        pattern = (
+            f"<code>{html.escape(base)}{'N' * random_digits}@"
+            f"{html.escape(domain)}</code> (suffix random)"
+        )
+    else:
+        pattern = (
+            f"<code>{html.escape(base)}NNN@{html.escape(domain)}</code>"
+        )
     # Background mode: send a single starting message, then return so the
     # bot stays responsive. Progress comes in as separate messages every
     # ``GENADDR_NOTIFY_EVERY`` successes, mirroring the /cekimap UX.
     await update.effective_message.reply_text(  # type: ignore[union-attr]
         f"🚀 Mulai generate <b>{count}</b> alamat di background untuk "
         f"<b>{html.escape(primary.email)}</b>{proxy_note}.\n"
-        f"Pola: <code>{html.escape(base)}NNN@{html.escape(domain)}</code>\n"
+        f"Pola: {pattern}\n"
         f"Bot tetap responsif — kamu bisa kirim /list, /cekimap, atau "
         f"perintah lain sambil generate jalan. Update tiap "
         f"<b>{GENADDR_NOTIFY_EVERY}</b> alamat sukses.",
@@ -2355,6 +2377,7 @@ async def cmd_genaddr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         cancel_event=cancel_event,
         browser_handle=browser_handle,
         proxy_provider=proxy_provider,
+        random_suffix=random_suffix,
     )
 
 
@@ -2369,6 +2392,7 @@ def _launch_genaddr_task(
     cancel_event: asyncio.Event,
     browser_handle: dict[str, object],
     proxy_provider,
+    random_suffix: bool = False,
 ) -> None:
     """Spawn ``_run_genaddr_background`` as a tracked asyncio task.
 
@@ -2390,6 +2414,7 @@ def _launch_genaddr_task(
             cancel_event=cancel_event,
             browser_handle=browser_handle,
             proxy_provider=proxy_provider,
+            random_suffix=random_suffix,
         ),
         name=f"genaddr-{primary.id}-{count}",
     )
@@ -2407,6 +2432,7 @@ async def _run_genaddr_background(
     cancel_event: asyncio.Event,
     browser_handle: dict[str, object],
     proxy_provider,
+    random_suffix: bool = False,
 ) -> None:
     """Run the actual address-creation batch as a background task.
 
@@ -2477,6 +2503,7 @@ async def _run_genaddr_background(
                 cancel_event=cancel_event,
                 browser_handle=browser_handle,
                 proxy_provider=proxy_provider,
+                random_suffix=random_suffix,
             )
         except address_generator.AddressGenerationError as exc:
             await bot.send_message(
@@ -2792,6 +2819,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await db.set_active_primary(chat_id, primary_id)
         # Pretend the user typed ``/genaddr <base> <count>`` and run the
         # real handler. ``context.args`` is read inside cmd_genaddr.
+        # The hidden ``genaddr_random_suffix`` flag tells cmd_genaddr to
+        # use random 2-digit numeric suffixes (vielz88311, vielz88347, …)
+        # instead of the legacy sequential vielz001..vielzNNN cursor —
+        # per the user's "yang 11 randomized" request.
+        context.user_data["genaddr_random_suffix"] = True
         context.args = [base, str(count)]
         await cmd_genaddr(update, context)
         return

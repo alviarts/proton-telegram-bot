@@ -15,6 +15,7 @@ layer in :mod:`proton_telegram_bot.db` is responsible for loading & saving the
 """
 from __future__ import annotations
 
+import random
 from collections.abc import Iterator
 from dataclasses import dataclass
 
@@ -139,6 +140,43 @@ def iter_names(
         nxt = advance(cur, max_number=max_number)
         yield name, nxt
         cur = nxt
+
+
+def random_suffix_names(
+    base: str,
+    count: int,
+    *,
+    rng: random.Random | None = None,
+) -> list[str]:
+    """Return ``count`` distinct ``<base><NN>`` local-parts with random
+    zero-padded numeric suffixes.
+
+    The suffix width is the smallest digit count that still lets the
+    pool fit ``count`` distinct values — i.e. 2 digits for ``count
+    <= 100``, 3 digits for ``count <= 1000``, and so on. The minimum is
+    2 digits even for tiny ``count``, so the user always sees the
+    "vielz88311 / vielz88347 / …" shape requested ("auto generate nya
+    ada di vielz88311 yang 11 randomized").
+
+    Names are sampled WITHOUT REPLACEMENT, so the caller can iterate
+    through all of them safely without producing duplicates inside the
+    same batch. (Proton-side ``ALREADY_EXISTS`` is still possible and
+    handled by the orchestrator.)
+    """
+    base_clean = _validate_base(base)
+    if count < 1:
+        raise AliasGenError("count must be >= 1")
+    if count > MAX_BATCH:
+        raise AliasGenError(f"count exceeds MAX_BATCH={MAX_BATCH}")
+    digits = max(2, len(str(count - 1)))
+    pool = 10 ** digits
+    if count > pool:
+        raise AliasGenError(
+            f"count {count} exceeds {digits}-digit random pool {pool}"
+        )
+    sampler = rng if rng is not None else random
+    suffixes = sampler.sample(range(pool), count)
+    return [f"{base_clean}{s:0{digits}d}" for s in suffixes]
 
 
 def generate_batch(

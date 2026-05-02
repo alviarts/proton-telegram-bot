@@ -13,7 +13,7 @@ from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
 from typing import Any
 
-from .alias_gen import generate_batch, iter_names
+from .alias_gen import generate_batch, iter_names, random_suffix_names
 from .crypto import CredentialCipher
 from .db import Database
 from .models import PrimaryAccount
@@ -82,6 +82,7 @@ async def run_batch(
     cancel_event: asyncio.Event | None = None,
     browser_handle: dict[str, Any] | None = None,
     proxy_provider: ProxyProvider | None = None,
+    random_suffix: bool = False,
 ) -> BatchSummary:
     """Drive the end-to-end ``/genaddr`` flow for one primary account.
 
@@ -102,7 +103,13 @@ async def run_batch(
             f"could not decrypt Proton password (key rotated?): {exc}"
         ) from exc
 
-    state = await db.get_generator_state(chat_id, primary.id, base)
+    # In random-suffix mode the names come from a one-shot shuffled pool
+    # (e.g. ``vielz88311, vielz88347, …``) so we don't track or persist
+    # the alphabetic-sequential cursor used by the default flow.
+    if random_suffix:
+        state = None
+    else:
+        state = await db.get_generator_state(chat_id, primary.id, base)
     domain_clean = domain.lstrip("@").lower()
 
     summary = BatchSummary(
@@ -144,7 +151,16 @@ async def run_batch(
                 browser_handle["browser"] = browser
             successes = 0
             attempts = 0
-            name_iter = iter_names(base, state)
+            if random_suffix:
+                # Pre-shuffle a pool large enough to absorb the same 3x
+                # over-attempt margin as the sequential flow. Each entry is
+                # paired with ``None`` so the iterator's tuple shape stays
+                # compatible with ``iter_names`` and the ``local, _ = next(…)``
+                # unpacking below.
+                random_names = random_suffix_names(base, max_attempts)
+                name_iter = iter((n, None) for n in random_names)
+            else:
+                name_iter = iter_names(base, state)
             while successes < count and attempts < max_attempts:
                 if cancel_event is not None and cancel_event.is_set():
                     summary.aborted_reason = "cancelled by user"
@@ -255,11 +271,13 @@ async def run_batch(
     # would only burn more retries. The exception is when we couldn't
     # even start (e.g. login failure before the first attempt) -- in
     # that case ``summary.results`` is empty and the cursor stays put.
-    if summary.results:
+    if summary.results and not random_suffix and state is not None:
         # Re-derive the cursor by replaying the generator one step per
         # attempt. This keeps alias_gen the single source of truth and
         # avoids leaking the live ``cursor`` variable from inside the
         # ``async with`` block (where exceptions may have unwound it).
+        # Skipped in random-suffix mode: there is no monotonic cursor to
+        # advance, every batch draws fresh from the shuffled pool.
         _, advanced = generate_batch(
             base=base,
             state=state,
