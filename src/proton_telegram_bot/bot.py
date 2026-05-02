@@ -847,12 +847,25 @@ def _build_post_connect_keyboard_with_aliases(
 
     Used when /connect lands on an account that already has aliases
     (auto-sync just imported them, or they were already in the DB from
-    an earlier session). Shows /list and a one-click "Cek listener"
-    button so the user can immediately validate that every alias under
-    this primary actually receives mail.
+    an earlier session). Surfaces three one-tap actions:
+
+    1. Generate 20 more random-suffix aliases — same callback the
+       fresh-account onboarding uses, so the user can extend the pool
+       without re-typing the email address. ``/genaddr`` and
+       ``/cekimap`` use independent ``chat_data`` locks
+       (``genaddr_running`` vs ``health_check_running``) so this is
+       safe to click while a background health check is running.
+    2. Run the end-to-end IMAP listener health check.
+    3. Open ``/list`` for this primary.
     """
     return InlineKeyboardMarkup(
         [
+            [
+                InlineKeyboardButton(
+                    "✨ Generate 20 alamat sekarang",
+                    callback_data=f"{CB_QUICK_GENADDR}:{primary_id}:20",
+                )
+            ],
             [
                 InlineKeyboardButton(
                     f"🩺 Cek IMAP listener semua {alias_count} alias",
