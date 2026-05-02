@@ -173,6 +173,41 @@ class TempMailbox:
         return None
 
 
+    async def wait_for_subject(
+        self,
+        client: httpx.AsyncClient,
+        token: str,
+        *,
+        max_attempts: int = 30,
+        poll_interval: float = 2.0,
+    ) -> bool:
+        """Poll the inbox for a message whose subject contains ``token``.
+
+        Used by the post-connect smoke test: we send a unique-token email
+        from the just-connected Bridge SMTP and confirm Mail.tm receives
+        it. Returns True on hit, False on timeout.
+        """
+        headers = {"Authorization": f"Bearer {self._token}"}
+        for attempt in range(max_attempts):
+            try:
+                resp = await client.get(
+                    f"{API_BASE}/messages",
+                    headers=headers,
+                    timeout=15,
+                )
+                resp.raise_for_status()
+                for msg in resp.json().get("hydra:member", []):
+                    subject = msg.get("subject") or ""
+                    if token in subject:
+                        LOGGER.info("smoke-test token %s found in inbox", token)
+                        return True
+            except Exception:
+                LOGGER.debug("smoke-test poll attempt %d failed", attempt, exc_info=True)
+            await asyncio.sleep(poll_interval)
+        LOGGER.warning("smoke-test token %s not seen in inbox after %d polls", token, max_attempts)
+        return False
+
+
 def _extract_code(text: str) -> str | None:
     """Extract a 6-digit verification code from text."""
     match = re.search(r"\b(\d{6})\b", text)

@@ -5,6 +5,9 @@ import asyncio
 import contextlib
 import html
 import logging
+import secrets
+import smtplib
+from email.message import EmailMessage
 from typing import Any, cast
 
 import aioimaplib
@@ -750,6 +753,72 @@ def _build_post_connect_keyboard(primary_id: int) -> InlineKeyboardMarkup:
     )
 
 
+SMTP_SMOKE_TIMEOUT_SECONDS = 60
+BRIDGE_SMTP_PORT = 1025
+
+
+def _smtp_send_test_message(
+    *,
+    host: str,
+    port: int,
+    username: str,
+    password: str,
+    from_addr: str,
+    to_addr: str,
+    subject: str,
+    body: str,
+) -> None:
+    """Synchronous SMTP send via Bridge. Wrapped in ``to_thread`` by callers."""
+    msg = EmailMessage()
+    msg["From"] = from_addr
+    msg["To"] = to_addr
+    msg["Subject"] = subject
+    msg.set_content(body)
+
+    with smtplib.SMTP(host, port, timeout=30) as smtp:
+        smtp.starttls()
+        smtp.login(username, password)
+        smtp.send_message(msg)
+
+
+async def _smoke_test_via_tempmail(
+    *,
+    email: str,
+    imap_username: str,
+    imap_password: str,
+    tempmail: TempMailbox,
+) -> bool:
+    """Send a tagged test email via Bridge SMTP and confirm Mail.tm receives it.
+
+    Bridge shares credentials between IMAP and SMTP, so a successful
+    SMTP roundtrip is a strong proxy for "IMAP listener will work too".
+    """
+    token = secrets.token_hex(8)
+    subject = f"[bot-smoke-test] {token}"
+    body = f"Smoke test from {email}.\nToken: {token}\n"
+    try:
+        await asyncio.to_thread(
+            _smtp_send_test_message,
+            host=CONNECT_DEFAULT_HOST,
+            port=BRIDGE_SMTP_PORT,
+            username=imap_username,
+            password=imap_password,
+            from_addr=email,
+            to_addr=tempmail.address,
+            subject=subject,
+            body=body,
+        )
+    except Exception as exc:
+        LOGGER.warning("smoke-test SMTP send failed: %s", exc)
+        return False
+
+    poll_attempts = max(1, SMTP_SMOKE_TIMEOUT_SECONDS // 2)
+    async with httpx.AsyncClient() as client:
+        return await tempmail.wait_for_subject(
+            client, token, max_attempts=poll_attempts, poll_interval=2.0
+        )
+
+
 async def _finalize_connect(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -757,12 +826,18 @@ async def _finalize_connect(
     email: str,
     imap_username: str,
     imap_password: str,
+    smoke_test_tempmail: TempMailbox | None = None,
 ) -> int:
     """Common tail of /connect: verify, save, start listener, friendly reply.
 
     Both the legacy "user-typed-Bridge-password" path and the new
     "auto-extracted-from-Bridge-vault" path land here once we hold a
     plausible IMAP password.
+
+    When ``smoke_test_tempmail`` is provided, run an end-to-end SMTP
+    smoke test (send email -> tempmail) after the listener starts. On
+    failure the freshly-added primary is rolled back so the user can
+    cleanly ``/connect`` again instead of being stuck with broken creds.
     """
     chat = update.effective_chat
     if chat is None:
@@ -837,6 +912,47 @@ async def _finalize_connect(
         )
         return ConversationHandler.END
 
+    if smoke_test_tempmail is not None:
+        await update.effective_message.reply_text(  # type: ignore[union-attr]
+            "🧪 Smoke test IMAP/SMTP: kirim email uji ke temp mail "
+            f"(<code>{html.escape(smoke_test_tempmail.address)}</code>)...",
+            parse_mode=ParseMode.HTML,
+        )
+        smoke_ok = await _smoke_test_via_tempmail(
+            email=email,
+            imap_username=imap_username,
+            imap_password=imap_password,
+            tempmail=smoke_test_tempmail,
+        )
+        if smoke_ok:
+            await update.effective_message.reply_text(  # type: ignore[union-attr]
+                "✅ <b>IMAP/SMTP berjalan sempurna</b> — email uji "
+                "diterima di temp mail.",
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            LOGGER.warning(
+                "smoke test failed for %s; rolling back primary %d",
+                email,
+                primary_id,
+            )
+            await update.effective_message.reply_text(  # type: ignore[union-attr]
+                "❌ <b>Smoke test gagal</b> — email uji tidak sampai ke "
+                "temp mail dalam 60 detik. Bridge mungkin belum benar-benar "
+                "siap atau IMAP/SMTP tidak jalan.\n\n"
+                "Sesi ini di-rollback. Silakan <b>/connect</b> lagi.",
+                parse_mode=ParseMode.HTML,
+            )
+            with contextlib.suppress(Exception):
+                await manager.stop_for_primary(primary_id)
+            with contextlib.suppress(Exception):
+                await db.delete_primary_account(chat.id, primary_id)
+            bridge_admin = _bot_bridge_admin(context)
+            if bridge_admin is not None:
+                with contextlib.suppress(Exception):
+                    await bridge_admin.remove_account(email)
+            return ConversationHandler.END
+
     aliases = await db.list_aliases(chat.id, primary_id=primary_id)
     if not aliases:
         await update.effective_message.reply_text(  # type: ignore[union-attr]
@@ -857,27 +973,33 @@ async def _setup_tempmail_recovery(
     update: Update,
     email: str,
     proton_password: str,
-) -> TempMailbox | None:
+) -> tuple[TempMailbox | None, bool]:
     """Create a temp mail and set it as recovery email in Proton settings.
 
     Logs into the Proton web UI, navigates to recovery settings, and
     replaces the current recovery email with a fresh Mail.tm address.
     Sends the recovery-email verification link to the Telegram user
     for manual click.
-    Returns the TempMailbox if successful, None otherwise.
+
+    Returns a tuple ``(tempmail, ok)`` where:
+      * ``tempmail`` is the disposable mailbox (or ``None`` on early failure).
+      * ``ok`` is ``True`` only if the verification link was sent to the
+        chat. When ``ok`` is ``False`` the caller MUST NOT proceed to
+        Bridge add-account: Proton login or recovery email change failed
+        and the user needs to retry ``/connect``.
     """
     try:
         from playwright.async_api import async_playwright
     except ImportError:
         LOGGER.warning("playwright not installed; skipping recovery email setup")
-        return None
+        return None, False
 
     async with httpx.AsyncClient() as client:
         try:
             tempmail = await TempMailbox.create(client)
         except TempMailError as exc:
             LOGGER.warning("failed to create temp mailbox: %s", exc)
-            return None
+            return None, False
 
         await update.effective_message.reply_text(  # type: ignore[union-attr]
             f"📧 Temp mail dibuat: <code>{html.escape(tempmail.address)}</code>\n"
@@ -930,9 +1052,9 @@ async def _setup_tempmail_recovery(
                     ),
                 }.get(blocker, "Proton tidak redirect ke dashboard dalam 60 detik.")
                 await update.effective_message.reply_text(  # type: ignore[union-attr]
-                    f"⚠️ Login Proton web gagal (<i>{blocker}</i>). {blocker_msg}\n\n"
-                    "Lanjut tanpa ganti recovery email — Bridge add-account akan "
-                    "lanjut, tapi kemungkinan akan minta verifikasi manual.",
+                    f"❌ <b>Login Proton web gagal</b> (<i>{blocker}</i>). {blocker_msg}\n\n"
+                    "Bridge add-account dibatalkan — silakan /connect lagi "
+                    "setelah memperbaiki masalah di atas.",
                     parse_mode=ParseMode.HTML,
                 )
                 if screenshot:
@@ -944,7 +1066,7 @@ async def _setup_tempmail_recovery(
                             )
                     except Exception as exc:
                         LOGGER.debug("could not send login-failure screenshot: %s", exc)
-                return tempmail
+                return tempmail, False
 
             # Change recovery email and get verification link
             verify_link = await change_recovery_email(
@@ -958,15 +1080,33 @@ async def _setup_tempmail_recovery(
                     f"{html.escape(verify_link)}",
                     parse_mode=ParseMode.HTML,
                 )
-            else:
-                await update.effective_message.reply_text(  # type: ignore[union-attr]
-                    "⚠️ Gagal mengubah/verifikasi recovery email. "
-                    "Verifikasi otomatis mungkin tidak akan berfungsi.",
-                )
-            return tempmail
+                return tempmail, True
+
+            failure = getattr(change_recovery_email, "last_failure", {}) or {}
+            step = failure.get("step", "unknown")
+            screenshot = failure.get("screenshot")
+            await update.effective_message.reply_text(  # type: ignore[union-attr]
+                "❌ <b>Gagal mengubah/verifikasi recovery email</b> "
+                f"(step: <code>{html.escape(step)}</code>).\n"
+                "Bridge add-account dibatalkan — password Proton beda dengan "
+                "password Bridge IMAP, jadi tidak aman lanjut.\n\n"
+                "Coba <b>/connect</b> lagi. Kalau berulang, kirim screenshot "
+                "ke developer.",
+                parse_mode=ParseMode.HTML,
+            )
+            if screenshot:
+                try:
+                    with open(screenshot, "rb") as fh:
+                        await update.effective_message.reply_photo(  # type: ignore[union-attr]
+                            photo=fh,
+                            caption=f"Screenshot saat recovery email gagal (step={step})",
+                        )
+                except Exception as exc:
+                    LOGGER.debug("could not send recovery-failure screenshot: %s", exc)
+            return tempmail, False
         except Exception:
             LOGGER.exception("recovery email setup failed")
-            return tempmail
+            return tempmail, False
         finally:
             if browser:
                 with contextlib.suppress(Exception):
@@ -1063,9 +1203,17 @@ async def _drive_bridge_login(
     # Step 0: set up temp mail + change recovery email BEFORE Bridge login.
     # This must happen before Bridge login because the Bridge CLI stops
     # the service (and thus the Proton web session is separate).
-    tempmail = await _setup_tempmail_recovery(
+    tempmail, recovery_ok = await _setup_tempmail_recovery(
         update, email, proton_password
     )
+    if not recovery_ok:
+        # Recovery email step failed: do NOT attempt Bridge add-account.
+        # Bridge uses the Proton account password for login (not the
+        # IMAP password it later generates), and without a verified
+        # recovery email Proton will demand human verification we cannot
+        # automate.  Better to abort cleanly than leave the user with a
+        # confusing TimeoutError after a broken recovery flow.
+        return ConversationHandler.END
 
     progress = await update.effective_message.reply_text(  # type: ignore[union-attr]
         f"🔧 Mendaftarkan <b>{html.escape(email)}</b> ke Proton Bridge "
@@ -1096,6 +1244,7 @@ async def _drive_bridge_login(
                 # Auto-verify failed: fall back to manual flow
                 user_data["bridge_captcha_iterator"] = iterator
                 user_data["bridge_email"] = email
+                user_data["bridge_smoke_tempmail"] = tempmail
                 await update.effective_message.reply_text(  # type: ignore[union-attr]
                     "🔒 Proton minta verifikasi manusia.\n\n"
                     "Auto-verify gagal. Selesaikan manual:\n"
@@ -1149,6 +1298,7 @@ async def _drive_bridge_login(
         email=creds.email,
         imap_username=creds.imap_username,
         imap_password=creds.imap_password,
+        smoke_test_tempmail=tempmail,
     )
 
 
@@ -1290,6 +1440,7 @@ async def connect_bridge_captcha(
                 email=creds.email,
                 imap_username=creds.imap_username,
                 imap_password=creds.imap_password,
+                smoke_test_tempmail=user_data.get("bridge_smoke_tempmail"),
             )
 
 
@@ -1298,6 +1449,7 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_data.pop("imap_password", None)
     user_data.pop("bridge_captcha_iterator", None)
     user_data.pop("bridge_email", None)
+    user_data.pop("bridge_smoke_tempmail", None)
     user_data.pop("proton_password", None)
     bridge_admin = _bot_bridge_admin(context)
     if bridge_admin is not None:
