@@ -3,21 +3,30 @@
 Workflow per primary:
 
 1. Pull Bridge IMAP/SMTP credentials for the primary email out of the
-   Bridge vault (Bridge serves all aliases of a primary through one
-   single login).
-2. Create **one fresh Mail.tm temp inbox per alias** so each alias has
-   an isolated audit trail. Throttled to one create per
-   ``MAILBOX_CREATE_THROTTLE_S`` to stay under Mail.tm's rate limit.
+   Bridge vault.
+2. Open a dedicated IMAP4 connection to Bridge (separate from the
+   running listener — Bridge accepts concurrent IMAP sessions). Select
+   ``INBOX``.
 3. For each alias of the primary (+ the primary itself), send a tagged
-   test email **from** that alias **to** that alias's dedicated temp
-   inbox via Bridge SMTP. The token in the subject still uniquely ties
-   subject ↔ alias even if Mail.tm assigns identical addresses.
-4. Poll each temp inbox in parallel. As soon as a tagged subject
-   appears, mark the alias confirmed.
+   test email **from** that alias **to** the primary's own address via
+   Bridge SMTP. Proton routes alias-to-primary internally so the
+   message lands in the primary's INBOX within seconds — no external
+   mail provider is involved.
+4. Poll the dedicated INBOX connection with ``UID SEARCH SUBJECT`` for
+   the unique ``[health-check] <token>`` tags. As soon as a token is
+   seen, mark its alias confirmed.
 5. Maintain a single rolling **progress message** in Telegram and edit
-   it in place as aliases land — no spam of one ✅/❌ per alias.
-   Important transitions (initial "started", final summary) stay as
-   distinct messages so they remain visible above the rolling line.
+   it in place as aliases land — no spam of one ✅/❌ per alias. The
+   "started" header and the final "selesai" summary stay as distinct
+   messages so they remain visible above the rolling line.
+6. After the poll completes, mark every detected health-check message
+   ``\\Deleted`` and EXPUNGE so the user's INBOX isn't polluted.
+
+This design avoids Mail.tm entirely. Mail.tm rate-limits account
+creation to 1/60s per IP (``ratelimit-policy: 1; w=60``) which makes
+per-alias temp inboxes infeasible for primaries with more than one
+alias. Routing via Proton-internal mail (alias → primary) is faster,
+isolated per alias by token, and has no external dependency.
 
 Runs in a background asyncio task so the user can keep using the bot
 (read mail, /list, /genaddr, …) while it executes.
@@ -26,41 +35,44 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import secrets
 import smtplib
 import time
 from email.message import EmailMessage
 
-import httpx
+import aioimaplib
 from telegram.constants import ParseMode
 
 from .bridge_admin import BridgeAdmin
 from .db import Database
 from .models import PrimaryAccount
-from .tempmail import TempMailbox, TempMailError
 
 LOGGER = logging.getLogger(__name__)
 
 # Bridge defaults (must match bot.CONNECT_DEFAULT_HOST + BRIDGE_SMTP_PORT).
 BRIDGE_SMTP_HOST = "127.0.0.1"
 BRIDGE_SMTP_PORT = 1025
+BRIDGE_IMAP_HOST = "127.0.0.1"
+BRIDGE_IMAP_PORT = 1143
+BRIDGE_IMAP_USE_SSL = False
 SMTP_SEND_TIMEOUT_S = 30
+IMAP_TIMEOUT_S = 30
 
-# Total time we allow Mail.tm to receive every alias's test email after we
-# finish sending the whole batch. Mail.tm typically delivers within ~10s,
-# but Bridge → Proton routing of internal sender→tempmail can occasionally
-# be slow so we err on the generous side.
-HEALTH_CHECK_RECEIVE_TIMEOUT_S = 120
-# How often each per-alias poll task hits Mail.tm.
+# Total time we allow Bridge to receive every alias's test email after
+# we finish sending the whole batch. Proton-internal alias→primary
+# delivery is normally < 5s but routing for very fresh aliases can lag.
+HEALTH_CHECK_RECEIVE_TIMEOUT_S = 90
+# How often the IMAP poll task runs UID SEARCH against the dedicated
+# health-check connection.
 HEALTH_CHECK_POLL_INTERVAL_S = 3.0
-# Spacing between Mail.tm account-create calls. Mail.tm's free tier
-# rate-limits API calls; 1s is a comfortable default — for 20 aliases
-# that's ~20s of setup, well below the receive deadline.
-MAILBOX_CREATE_THROTTLE_S = 1.0
 # How often the rolling Telegram progress message is edited. Telegram
 # limits edits to ~1/sec per chat; 2.0s is conservative and avoids
 # burning ratelimits when a primary has 20+ aliases.
 PROGRESS_EDIT_INTERVAL_S = 2.0
+# Subject prefix every health-check message carries so we can find them
+# from a UID SEARCH and clean them up afterwards.
+HEALTH_CHECK_SUBJECT_PREFIX = "[health-check]"
 
 
 def _smtp_send(
@@ -111,8 +123,6 @@ def _format_progress(
         f"✅ Sukses: <b>{len(confirmed)}/{total}</b>",
     ]
     if failed:
-        # Truncate long failure lists so the message stays under
-        # Telegram's 4096-char cap.
         sample = ", ".join(sorted(failed)[:8])
         more = "" if len(failed) <= 8 else f" (+{len(failed) - 8} lagi)"
         lines.append(f"❌ Gagal: <b>{len(failed)}</b> — <code>{sample}</code>{more}")
@@ -125,33 +135,119 @@ def _format_progress(
     return "\n".join(lines)
 
 
-async def _create_mailbox_with_retry(
-    client: httpx.AsyncClient,
-    *,
-    attempts: int = 3,
-    backoff_s: float = 2.0,
-) -> TempMailbox | None:
-    """Create one ``TempMailbox`` with retry on transient failures.
+def _parse_uids(lines: list[bytes | str]) -> list[int]:
+    """Extract UIDs from an aioimaplib SEARCH response.
 
-    Returns ``None`` after ``attempts`` failures so the caller can mark
-    the corresponding alias as send-failed instead of crashing the
-    whole batch.
+    Mirrors the parser in ``imap_listener._parse_uids`` — only
+    digits-only lines count as UID lines, so trailing OK status lines
+    don't get parsed as UIDs.
     """
-    last_exc: Exception | None = None
-    for i in range(attempts):
-        try:
-            return await TempMailbox.create(client)
-        except (TempMailError, httpx.HTTPError) as exc:
-            last_exc = exc
-            LOGGER.warning(
-                "health check: temp mailbox create attempt %d/%d failed: %s",
-                i + 1,
-                attempts,
-                exc,
-            )
-            await asyncio.sleep(backoff_s * (i + 1))
-    LOGGER.error("health check: gave up creating temp mailbox: %s", last_exc)
-    return None
+    uids: list[int] = []
+    for raw in lines:
+        if isinstance(raw, bytes):
+            try:
+                line = raw.decode()
+            except UnicodeDecodeError:
+                continue
+        else:
+            line = raw
+        tokens = line.strip().split()
+        if not tokens:
+            continue
+        if not all(t.isdigit() for t in tokens):
+            continue
+        uids.extend(int(t) for t in tokens)
+    return uids
+
+
+_TOKEN_IN_SUBJECT_RE = re.compile(rb"\[health-check\]\s+([0-9a-f]{16})", re.IGNORECASE)
+
+
+def _extract_token_from_header_blob(blob: bytes) -> str | None:
+    """Return the 16-char hex token in a fetched ``BODY[HEADER.FIELDS
+    (SUBJECT)]`` blob, or ``None`` if it isn't a health-check tag.
+
+    Email headers may be folded over multiple lines so we scan the
+    whole blob rather than pattern-matching just the first line.
+    """
+    match = _TOKEN_IN_SUBJECT_RE.search(blob)
+    if match is None:
+        return None
+    return match.group(1).decode().lower()
+
+
+async def _open_imap(
+    *, host: str, port: int, use_ssl: bool, username: str, password: str
+) -> aioimaplib.IMAP4:
+    """Open one short-lived IMAP4 session against Bridge for the
+    health-check polls. Caller is responsible for ``logout()``.
+    """
+    if use_ssl:
+        client = aioimaplib.IMAP4_SSL(host=host, port=port, timeout=IMAP_TIMEOUT_S)
+    else:
+        client = aioimaplib.IMAP4(host=host, port=port, timeout=IMAP_TIMEOUT_S)
+    await client.wait_hello_from_server()
+    await client.login(username, password)
+    await client.select("INBOX")
+    return client
+
+
+async def _scan_inbox_for_tokens(
+    client: aioimaplib.IMAP4, baseline_uid: int
+) -> dict[str, int]:
+    """Search INBOX for health-check messages newer than ``baseline_uid``
+    and return ``{token: uid}`` for every one we recognise.
+    """
+    response = await client.uid_search(
+        f"UID {baseline_uid + 1}:*"
+    )
+    if response.result != "OK":
+        return {}
+    uids = _parse_uids(response.lines)
+    if not uids:
+        return {}
+    # Fetch only the Subject header for matching UIDs in one round trip.
+    uid_set = ",".join(str(u) for u in uids)
+    fetch_resp = await client.uid(
+        "fetch", uid_set, "(BODY.PEEK[HEADER.FIELDS (SUBJECT)])"
+    )
+    if fetch_resp.result != "OK":
+        return {}
+    found: dict[str, int] = {}
+    current_uid: int | None = None
+    for raw in fetch_resp.lines:
+        line = raw if isinstance(raw, bytes) else raw.encode()
+        m = re.match(rb"\* (\d+) FETCH ", line)
+        if m:
+            try:
+                current_uid = int(m.group(1))
+            except ValueError:
+                current_uid = None
+            continue
+        if current_uid is None:
+            continue
+        token = _extract_token_from_header_blob(line)
+        if token is not None:
+            found[token] = current_uid
+    return found
+
+
+async def _cleanup_inbox(
+    client: aioimaplib.IMAP4, uids: list[int]
+) -> None:
+    """Mark the listed UIDs ``\\Deleted`` and EXPUNGE so health-check
+    messages don't clutter the user's INBOX.
+    """
+    if not uids:
+        return
+    uid_set = ",".join(str(u) for u in uids)
+    try:
+        await client.uid("store", uid_set, "+FLAGS", "(\\Deleted)")
+        await client.expunge()
+    except Exception:
+        LOGGER.debug(
+            "health check: cleanup of UIDs %s raised", uids, exc_info=True
+        )
 
 
 async def run_health_check(
@@ -224,7 +320,7 @@ async def run_health_check(
         text=(
             f"🩺 Health check <b>{primary.email}</b> dimulai.\n"
             f"Total target: <b>{len(targets)}</b> alamat.\n"
-            f"Setiap alias dapat temp mailbox sendiri. "
+            f"Tes pakai routing internal Proton (no Mail.tm). "
             f"Bot tetap bisa dipakai sambil menunggu hasil."
         ),
         parse_mode=ParseMode.HTML,
@@ -235,19 +331,14 @@ async def run_health_check(
     failed: set[str] = set()
     progress_lock = asyncio.Lock()
 
-    async def _send_initial_progress() -> int | None:
-        msg = await bot.send_message(
-            chat_id=chat_id,
-            text=_format_progress(
-                primary.email, len(targets), confirmed, failed, list(targets)
-            ),
-            parse_mode=ParseMode.HTML,
-        )
-        # python-telegram-bot returns a Message object; tests use a fake
-        # bot that returns ``None`` so we tolerate both.
-        return getattr(msg, "message_id", None) if msg is not None else None
-
-    progress_msg_id = await _send_initial_progress()
+    msg = await bot.send_message(
+        chat_id=chat_id,
+        text=_format_progress(
+            primary.email, len(targets), confirmed, failed, list(targets)
+        ),
+        parse_mode=ParseMode.HTML,
+    )
+    progress_msg_id = getattr(msg, "message_id", None) if msg is not None else None
 
     last_edit = 0.0
     last_text = ""
@@ -279,115 +370,132 @@ async def run_health_check(
                     "health check: edit_message_text failed", exc_info=True
                 )
 
-    # 3. Per-alias mailbox creation, throttled. Tracks ``alias -> mailbox``.
-    mailboxes: dict[str, TempMailbox] = {}
-    setup_failures: list[tuple[str, str]] = []
-    async with httpx.AsyncClient() as client:
-        for alias_email in targets:
-            mb = await _create_mailbox_with_retry(client)
-            if mb is None:
-                setup_failures.append(
-                    (alias_email, "tidak bisa bikin temp mailbox (Mail.tm error)")
-                )
-                failed.add(alias_email)
-                await _refresh_progress()
-                continue
-            mailboxes[alias_email] = mb
-            # Mark the alias as still pending; let the progress refresh
-            # show the user mailbox setup is making progress.
-            await _refresh_progress()
-            await asyncio.sleep(MAILBOX_CREATE_THROTTLE_S)
-
-    # 4. SMTP send (sequential — Bridge serializes SMTP sessions).
-    expected: dict[str, tuple[str, TempMailbox]] = {}  # alias -> (token, mailbox)
-    send_failures: list[tuple[str, str]] = []
-
-    async def _send_one(alias_email: str, mailbox: TempMailbox) -> None:
-        token = secrets.token_hex(8)
-        subject = f"[health-check] {token} {alias_email}"
-        body = (
-            f"Health check from {alias_email} via Bridge SMTP.\n"
-            f"Token: {token}\n"
-            f"Inbox: {mailbox.address}\n"
+    # 3. Open the dedicated IMAP connection up front, capture the
+    # current high-water UID so we only consider messages that arrive
+    # after we start sending. Bridge accepts concurrent connections;
+    # this is independent of the always-on listener.
+    try:
+        imap = await _open_imap(
+            host=BRIDGE_IMAP_HOST,
+            port=BRIDGE_IMAP_PORT,
+            use_ssl=BRIDGE_IMAP_USE_SSL,
+            username=creds.imap_username,
+            password=creds.imap_password,
         )
-        try:
-            await asyncio.to_thread(
-                _smtp_send,
-                host=BRIDGE_SMTP_HOST,
-                port=BRIDGE_SMTP_PORT,
-                username=creds.imap_username,
-                password=creds.imap_password,
-                from_addr=alias_email,
-                to_addr=mailbox.address,
-                subject=subject,
-                body=body,
-            )
-        except Exception as exc:  # pragma: no cover - network failures
-            LOGGER.warning(
-                "health check: SMTP send from %s failed: %s",
-                alias_email,
-                exc,
-            )
-            send_failures.append((alias_email, str(exc)[:200]))
-            failed.add(alias_email)
-            await _refresh_progress()
-            return
-        expected[alias_email] = (token, mailbox)
-
-    for alias_email, mailbox in mailboxes.items():
-        await _send_one(alias_email, mailbox)
-
-    # If everything failed at the send stage, short-circuit with a final
-    # summary so the user isn't left staring at a frozen progress bar.
-    if not expected:
-        await _refresh_progress(force=True)
+    except Exception as exc:
+        LOGGER.exception("health check: failed to open IMAP session")
         await bot.send_message(
             chat_id=chat_id,
             text=(
-                f"🩺 Health check selesai — <b>0/{len(targets)}</b> sync. "
-                f"Tidak ada email yang berhasil dikirim."
+                f"❌ Gagal buka IMAP ke Bridge: {exc!s}\n"
+                f"Bridge mungkin belum running atau kredensial salah."
             ),
-            parse_mode=ParseMode.HTML,
         )
         return
 
-    # 5. Per-alias poll tasks. Each polls its own mailbox until the
-    # token shows up or the global deadline passes; result feeds the
-    # rolling progress refresh.
-    deadline = time.monotonic() + HEALTH_CHECK_RECEIVE_TIMEOUT_S
+    try:
+        baseline_resp = await imap.uid_search("ALL")
+        baseline_uids = (
+            _parse_uids(baseline_resp.lines)
+            if baseline_resp.result == "OK"
+            else []
+        )
+        baseline_uid = max(baseline_uids, default=0)
 
-    async def _watch(alias_email: str, token: str, mailbox: TempMailbox) -> None:
-        async with httpx.AsyncClient() as poll_client:
-            while time.monotonic() < deadline:
-                await asyncio.sleep(HEALTH_CHECK_POLL_INTERVAL_S)
-                try:
-                    subjects = await mailbox.list_subjects(poll_client)
-                except Exception:
-                    LOGGER.debug(
-                        "health check: list_subjects raised for %s",
-                        alias_email,
-                        exc_info=True,
-                    )
-                    continue
-                if any(token in subj for subj in subjects):
-                    confirmed.add(alias_email)
-                    await _refresh_progress()
-                    return
-        # Deadline exceeded without the token showing up.
-        if alias_email not in confirmed:
-            failed.add(alias_email)
+        # 4. SMTP send (sequential — Bridge serializes SMTP sessions).
+        expected: dict[str, str] = {}  # alias -> token
+        send_failures: list[tuple[str, str]] = []
+
+        async def _send_one(alias_email: str) -> None:
+            token = secrets.token_hex(8)
+            subject = (
+                f"{HEALTH_CHECK_SUBJECT_PREFIX} {token} {alias_email}"
+            )
+            body = (
+                f"Health check from {alias_email} via Bridge SMTP.\n"
+                f"Token: {token}\n"
+                f"Routes alias→primary internally; ignore.\n"
+            )
+            try:
+                await asyncio.to_thread(
+                    _smtp_send,
+                    host=BRIDGE_SMTP_HOST,
+                    port=BRIDGE_SMTP_PORT,
+                    username=creds.imap_username,
+                    password=creds.imap_password,
+                    from_addr=alias_email,
+                    to_addr=primary.email,
+                    subject=subject,
+                    body=body,
+                )
+            except Exception as exc:  # pragma: no cover - network failures
+                LOGGER.warning(
+                    "health check: SMTP send from %s failed: %s",
+                    alias_email,
+                    exc,
+                )
+                send_failures.append((alias_email, str(exc)[:200]))
+                failed.add(alias_email)
+                await _refresh_progress()
+                return
+            expected[alias_email] = token
+
+        for alias_email in targets:
+            await _send_one(alias_email)
+
+        await _refresh_progress(force=True)
+
+        if not expected:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"🩺 Health check selesai — <b>0/{len(targets)}</b> sync. "
+                    f"Tidak ada email yang berhasil dikirim."
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        # 5. Poll INBOX for tokens. One scan handles every alias at
+        # once via UID SEARCH + batched FETCH, so an N-alias batch
+        # still only needs O(deadline / poll_interval) round trips.
+        token_to_alias = {tok: alias for alias, tok in expected.items()}
+        all_uids: set[int] = set()
+        deadline = time.monotonic() + HEALTH_CHECK_RECEIVE_TIMEOUT_S
+        while time.monotonic() < deadline:
+            await asyncio.sleep(HEALTH_CHECK_POLL_INTERVAL_S)
+            try:
+                found = await _scan_inbox_for_tokens(imap, baseline_uid)
+            except Exception:
+                LOGGER.debug(
+                    "health check: scan failed (will retry)", exc_info=True
+                )
+                continue
+            for token, uid in found.items():
+                all_uids.add(uid)
+                alias = token_to_alias.get(token)
+                if alias and alias not in confirmed:
+                    confirmed.add(alias)
+            if confirmed >= set(expected):
+                break
             await _refresh_progress()
 
-    await asyncio.gather(
-        *[
-            _watch(alias_email, token, mailbox)
-            for alias_email, (token, mailbox) in expected.items()
-        ]
-    )
+        # 6. Anything still expected and unseen has timed out.
+        for alias in expected:
+            if alias not in confirmed:
+                failed.add(alias)
 
-    # 6. Final progress refresh + summary message (separate so the user
-    # sees a distinct "selesai" line).
-    await _refresh_progress(force=True)
+        await _refresh_progress(force=True)
+
+        # 7. Cleanup health-check messages from the INBOX so the user
+        # doesn't see a pile of [health-check] entries when they open
+        # Proton webmail.
+        await _cleanup_inbox(imap, sorted(all_uids))
+    finally:
+        try:
+            await imap.logout()
+        except Exception:
+            LOGGER.debug("health check: imap.logout raised", exc_info=True)
 
     total_ok = len(confirmed)
     total = len(targets)
@@ -411,9 +519,6 @@ async def run_health_check(
         text=summary,
         parse_mode=ParseMode.HTML,
     )
-    # Mark unused for static analysers; ``db`` is kept in the signature
-    # so future modes (DB-backed history) don't have to refactor every
-    # call site.
+    # Keep ``db`` in the signature for future modes (DB-backed history).
     _ = db
-    _ = setup_failures
     _ = send_failures

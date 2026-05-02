@@ -1,9 +1,12 @@
 """Unit tests for the /cekimap health check task and the onboarding
 keyboard helpers added alongside it.
 
-The full Bridge-SMTP + Mail.tm round-trip can't run in CI so we mock
-those layers and assert the bot reports the right messages back to
-Telegram, in the right order, for both happy and degraded cases.
+The full Bridge SMTP + IMAP round-trip can't run in CI so we mock the
+SMTP transport and substitute a fake aioimaplib client. The fake
+client matches the surface of ``aioimaplib.IMAP4`` that
+``run_health_check`` uses (``wait_hello_from_server``, ``login``,
+``select``, ``uid_search``, ``uid("fetch", ...)``, ``uid("store",
+...)``, ``expunge``, ``logout``).
 """
 from __future__ import annotations
 
@@ -195,33 +198,106 @@ class _FakeBridgeAdmin:
         return self._creds
 
 
-class _FakeTempMailbox:
-    """Stand-in for ``TempMailbox`` that pretends every tagged email
-    arrives in the inbox. Each instance is independent so tests can
-    simulate per-alias inboxes (the production code creates one
-    mailbox per alias).
+@dataclass
+class _ImapResp:
+    result: str
+    lines: list[bytes]
+
+
+class _FakeImap:
+    """Lightweight stand-in for ``aioimaplib.IMAP4``.
+
+    Tracks every call so tests can assert on the IMAP traffic, and lets
+    a callback "deliver" messages with a synthetic UID so the
+    ``UID SEARCH`` / ``UID FETCH`` round trip in
+    :func:`health_check._scan_inbox_for_tokens` returns predictable
+    UIDs and Subject headers.
     """
 
-    _next_id = 0
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, tuple[Any, ...]]] = []
+        # Map of UID -> raw subject bytes. New "delivered" messages get
+        # appended with the next UID.
+        self._messages: dict[int, bytes] = {}
+        self._next_uid = 100
+        self.expunged: list[int] = []
+        self.stored: list[tuple[str, str, str]] = []
+        self.logged_out = False
 
-    def __init__(self, address: str | None = None) -> None:
-        if address is None:
-            type(self)._next_id += 1
-            address = f"fake-{type(self)._next_id}@mail.tm"
-        self.address = address
-        self._delivered_subjects: list[str] = []
+    def deliver(self, subject: str) -> int:
+        uid = self._next_uid
+        self._next_uid += 1
+        self._messages[uid] = subject.encode()
+        return uid
 
-    async def list_subjects(self, _client: Any) -> list[str]:
-        return list(self._delivered_subjects)
+    async def wait_hello_from_server(self) -> None:
+        self.calls.append(("wait_hello", ()))
 
-    def deliver(self, subject: str) -> None:
-        self._delivered_subjects.append(subject)
+    async def login(self, username: str, password: str) -> _ImapResp:
+        self.calls.append(("login", (username, password)))
+        return _ImapResp("OK", [])
+
+    async def select(self, mailbox: str) -> _ImapResp:
+        self.calls.append(("select", (mailbox,)))
+        return _ImapResp("OK", [])
+
+    async def uid_search(self, query: str) -> _ImapResp:
+        self.calls.append(("uid_search", (query,)))
+        # The production code calls ``uid_search("ALL")`` once for the
+        # baseline, then ``uid_search(f"UID {n+1}:*")`` repeatedly. For
+        # the baseline we always start with the empty inbox.
+        if query == "ALL":
+            return _ImapResp("OK", [b""])  # empty digit-only line
+        # Range query: collect every UID we have above the lower bound.
+        try:
+            after = int(query.split()[1].split(":")[0]) - 1
+        except Exception:
+            after = 0
+        uids = sorted(uid for uid in self._messages if uid > after)
+        if not uids:
+            return _ImapResp("OK", [b""])
+        return _ImapResp("OK", [(" ".join(str(u) for u in uids)).encode()])
+
+    async def uid(self, command: str, *args: str) -> _ImapResp:
+        self.calls.append(("uid", (command, *args)))
+        if command == "fetch":
+            uid_set = args[0]
+            uids = [
+                int(token) for token in uid_set.split(",") if token.isdigit()
+            ]
+            lines: list[bytes] = []
+            for uid in uids:
+                subject = self._messages.get(uid)
+                if subject is None:
+                    continue
+                # Imitate aioimaplib's per-FETCH framing.
+                lines.append(f"* {uid} FETCH (BODY[HEADER.FIELDS (SUBJECT)] {{}}".encode())
+                lines.append(b"Subject: " + subject)
+                lines.append(b")")
+            lines.append(b"OK FETCH completed")
+            return _ImapResp("OK", lines)
+        if command == "store":
+            self.stored.append((args[0], args[1], args[2]))
+            return _ImapResp("OK", [])
+        if command == "search":
+            return _ImapResp("OK", [b""])
+        return _ImapResp("OK", [])
+
+    async def expunge(self) -> _ImapResp:
+        self.calls.append(("expunge", ()))
+        self.expunged.extend(sorted(self._messages))
+        return _ImapResp("OK", [])
+
+    async def logout(self) -> _ImapResp:
+        self.calls.append(("logout", ()))
+        self.logged_out = True
+        return _ImapResp("OK", [])
 
 
-async def test_run_health_check_happy_path_uses_per_alias_mailbox_and_edits() -> None:
-    """Happy path: every alias gets its own Mail.tm inbox, and the
-    rolling progress message is edited in place rather than a new
-    ✅ message per alias being sent."""
+async def test_run_health_check_happy_path_via_bridge_imap() -> None:
+    """Happy path: every alias's SMTP send lands in the primary's
+    INBOX (faked via ``_FakeImap``) and the rolling progress message is
+    edited in place rather than spamming one ✅ per alias."""
     bot = _FakeBot()
     primary = PrimaryAccount(
         id=1,
@@ -239,27 +315,24 @@ async def test_run_health_check_happy_path_uses_per_alias_mailbox_and_edits() ->
         imap_password="bridge-pw",
     )
     admin = _FakeBridgeAdmin(creds)
-    boxes: list[_FakeTempMailbox] = []
-    by_addr: dict[str, _FakeTempMailbox] = {}
-
-    async def _create(_client: Any) -> _FakeTempMailbox:
-        mb = _FakeTempMailbox()
-        boxes.append(mb)
-        by_addr[mb.address] = mb
-        return mb
+    fake_imap = _FakeImap()
 
     def _fake_smtp_send(**kw: Any) -> None:
-        # Route the test email to the alias-specific inbox.
-        by_addr[kw["to_addr"]].deliver(kw["subject"])
+        # Simulate Proton-internal alias→primary delivery: every send
+        # immediately appears in the primary's INBOX with the same
+        # Subject we just sent out.
+        fake_imap.deliver(kw["subject"])
+
+    async def _open_imap(**_kw: Any) -> _FakeImap:
+        return fake_imap
 
     targets = ["vielz74@proton.me", "vielz001@proton.me", "vielz002@proton.me"]
 
     with (
-        patch.object(health_check.TempMailbox, "create", side_effect=_create),
+        patch.object(health_check, "_open_imap", _open_imap),
         patch.object(health_check, "_smtp_send", _fake_smtp_send),
         patch.object(health_check, "HEALTH_CHECK_RECEIVE_TIMEOUT_S", 5),
         patch.object(health_check, "HEALTH_CHECK_POLL_INTERVAL_S", 0.01),
-        patch.object(health_check, "MAILBOX_CREATE_THROTTLE_S", 0.0),
         patch.object(health_check, "PROGRESS_EDIT_INTERVAL_S", 0.0),
     ):
         await health_check.run_health_check(
@@ -271,14 +344,7 @@ async def test_run_health_check_happy_path_uses_per_alias_mailbox_and_edits() ->
             targets=targets,
         )
 
-    # One mailbox per alias, never reused.
-    assert len(boxes) == len(targets)
-    addresses = {mb.address for mb in boxes}
-    assert len(addresses) == len(targets)
-
-    # Static messages stay distinct: the "started" header, the rolling
-    # progress message, and the final "selesai" summary — three in
-    # total. Per-alias ✅ spam is gone (replaced by edits).
+    # Static messages: starter + initial progress + final summary.
     assert len(bot.messages) == 3
     starter, _progress_initial, summary = (m.text for m in bot.messages)
     assert "Health check" in starter
@@ -286,15 +352,25 @@ async def test_run_health_check_happy_path_uses_per_alias_mailbox_and_edits() ->
     assert "selesai" in summary.lower()
     assert f"{len(targets)}/{len(targets)}" in summary
 
-    # Rolling progress was edited at least once and the final edit
-    # reports the full success count.
+    # Rolling progress edited in place; final edit reports full success.
     assert bot.edits, "rolling progress message must be edited in place"
     final_edit_text = bot.edits[-1].text
     assert f"{len(targets)}/{len(targets)}" in final_edit_text
-    # All edits target the same message_id as the initial progress send.
     progress_id = bot.messages[1].message_id
     for edit in bot.edits:
         assert edit.message_id == progress_id
+
+    # Bridge IMAP was used: baseline + range UID searches, at least one
+    # UID FETCH, and a final logout. (login/select happen inside
+    # ``_open_imap`` which is itself patched in this test, so we only
+    # assert the calls that go through the returned client.)
+    call_names = [c[0] for c in fake_imap.calls]
+    assert "logout" in call_names
+    assert any(c[0] == "uid_search" for c in fake_imap.calls)
+    assert any(c[0] == "uid" and c[1][0] == "fetch" for c in fake_imap.calls)
+    # Cleanup: STORE \\Deleted + EXPUNGE removes the health-check noise.
+    assert fake_imap.stored, "expected STORE \\Deleted on detected UIDs"
+    assert fake_imap.expunged
 
 
 async def test_run_health_check_marks_unanswered_aliases_as_failed() -> None:
@@ -315,31 +391,25 @@ async def test_run_health_check_marks_unanswered_aliases_as_failed() -> None:
         imap_password="bridge-pw",
     )
     admin = _FakeBridgeAdmin(creds)
-    boxes: list[_FakeTempMailbox] = []
-    by_addr: dict[str, _FakeTempMailbox] = {}
-
-    async def _create(_client: Any) -> _FakeTempMailbox:
-        mb = _FakeTempMailbox()
-        boxes.append(mb)
-        by_addr[mb.address] = mb
-        return mb
+    fake_imap = _FakeImap()
 
     delivered_for_alias = "vielz001@proton.me"
     broken_alias = "vielzbroken@proton.me"
 
     def _fake_smtp_send(**kw: Any) -> None:
-        # Only deliver mail for the one alias; the other times out.
         if delivered_for_alias in kw["subject"]:
-            by_addr[kw["to_addr"]].deliver(kw["subject"])
+            fake_imap.deliver(kw["subject"])
+
+    async def _open_imap(**_kw: Any) -> _FakeImap:
+        return fake_imap
 
     targets = [delivered_for_alias, broken_alias]
 
     with (
-        patch.object(health_check.TempMailbox, "create", side_effect=_create),
+        patch.object(health_check, "_open_imap", _open_imap),
         patch.object(health_check, "_smtp_send", _fake_smtp_send),
         patch.object(health_check, "HEALTH_CHECK_RECEIVE_TIMEOUT_S", 1),
         patch.object(health_check, "HEALTH_CHECK_POLL_INTERVAL_S", 0.01),
-        patch.object(health_check, "MAILBOX_CREATE_THROTTLE_S", 0.0),
         patch.object(health_check, "PROGRESS_EDIT_INTERVAL_S", 0.0),
     ):
         await health_check.run_health_check(
@@ -351,14 +421,9 @@ async def test_run_health_check_marks_unanswered_aliases_as_failed() -> None:
             targets=targets,
         )
 
-    # The summary message reports 1/2 and names the broken alias so the
-    # user knows what's still wrong.
     summary = bot.messages[-1].text
     assert "1/2" in summary
     assert broken_alias in summary
-    # Final progress edit also surfaces the broken alias.
-    final_edit_text = bot.edits[-1].text if bot.edits else ""
-    assert broken_alias in final_edit_text or broken_alias in summary
 
 
 async def test_run_health_check_aborts_when_bridge_admin_unavailable() -> None:
@@ -405,21 +470,21 @@ async def test_run_health_check_handles_send_failures_per_alias() -> None:
         imap_password="bridge-pw",
     )
     admin = _FakeBridgeAdmin(creds)
-
-    async def _create(_client: Any) -> _FakeTempMailbox:
-        return _FakeTempMailbox()
+    fake_imap = _FakeImap()
 
     def _fake_smtp_send(**_kw: Any) -> None:
         raise RuntimeError("Bridge SMTP refused: alias not found")
 
+    async def _open_imap(**_kw: Any) -> _FakeImap:
+        return fake_imap
+
     targets = ["vielz74@proton.me", "vielz999@proton.me"]
 
     with (
-        patch.object(health_check.TempMailbox, "create", side_effect=_create),
+        patch.object(health_check, "_open_imap", _open_imap),
         patch.object(health_check, "_smtp_send", _fake_smtp_send),
         patch.object(health_check, "HEALTH_CHECK_RECEIVE_TIMEOUT_S", 1),
         patch.object(health_check, "HEALTH_CHECK_POLL_INTERVAL_S", 0.01),
-        patch.object(health_check, "MAILBOX_CREATE_THROTTLE_S", 0.0),
         patch.object(health_check, "PROGRESS_EDIT_INTERVAL_S", 0.0),
     ):
         await health_check.run_health_check(
@@ -431,12 +496,10 @@ async def test_run_health_check_handles_send_failures_per_alias() -> None:
             targets=targets,
         )
 
-    # All sends raised so no SMTP token ever existed → final summary
-    # reports 0 succeeded out of 2 targets.
+    # Every send raised → 0/2 (or "Tidak ada email yang berhasil dikirim").
     summary = bot.messages[-1].text
-    assert "0/2" in summary or "0 yang berhasil" in summary.lower()
-    # Both broken aliases are surfaced somewhere visible to the user
-    # (either in the rolling progress edit or the summary text).
+    haystack_lower = summary.lower()
+    assert "0/2" in summary or "tidak ada email" in haystack_lower
     haystack = summary + " ".join(e.text for e in bot.edits)
     assert "vielz74@proton.me" in haystack
     assert "vielz999@proton.me" in haystack
@@ -460,28 +523,25 @@ async def test_run_health_check_dedupes_targets() -> None:
         imap_password="bridge-pw",
     )
     admin = _FakeBridgeAdmin(creds)
-    by_addr: dict[str, _FakeTempMailbox] = {}
-
-    async def _create(_client: Any) -> _FakeTempMailbox:
-        mb = _FakeTempMailbox()
-        by_addr[mb.address] = mb
-        return mb
+    fake_imap = _FakeImap()
 
     sent: list[str] = []
 
     def _fake_smtp_send(**kw: Any) -> None:
         sent.append(kw["from_addr"])
-        by_addr[kw["to_addr"]].deliver(kw["subject"])
+        fake_imap.deliver(kw["subject"])
+
+    async def _open_imap(**_kw: Any) -> _FakeImap:
+        return fake_imap
 
     # Primary is in the list twice, plus uppercase variant — dedupe to 1.
     targets = ["vielz74@proton.me", "VIELZ74@proton.me", "vielz74@proton.me"]
 
     with (
-        patch.object(health_check.TempMailbox, "create", side_effect=_create),
+        patch.object(health_check, "_open_imap", _open_imap),
         patch.object(health_check, "_smtp_send", _fake_smtp_send),
         patch.object(health_check, "HEALTH_CHECK_RECEIVE_TIMEOUT_S", 1),
         patch.object(health_check, "HEALTH_CHECK_POLL_INTERVAL_S", 0.01),
-        patch.object(health_check, "MAILBOX_CREATE_THROTTLE_S", 0.0),
         patch.object(health_check, "PROGRESS_EDIT_INTERVAL_S", 0.0),
     ):
         await health_check.run_health_check(
@@ -493,26 +553,24 @@ async def test_run_health_check_dedupes_targets() -> None:
             targets=targets,
         )
 
-    # SMTP send happened once. Only one mailbox was created (1 deduped target).
+    # Only one SMTP call (rest were dupes), and the summary reports 1/1.
     assert len(sent) == 1
-    assert len(by_addr) == 1
     summary = bot.messages[-1].text
     assert "1/1" in summary
 
 
 @pytest.mark.parametrize(
-    "subjects, expected_token, expected_hit",
+    "blob, expected",
     [
-        (["[health-check] abc123 vielz74@proton.me"], "abc123", True),
-        (["unrelated mail"], "abc123", False),
-        ([], "abc123", False),
+        (b"Subject: [health-check] abc1234567890def vielz@proton.me", "abc1234567890def"),
+        (b"Subject: unrelated mail", None),
+        (b"", None),
     ],
 )
-def test_token_match_logic_via_subject_substring(
-    subjects: list[str], expected_token: str, expected_hit: bool
+def test_extract_token_from_header_blob(
+    blob: bytes, expected: str | None
 ) -> None:
-    """The polling loop matches a token via simple substring against the
-    subject. Lock that contract down so future refactors don't break it.
+    """``_extract_token_from_header_blob`` returns the lowercase 16-hex
+    token only when the blob looks like a health-check tag.
     """
-    hit = any(expected_token in s for s in subjects)
-    assert hit is expected_hit
+    assert health_check._extract_token_from_header_blob(blob) == expected
