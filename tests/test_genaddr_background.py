@@ -37,9 +37,14 @@ def _make_primary(email: str = "vielz883@proton.me") -> PrimaryAccount:
 class _FakeBot:
     def __init__(self) -> None:
         self.messages: list[str] = []
+        # Captured as ``(text, kwargs)`` so newer tests can assert on the
+        # ``reply_markup`` attached to the final-summary message without
+        # disrupting the existing text-only assertions.
+        self.calls: list[tuple[str, dict[str, Any]]] = []
 
-    async def send_message(self, *, chat_id: int, text: str, **_kw: Any) -> None:
+    async def send_message(self, *, chat_id: int, text: str, **kw: Any) -> None:
         self.messages.append(text)
+        self.calls.append((text, kw))
 
 
 class _FakeApp:
@@ -259,3 +264,114 @@ def test_genaddr_notify_every_default_is_five() -> None:
     the default in so a future refactor can't silently change it.
     """
     assert bot_mod.GENADDR_NOTIFY_EVERY == 5
+
+
+async def test_final_summary_attaches_cekimap_button_when_aliases_created() -> None:
+    """The post-/genaddr summary must include a one-tap "🩺 Cek hasil
+    sekarang" button so the user doesn't have to retype /cekimap.
+
+    Reuses ``CB_QUICK_HEALTHCHECK:<primary_id>`` so the existing
+    callback router runs the same health-check task /cekimap launches.
+    """
+    context = _FakeContext()
+    primary = _make_primary()
+
+    async def _fake_run_batch(**kw: Any) -> BatchSummary:
+        progress = kw["progress"]
+        results = []
+        for i in range(1, 4):
+            r = _success(f"vielz{i:03d}")
+            results.append(r)
+            await progress(i, 3, r)
+        return BatchSummary(
+            primary=primary,
+            base="vielz",
+            requested=3,
+            domain="proton.me",
+            results=results,
+        )
+
+    with patch.object(bot_mod.address_generator, "run_batch", _fake_run_batch):
+        await bot_mod._run_genaddr_background(
+            context,  # type: ignore[arg-type]
+            chat_id=99,
+            primary=primary,
+            base="vielz",
+            count=3,
+            domain="proton.me",
+            cancel_event=__import__("asyncio").Event(),
+            browser_handle={},
+            proxy_provider=None,
+        )
+
+    summary_calls = [
+        (text, kw)
+        for text, kw in context.application.bot.calls
+        if "/genaddr selesai" in text
+    ]
+    assert len(summary_calls) == 1
+    _, summary_kw = summary_calls[0]
+    markup = summary_kw.get("reply_markup")
+    assert markup is not None, "expected an InlineKeyboardMarkup on the summary"
+    # Single row, single button, callback wired to the existing
+    # CB_QUICK_HEALTHCHECK router with the primary id we just generated for.
+    assert len(markup.inline_keyboard) == 1
+    row = markup.inline_keyboard[0]
+    assert len(row) == 1
+    button = row[0]
+    assert "Cek hasil sekarang" in button.text
+    assert "3 alias" in button.text
+    assert button.callback_data == f"{bot_mod.CB_QUICK_HEALTHCHECK}:{primary.id}"
+
+
+async def test_final_summary_omits_cekimap_button_when_zero_aliases_created() -> None:
+    """When all addresses failed (or were duplicates), there is nothing
+    to validate yet — don't show a misleading "Cek hasil" button.
+    """
+    context = _FakeContext()
+    primary = _make_primary()
+
+    async def _fake_run_batch(**_kw: Any) -> BatchSummary:
+        return BatchSummary(
+            primary=primary,
+            base="vielz",
+            requested=2,
+            domain="proton.me",
+            # Both attempts failed: BatchSummary.created stays empty.
+            results=[
+                AddressCreationResult(
+                    local="vielz001",
+                    domain="proton.me",
+                    status=CreationStatus.ERROR,
+                ),
+                AddressCreationResult(
+                    local="vielz002",
+                    domain="proton.me",
+                    status=CreationStatus.ERROR,
+                ),
+            ],
+        )
+
+    with patch.object(bot_mod.address_generator, "run_batch", _fake_run_batch):
+        await bot_mod._run_genaddr_background(
+            context,  # type: ignore[arg-type]
+            chat_id=99,
+            primary=primary,
+            base="vielz",
+            count=2,
+            domain="proton.me",
+            cancel_event=__import__("asyncio").Event(),
+            browser_handle={},
+            proxy_provider=None,
+        )
+
+    summary_calls = [
+        (text, kw)
+        for text, kw in context.application.bot.calls
+        if "/genaddr selesai" in text
+    ]
+    assert len(summary_calls) == 1
+    _, summary_kw = summary_calls[0]
+    # ``reply_markup`` is either absent or explicitly None — never an
+    # empty keyboard, so the user doesn't see a dangling button.
+    assert summary_kw.get("reply_markup") is None
