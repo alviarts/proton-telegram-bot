@@ -911,7 +911,9 @@ async def _setup_tempmail_recovery(
                 LOGGER.warning("Proton web login did not complete; skipping recovery email change")
                 return tempmail  # Still return the tempmail for manual use
 
-            ok = await change_recovery_email(page, tempmail.address, tempmail, client)
+            ok = await change_recovery_email(
+                page, tempmail.address, proton_password, tempmail, client
+            )
             if ok:
                 await update.effective_message.reply_text(  # type: ignore[union-attr]
                     f"✅ Recovery email diubah ke <code>{html.escape(tempmail.address)}</code>",
