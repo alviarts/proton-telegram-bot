@@ -467,9 +467,21 @@ async def change_recovery_email(
     if toggle_clicked:
         await asyncio.sleep(2)
 
-    # Step 5: Click "Verifikasi" link
+    # Step 5: Click "Verifikasi" link.
+    #
+    # In the live recovery settings page this is rendered as a
+    # ``<button class="link" type="button" aria-label="Verify now this
+    # recovery email address: ...">Verifikasi</button>`` next to a
+    # ``"Alamat email belum diverifikasi."`` notice — NOT as an ``<a>``
+    # tag. Older versions of the page may have used an ``<a>``, so we
+    # try both. Anchor primary detection on the unique aria-label so
+    # we never accidentally match an unrelated button.
     verify_link = page.locator(
-        "a:has-text('Verifikasi'), a:has-text('Verify')"
+        "button[aria-label*='Verify now this recovery email' i], "
+        "button.link:has-text('Verifikasi'), "
+        "button.link:has-text('Verify'), "
+        "a:has-text('Verifikasi'), "
+        "a:has-text('Verify')"
     ).first
     try:
         await verify_link.wait_for(state="visible", timeout=10_000)
