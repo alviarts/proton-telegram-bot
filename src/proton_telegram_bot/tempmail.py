@@ -152,6 +152,12 @@ class TempMailbox:
                     msg_id = msg.get("id")
                     if not msg_id:
                         continue
+                    LOGGER.info(
+                        "saw candidate verification email id=%s from=%s subject=%r",
+                        msg_id,
+                        from_addr,
+                        msg.get("subject", ""),
+                    )
                     detail = await client.get(
                         f"{API_BASE}/messages/{msg_id}",
                         headers=headers,
@@ -160,14 +166,23 @@ class TempMailbox:
                     if detail.status_code != 200:
                         continue
                     body_data = detail.json()
-                    html_body = body_data.get("html", "") or ""
-                    text_body = body_data.get("text", "") or ""
+                    html_body = body_data.get("html") or ""
+                    text_body = body_data.get("text") or ""
                     link = _extract_verify_link(html_body) or _extract_verify_link(text_body)
                     if link:
                         LOGGER.info("verification link found: %s", link)
                         return link
+                    LOGGER.warning(
+                        "candidate email %s had no parsable verification link "
+                        "(html_type=%s text_type=%s html_len=%d text_len=%d)",
+                        msg_id,
+                        type(html_body).__name__,
+                        type(text_body).__name__,
+                        len(_coerce_text(html_body)),
+                        len(_coerce_text(text_body)),
+                    )
             except Exception:
-                LOGGER.debug("poll attempt %d failed", attempt, exc_info=True)
+                LOGGER.warning("poll attempt %d failed", attempt, exc_info=True)
             await asyncio.sleep(POLL_INTERVAL)
         LOGGER.warning("timed out waiting for verification link")
         return None
@@ -208,24 +223,45 @@ class TempMailbox:
         return False
 
 
-def _extract_code(text: str) -> str | None:
+def _coerce_text(value: object) -> str:
+    """Normalize a Mail.tm body field to a single string.
+
+    Mail.tm returns ``html`` (and occasionally ``text``) as a **list**
+    of multipart sections rather than a flat string, so feeding it
+    straight into ``re.search`` raises
+    ``TypeError: expected string or bytes-like object, got 'list'``.
+    Coerce list/None/anything-else into a usable string here so
+    callers don't have to.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list | tuple):
+        return "\n".join(_coerce_text(v) for v in value)
+    return str(value)
+
+
+def _extract_code(text: object) -> str | None:
     """Extract a 6-digit verification code from text."""
-    match = re.search(r"\b(\d{6})\b", text)
+    text_str = _coerce_text(text)
+    match = re.search(r"\b(\d{6})\b", text_str)
     return match.group(1) if match else None
 
 
-def _extract_verify_link(text: str) -> str | None:
+def _extract_verify_link(text: object) -> str | None:
     """Extract a Proton verification link from email text/HTML."""
+    text_str = _coerce_text(text)
     match = re.search(
         r'https?://account\.proton\.me/[^\s"\'<>]+verify[^\s"\'<>]*',
-        text,
+        text_str,
         re.IGNORECASE,
     )
     if match:
         return match.group(0)
     match = re.search(
         r'https?://[^\s"\'<>]*proton[^\s"\'<>]*verify[^\s"\'<>]*',
-        text,
+        text_str,
         re.IGNORECASE,
     )
     return match.group(0) if match else None
