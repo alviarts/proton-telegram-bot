@@ -63,6 +63,66 @@ def test_build_handlers_has_callback_query_router() -> None:
     assert any(isinstance(h, CallbackQueryHandler) for h in handlers)
 
 
+@pytest.mark.asyncio
+async def test_send_connect_log_passthrough_no_tracker() -> None:
+    """When ``tracker`` is None, :func:`_send_connect_log` must call
+    ``reply_text`` with the args verbatim and return the message
+    object — i.e. it degrades to a plain reply_text. No tracking.
+    """
+    from proton_telegram_bot.bot import _send_connect_log
+
+    sent: list[tuple[str, dict]] = []
+
+    class _FakeMessage:
+        message_id = 99
+
+        async def reply_text(self, text, **kw):
+            sent.append((text, kw))
+            return self
+
+    class _FakeUpdate:
+        effective_message = _FakeMessage()
+
+    msg = await _send_connect_log(
+        _FakeUpdate(),  # type: ignore[arg-type]
+        None,
+        "hi",
+        parse_mode="HTML",
+    )
+    assert msg is _FakeUpdate.effective_message
+    assert sent == [("hi", {"parse_mode": "HTML"})]
+
+
+@pytest.mark.asyncio
+async def test_send_connect_log_tracks_when_tracker_given() -> None:
+    """With a tracker, :func:`_send_connect_log` must register the
+    returned message id so the cleanup task knows to delete it.
+    """
+    from proton_telegram_bot.bot import _send_connect_log
+    from proton_telegram_bot.task_message_tracker import TaskMessageTracker
+
+    class _FakeBot:
+        async def delete_message(self, *, chat_id, message_id):
+            pass
+
+    class _FakeMessage:
+        message_id = 1234
+
+        async def reply_text(self, text, **kw):
+            return self
+
+    class _FakeUpdate:
+        effective_message = _FakeMessage()
+
+    tracker = TaskMessageTracker(_FakeBot(), chat_id=42)
+    await _send_connect_log(
+        _FakeUpdate(),  # type: ignore[arg-type]
+        tracker,
+        "log line",
+    )
+    assert len(tracker) == 1
+
+
 def test_resolve_connect_email_appends_default_domain() -> None:
     """When the user types just a username (no @), :func:`_resolve_connect_email`
     must auto-suffix ``@proton.me`` and flag that the suffix happened.
