@@ -898,10 +898,52 @@ async def _setup_tempmail_recovery(
             # Log into Proton web and detect user_index
             user_index = await _login_proton(page, email, proton_password)
             if user_index is None:
-                LOGGER.warning("Proton web login failed; skipping recovery email change")
-                await update.effective_message.reply_text(  # type: ignore[union-attr]
-                    "⚠️ Login Proton web gagal. Lanjut tanpa ganti recovery email.",
+                failure = getattr(_login_proton, "last_failure", {}) or {}
+                blocker = failure.get("blocker", "unknown")
+                screenshot = failure.get("screenshot")
+                LOGGER.warning(
+                    "Proton web login failed (blocker=%s, url=%s); skipping recovery email change",
+                    blocker,
+                    failure.get("url"),
                 )
+                blocker_msg = {
+                    "2fa": (
+                        "Akun Proton ini punya <b>2FA aktif</b> — bot belum "
+                        "mendukung input kode 2FA. Matikan 2FA sementara di "
+                        "<code>account.proton.me/u/0/account-password/two-factor-authentication</code> "
+                        "atau /cancel."
+                    ),
+                    "captcha": (
+                        "Proton menampilkan <b>CAPTCHA / human verification</b>. "
+                        "Lihat screenshot di bawah, lalu coba lagi setelah "
+                        "beberapa menit (Proton mungkin rate-limit IP VPS)."
+                    ),
+                    "bad_credentials": (
+                        "Proton menolak password — pastikan ini password "
+                        "akun Proton (yang kamu pakai login di proton.me), "
+                        "bukan password Bridge."
+                    ),
+                    "unlock": (
+                        "Proton meminta verifikasi tambahan untuk membuka kunci "
+                        "akun. Buka akun di browser sendiri sekali, selesaikan "
+                        "verifikasinya, lalu /connect lagi."
+                    ),
+                }.get(blocker, "Proton tidak redirect ke dashboard dalam 60 detik.")
+                await update.effective_message.reply_text(  # type: ignore[union-attr]
+                    f"⚠️ Login Proton web gagal (<i>{blocker}</i>). {blocker_msg}\n\n"
+                    "Lanjut tanpa ganti recovery email — Bridge add-account akan "
+                    "lanjut, tapi kemungkinan akan minta verifikasi manual.",
+                    parse_mode=ParseMode.HTML,
+                )
+                if screenshot:
+                    try:
+                        with open(screenshot, "rb") as fh:
+                            await update.effective_message.reply_photo(  # type: ignore[union-attr]
+                                photo=fh,
+                                caption=f"Screenshot saat login gagal ({blocker})",
+                            )
+                    except Exception as exc:
+                        LOGGER.debug("could not send login-failure screenshot: %s", exc)
                 return tempmail
 
             # Change recovery email and get verification link
