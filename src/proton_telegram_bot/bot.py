@@ -126,6 +126,14 @@ CB_QUICK_HEALTHCHECK = "qhc"
 # the scrape moves through its phases.
 CB_SYNC_PRIMARY = "syncp"
 
+# Soft target for total aliases per primary. After /cekimap or after
+# the per-primary "🔄 Sync" button finishes, if the alias count for
+# that primary is below this number the bot offers a one-tap "✨
+# Tambah N alamat lagi" button that drives /genaddr in random-suffix
+# mode to top the account up. 21 matches the typical "20 alias + 1
+# primary" shape we've been seeing across the test accounts.
+ALIAS_TARGET_PER_PRIMARY = 21
+
 
 def _is_allowed(settings: Settings, user_id: int | None) -> bool:
     if not settings.allowed_user_ids:
@@ -1969,18 +1977,92 @@ def _launch_health_check_task(
     # Drop already-finished tasks to keep the list bounded.
     task_list[:] = [t for t in task_list if not t.done()]
 
+    async def _run_then_offer_topup() -> None:
+        """Run /cekimap and, when it finishes, offer to top the
+        primary up to the soft alias target if it's still under.
+        """
+        try:
+            await run_health_check(
+                bot=bot,
+                chat_id=chat_id,
+                db=db,
+                bridge_admin=bridge_admin,
+                primary=primary,
+                targets=targets,
+            )
+        finally:
+            try:
+                aliases = await db.list_aliases(
+                    chat_id, primary_id=primary.id
+                )
+                await _maybe_offer_alias_topup(
+                    bot,
+                    chat_id=chat_id,
+                    primary=primary,
+                    current_count=len(aliases),
+                )
+            except Exception:
+                LOGGER.debug(
+                    "post-cekimap topup offer failed", exc_info=True
+                )
+
     task = asyncio.create_task(
-        run_health_check(
-            bot=bot,
-            chat_id=chat_id,
-            db=db,
-            bridge_admin=bridge_admin,
-            primary=primary,
-            targets=targets,
-        ),
+        _run_then_offer_topup(),
         name=f"healthcheck-{primary.id}",
     )
     task_list.append(task)
+
+
+async def _maybe_offer_alias_topup(
+    bot: Any,
+    *,
+    chat_id: int,
+    primary: PrimaryAccount,
+    current_count: int,
+    target: int = ALIAS_TARGET_PER_PRIMARY,
+) -> None:
+    """If the primary has fewer than ``target`` aliases, post a
+    follow-up message with a one-tap "✨ Tambah N alamat lagi"
+    button that fires /genaddr in random-suffix mode to top up.
+
+    Best-effort: any send/encode failure is swallowed because this
+    is a UX nicety on top of the real summary message — losing it
+    must never make the underlying flow look broken.
+    """
+    missing = target - current_count
+    if missing <= 0:
+        return
+    try:
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        f"✨ Tambah {missing} alamat lagi",
+                        callback_data=(
+                            f"{CB_QUICK_GENADDR}:{primary.id}:{missing}"
+                        ),
+                    )
+                ]
+            ]
+        )
+        await bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"💡 Akun <b>{html.escape(primary.email)}</b> baru "
+                f"punya <b>{current_count}</b> alias dari target "
+                f"<b>{target}</b>. Mau langsung tambah "
+                f"<b>{missing}</b> alamat sekaligus?"
+            ),
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+        )
+    except Exception:
+        LOGGER.debug(
+            "topup suggestion send failed (chat=%s primary=%s)",
+            chat_id,
+            primary.id,
+            exc_info=True,
+        )
 
 
 async def _start_sync_for_primary(
@@ -2138,6 +2220,20 @@ async def _run_sync_for_primary_background(
             parse_mode=ParseMode.HTML,
         )
         await status.done(f"✅ {inserted} alias baru ditambahkan")
+
+        # Offer to top the primary up to the soft target so the user
+        # doesn't have to compute "current vs target" manually. The
+        # button delegates to the existing CB_QUICK_GENADDR path so
+        # /genaddr's random-suffix mode + concurrency guard apply.
+        # ``alias_addresses`` already excludes the primary's own
+        # email, so after the UPSERT it equals the alias count we
+        # have on file for this primary.
+        await _maybe_offer_alias_topup(
+            bot,
+            chat_id=chat_id,
+            primary=primary,
+            current_count=len(alias_addresses),
+        )
     except Exception as exc:
         LOGGER.exception("sync: background task crashed")
         try:
