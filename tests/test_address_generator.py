@@ -313,12 +313,21 @@ async def test_error_keeps_going_until_target_successes(
     assert await db.get_generator_state(chat_id, primary.id, "vielz") == GenState("", 5)
 
 
-async def test_safety_cap_aborts_when_too_many_failures(
+async def test_consecutive_failure_cap_aborts_when_all_fail(
     db_and_primary, cipher: CredentialCipher
 ) -> None:
-    """If 3*count attempts fail to produce N successes, bail out cleanly."""
+    """If too many attempts fail in a row with no success between them, bail
+    out before exhausting ``max_attempts``.
+
+    Previously the orchestrator would burn the full ``3*count`` cap (12
+    attempts at count=2) even when every single attempt failed, which made
+    the bot look stuck for a full minute when an account was actually full.
+    The consecutive-failure cap (4) detects "structurally broken" runs and
+    stops early so the user gets a clear summary fast.
+    """
     db, chat_id, primary = db_and_primary
-    # All ERROR -- never reaches success target.
+    # All ERROR -- never reaches success target. Provide more than enough
+    # statuses so the iterator never runs out before the cap fires.
     _, factory = _factory([CreationStatus.ERROR] * 30)
 
     summary = await run_batch(
@@ -332,12 +341,47 @@ async def test_safety_cap_aborts_when_too_many_failures(
         browser_factory=factory,
     )
 
-    # count=2, max_attempts = max(2*3, 2+10) = 12 -- so we stop after 12
-    # attempts even though all failed.
+    # consecutive_failure_cap = 4 -> stop after 4 failures in a row.
     assert len(summary.created) == 0
-    assert len(summary.failed) == 12
+    assert len(summary.failed) == 4
     assert summary.aborted_reason is not None
-    assert "safety cap" in summary.aborted_reason
+    assert "berturut-turut" in summary.aborted_reason
+
+
+async def test_consecutive_failure_counter_resets_on_success(
+    db_and_primary, cipher: CredentialCipher
+) -> None:
+    """A success resets the consecutive-failure counter so an interleaved
+    pattern of fail/success/fail does not trigger the early bail-out."""
+    db, chat_id, primary = db_and_primary
+    _, factory = _factory(
+        [
+            CreationStatus.ERROR,
+            CreationStatus.ERROR,
+            CreationStatus.ERROR,
+            CreationStatus.SUCCESS,  # resets the counter
+            CreationStatus.ERROR,
+            CreationStatus.ERROR,
+            CreationStatus.ERROR,
+            CreationStatus.SUCCESS,  # resets again
+            CreationStatus.SUCCESS,
+        ]
+    )
+
+    summary = await run_batch(
+        db=db,
+        cipher=cipher,
+        chat_id=chat_id,
+        primary=primary,
+        base="vielz",
+        count=3,
+        domain="proton.me",
+        browser_factory=factory,
+    )
+
+    # All 3 successes obtained despite 6 total failures interleaved.
+    assert len(summary.created) == 3
+    assert summary.aborted_reason is None
 
 
 async def test_limit_reached_aborts_batch(db_and_primary, cipher: CredentialCipher) -> None:
@@ -639,3 +683,36 @@ async def test_browser_handle_cleared_on_normal_completion(
     )
 
     assert "browser" not in handle
+
+
+async def test_cancel_event_set_before_first_attempt_skips_loop(
+    db_and_primary, cipher: CredentialCipher
+) -> None:
+    """If ``cancel_event`` is already set when the browser session opens
+    (i.e. the user clicked Cancel during the login phase), the orchestrator
+    must bail out cleanly without making a single ``create_address`` call.
+
+    Previously the cancel check only ran inside the per-iteration loop, so
+    a Cancel click during ``Menyiapkan browser & login`` would still cause
+    one wasted attempt before the loop noticed.
+    """
+    db, chat_id, primary = db_and_primary
+    fake, factory = _factory([CreationStatus.SUCCESS] * 5)
+    cancel = asyncio.Event()
+    cancel.set()  # already cancelled before run_batch is awaited
+
+    summary = await run_batch(
+        db=db,
+        cipher=cipher,
+        chat_id=chat_id,
+        primary=primary,
+        base="vielz",
+        count=5,
+        domain="proton.me",
+        browser_factory=factory,
+        cancel_event=cancel,
+    )
+
+    assert fake.calls == []
+    assert summary.results == []
+    assert summary.aborted_reason == "cancelled by user"

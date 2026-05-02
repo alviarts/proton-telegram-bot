@@ -135,6 +135,16 @@ async def run_batch(
             return _default_browser_factory(
                 email, password, proxy_provider=proxy_provider
             )
+    # Stop early if the modal returns this many non-success results in a
+    # row without any success in between. This catches "account is full"
+    # cases where Proton's error toast doesn't classify as LIMIT_REACHED
+    # (e.g. it's localised: "Anda sudah mencapai jumlah maksimum alamat")
+    # and we'd otherwise burn the entire ``max_attempts`` cap producing
+    # the exact same error N times. Tuned to a small number because there
+    # is no realistic flow where 4 consecutive attempts genuinely fail
+    # for transient reasons but the next one succeeds.
+    consecutive_failure_cap = 4
+
     try:
         async with factory(primary.email, password) as browser:
             # Expose the live browser to the caller so the bot's Cancel button
@@ -142,8 +152,17 @@ async def run_batch(
             # without waiting for the Playwright timeout to fire.
             if browser_handle is not None:
                 browser_handle["browser"] = browser
+            # The user may have clicked Cancel during the login phase,
+            # before we ever entered this ``async with``. Set the event
+            # here so ``async with`` exits cleanly via the context
+            # manager's ``__aexit__`` instead of forcing the caller to
+            # wait for the first attempt to start.
+            if cancel_event is not None and cancel_event.is_set():
+                summary.aborted_reason = "cancelled by user"
+                return summary
             successes = 0
             attempts = 0
+            consecutive_failures = 0
             name_iter = iter_names(base, state)
             while successes < count and attempts < max_attempts:
                 if cancel_event is not None and cancel_event.is_set():
@@ -199,11 +218,14 @@ async def run_batch(
                 summary.results.append(result)
                 if result.status is CreationStatus.SUCCESS:
                     successes += 1
+                    consecutive_failures = 0
                     await db.add_aliases(
                         chat_id=chat_id,
                         emails=[result.email],
                         primary_id=primary.id,
                     )
+                else:
+                    consecutive_failures += 1
                 if progress is not None:
                     # Progress callback signature stays (current, target, result)
                     # but ``current`` is now successes-so-far so the user sees
@@ -222,6 +244,19 @@ async def run_batch(
                     # burns more retries.
                     summary.aborted_reason = (
                         "Proton rejected credentials mid-batch"
+                    )
+                    break
+                if consecutive_failures >= consecutive_failure_cap:
+                    # Many consecutive failures with no success in between
+                    # is a strong signal that something structural is wrong
+                    # (account full, password rejected at modal, Proton
+                    # localised the limit-reached toast, etc.). Bail out
+                    # so the user sees a clear summary instead of the bot
+                    # silently grinding through ``max_attempts`` retries.
+                    summary.aborted_reason = (
+                        f"berhenti otomatis: {consecutive_failures} percobaan "
+                        "gagal berturut-turut tanpa sukses (kemungkinan akun "
+                        "sudah penuh / limit alamat tercapai)"
                     )
                     break
 

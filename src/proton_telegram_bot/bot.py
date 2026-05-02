@@ -2160,22 +2160,43 @@ async def cmd_genaddr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             # matters.
             LOGGER.debug("genaddr progress edit failed", exc_info=True)
 
+    # Run the orchestrator inside an explicit ``Task`` so the Cancel
+    # button can ``task.cancel()`` even while we're still inside the
+    # login phase (before ``browser_handle`` is populated and
+    # ``force_close`` is reachable). Without this, clicking Cancel
+    # during "Menyiapkan browser & login" simply sets the event and
+    # waits for login to finish on its own — which can take up to
+    # ``LOGIN_OUTCOME_TIMEOUT_MS`` (90s) and looks frozen to the user.
+    genaddr_task: asyncio.Task[address_generator.BatchSummary] = asyncio.create_task(
+        address_generator.run_batch(
+            db=db,
+            cipher=cipher,
+            chat_id=chat.id,
+            primary=primary,
+            base=base,
+            count=count,
+            domain=domain,
+            browser_factory=context.application.bot_data.get("browser_factory"),
+            progress=_on_progress,
+            cancel_event=cancel_event,
+            browser_handle=browser_handle,
+            proxy_provider=proxy_provider,
+        )
+    )
+    context.chat_data["genaddr_task"] = genaddr_task
+
+    summary: address_generator.BatchSummary | None = None
+    cancelled_by_user = False
     try:
         try:
-            summary = await address_generator.run_batch(
-                db=db,
-                cipher=cipher,
-                chat_id=chat.id,
-                primary=primary,
-                base=base,
-                count=count,
-                domain=domain,
-                browser_factory=context.application.bot_data.get("browser_factory"),
-                progress=_on_progress,
-                cancel_event=cancel_event,
-                browser_handle=browser_handle,
-                proxy_provider=proxy_provider,
-            )
+            summary = await genaddr_task
+        except asyncio.CancelledError:
+            # The Cancel button cancelled the task directly (login phase
+            # path). The callback already edited ``progress_message`` to
+            # the "berhasil dibatalkan" final state, so we just clean up
+            # and return without writing another summary.
+            cancelled_by_user = True
+            return
         except address_generator.AddressGenerationError as exc:
             await progress_message.edit_text(
                 f"❌ Tidak bisa mulai: {html.escape(str(exc))}\n\n"
@@ -2201,6 +2222,41 @@ async def cmd_genaddr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         context.chat_data.pop("genaddr_cancel_event", None)
         context.chat_data.pop("genaddr_browser_handle", None)
         context.chat_data.pop("genaddr_force_close_task", None)
+        context.chat_data.pop("genaddr_task", None)
+
+    if cancelled_by_user or summary is None:
+        # The Cancel button already wrote the final user-facing message
+        # ("Berhasil dibatalkan! Silakan mulai /start lagi."); skip the
+        # normal summary so we don't overwrite it with a misleading
+        # "Selesai" line that hides what just happened.
+        return
+
+    if cancel_event.is_set():
+        # Cooperative cancellation path: the loop noticed ``cancel_event``
+        # between iterations and exited cleanly with a partial summary.
+        # Surface the cancellation as the primary user-facing outcome
+        # (with whatever was created in the meantime) instead of a
+        # neutral "Selesai" line.
+        cancel_lines = [
+            "✅ <b>Berhasil dibatalkan.</b> Silakan mulai /start lagi.",
+        ]
+        if summary.created:
+            cancel_sample = ", ".join(r.email for r in summary.created[:5])
+            cancel_more = (
+                ""
+                if len(summary.created) <= 5
+                else f" (+{len(summary.created) - 5} lagi)"
+            )
+            cancel_lines.append(
+                f"Sebelum dibatalkan, <b>{len(summary.created)}</b> alamat "
+                f"sudah dibuat: <code>{html.escape(cancel_sample)}</code>{cancel_more}"
+            )
+        await progress_message.edit_text(
+            "\n".join(cancel_lines),
+            parse_mode=ParseMode.HTML,
+            reply_markup=None,
+        )
+        return
 
     final_lines = [
         f"✅ Selesai. Sukses: <b>{len(summary.created)}</b>, "
@@ -2233,12 +2289,19 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     query = update.callback_query
     if query is None or query.data is None:
         return
-    await query.answer()
+    data = query.data
+    # ``query.answer()`` may only be called once per callback. Defer it
+    # for ``CB_GENADDR_CANCEL`` so its handler can pass a custom toast
+    # ("Membatalkan...") instead of the silent default -- previously the
+    # generic answer here ate the only allowed answer slot, and the
+    # later ``query.answer("Membatalkan...")`` raised ``BadRequest:
+    # Query is too old`` and the user saw no feedback at all.
+    if data != CB_GENADDR_CANCEL:
+        await query.answer()
     chat_id = query.message.chat_id if query.message else None
     if chat_id is None:
         return
     db = _bot_db(context)
-    data = query.data
     if data == CB_NOOP:
         return
     if data == CB_GENADDR_CANCEL:
@@ -2252,7 +2315,36 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             except Exception:
                 pass
             return
+        # Acknowledge the click *first* with a short toast so Telegram
+        # stops the spinner on the button immediately. Everything that
+        # follows is best-effort and may take a moment.
+        try:
+            await query.answer("Membatalkan...")
+        except Exception:
+            LOGGER.debug("genaddr cancel: query.answer failed", exc_info=True)
         cancel_event.set()
+        # Edit the progress message into its terminal cancellation state
+        # right now. Doing this before force-close / task-cancel guarantees
+        # the user sees "Berhasil dibatalkan" even if the cleanup tasks
+        # below take a moment to wind down a wedged Playwright session.
+        try:
+            await query.edit_message_text(
+                "✅ <b>Berhasil dibatalkan.</b>\n\n"
+                "Silakan mulai /start lagi.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=None,
+            )
+        except Exception:
+            # Telegram rejects identical edits and rate-limits frequent ones.
+            # Fall back to just dropping the keyboard so the button is
+            # at least disabled.
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                LOGGER.debug(
+                    "genaddr cancel: failed to edit progress message",
+                    exc_info=True,
+                )
         # Force-close the live browser so any in-flight Playwright await
         # (``page.click``, ``wait_for_url``, …) raises ``TargetClosedError``
         # right now instead of running the rest of its 60s timeout.
@@ -2273,14 +2365,20 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             context.chat_data["genaddr_force_close_task"] = asyncio.create_task(
                 _safe_force_close(force_close)
             )
-        await query.answer("Membatalkan & menutup browser...")
-        try:
-            # Disable the button immediately so the user knows their click
-            # registered. The progress edits will still come in until the
-            # in-flight create_address resolves.
-            await query.edit_message_reply_markup(reply_markup=None)
-        except Exception:
-            pass
+        else:
+            # No browser yet -- we're still in the login phase, so
+            # ``force_close`` won't help. Cancelling the orchestrator task
+            # propagates ``CancelledError`` through whatever Playwright /
+            # network call is in flight (typically ``wait_for_url`` during
+            # login), which is the only reliable way to abort during
+            # ``Menyiapkan browser & login`` without waiting for the 90s
+            # ``LOGIN_OUTCOME_TIMEOUT_MS`` to elapse.
+            genaddr_task = context.chat_data.get("genaddr_task")
+            if (
+                isinstance(genaddr_task, asyncio.Task)
+                and not genaddr_task.done()
+            ):
+                genaddr_task.cancel()
         return
     if data == CB_REFRESH or data == CB_BACK_TO_PRIMARIES:
         primaries = await db.list_primary_accounts(chat_id)
