@@ -8,6 +8,7 @@ from telegram import BotCommand
 from telegram.ext import Application, ApplicationBuilder
 
 from .bot import TelegramNotifier, build_handlers
+from .bridge_admin import BridgeAdmin
 from .config import Settings, load_settings
 from .crypto import CredentialCipher
 from .db import Database
@@ -80,6 +81,7 @@ def _build_application(settings: Settings) -> Application:
     application.bot_data["db"] = db
     application.bot_data["cipher"] = cipher
     application.bot_data["manager"] = manager
+    application.bot_data["bridge_admin"] = BridgeAdmin(settings)
     # Optional Proton-bound proxy rotation. ``from_env`` returns ``None`` when
     # ``PROTON_USE_PROXY=0`` so deployments can disable it without touching code.
     proxy_provider = ProxyProvider.from_env()
