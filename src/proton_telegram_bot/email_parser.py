@@ -6,12 +6,25 @@ from email import message_from_bytes
 from email.header import decode_header, make_header
 from email.message import Message
 from email.utils import getaddresses
+from html import escape as html_escape
 from html import unescape
 from html.parser import HTMLParser
 from typing import ClassVar
 
 RECIPIENT_HEADERS = ("Delivered-To", "X-Original-To", "To", "Cc", "Bcc")
 MAX_BODY_PREVIEW_CHARS = 1500
+
+# Match a 4-8 digit code that stands alone (surrounded by non-digit / boundary).
+# Telegram's HTML parser will render ``<code>...</code>`` as tap-to-copy on
+# mobile. We deliberately match BOTH the raw digit run and explicit "code: NNN"
+# / "kode: NNN" framings so the bot doesn't miss OTPs sandwiched between
+# punctuation (".", ":", etc.).
+_OTP_RE = re.compile(r"(?<![\w\d])(\d{4,8})(?![\w\d])")
+# Match URLs (http/https). We use this to *skip* OTP wrapping inside URLs:
+# if a 6-digit token shows up in a query string we must NOT inject ``<code>``
+# around it because Telegram won't auto-link a URL that's been interrupted
+# by HTML tags.
+_URL_RE = re.compile(r"https?://[^\s<>\"']+")
 
 
 class _HTMLToText(HTMLParser):
@@ -168,3 +181,59 @@ def summarize(message: Message, max_chars: int = MAX_BODY_PREVIEW_CHARS) -> dict
         "date": date,
         "body": body,
     }
+
+
+def collapse_blank_lines(text: str) -> str:
+    """Collapse runs of 2+ blank lines into a single blank line.
+
+    Forwarded emails often arrive with huge vertical gaps (HTML→text
+    conversion + signature padding). Telegram doesn't render extra blank
+    space well on mobile, so we cap at one blank line between paragraphs.
+    Returns ``text`` with trailing whitespace stripped per-line and at
+    most ``\\n\\n`` between non-empty paragraphs.
+    """
+    if not text:
+        return text
+    # Strip trailing spaces per line so " \n" doesn't read as content.
+    cleaned = "\n".join(line.rstrip() for line in text.splitlines())
+    # Collapse 3+ consecutive newlines down to 2 (one blank line).
+    return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+
+
+def format_body_html(body: str) -> str:
+    """Render an email body as Telegram-safe HTML.
+
+    * HTML-escapes everything (so user content can never inject markup).
+    * Re-injects ``<code>...</code>`` around standalone 4-8 digit OTPs
+      so Telegram mobile users can tap-to-copy.
+    * Leaves URLs intact — Telegram auto-links bare URLs in HTML
+      messages as long as the URL itself isn't broken across tags or
+      mid-character.
+    * Caps consecutive blank lines at one.
+
+    Returns a string ready to embed directly inside a Telegram HTML
+    message. Callers must NOT wrap the result in ``<pre>`` (that would
+    disable URL auto-linking).
+    """
+    if not body:
+        return ""
+    collapsed = collapse_blank_lines(body)
+
+    def _wrap_outside_urls(piece: str) -> str:
+        return _OTP_RE.sub(r"<code>\1</code>", html_escape(piece, quote=False))
+
+    # Walk the body in two regions: URL spans (escape only, no OTP wrap) and
+    # everything else (escape + OTP wrap). Splitting before HTML escape
+    # keeps the regex's byte offsets stable; html.escape never affects
+    # digits so the OTP regex is safe to run on the escaped output.
+    parts: list[str] = []
+    cursor = 0
+    for match in _URL_RE.finditer(collapsed):
+        start, end = match.span()
+        if cursor < start:
+            parts.append(_wrap_outside_urls(collapsed[cursor:start]))
+        parts.append(html_escape(collapsed[start:end], quote=False))
+        cursor = end
+    if cursor < len(collapsed):
+        parts.append(_wrap_outside_urls(collapsed[cursor:]))
+    return "".join(parts)
