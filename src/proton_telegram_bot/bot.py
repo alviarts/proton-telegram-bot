@@ -199,17 +199,23 @@ def _build_primary_keyboard(
             count = (alias_counts or {}).get(primary.id, 0)
             marker = "🔒 " if active_primary_id == primary.id else "📧 "
             label = f"{marker}{primary.email} ({count} alias)"
+            # Email button on its own row so the "(N alias)" count
+            # never gets truncated by the Telegram client when the
+            # row has to share width with another button.
             rows.append(
                 [
                     InlineKeyboardButton(
                         label,
                         callback_data=f"{CB_PICK_PRIMARY}:{primary.id}",
                     ),
-                    # Per-primary "Sync alias from Proton" trigger.
-                    # Sits on the same row as the email so the
-                    # keyboard stays compact even with 5+ accounts.
+                ]
+            )
+            # Per-primary "Sync alias from Proton" trigger on the
+            # next row. Full-width so the icon + label read clearly.
+            rows.append(
+                [
                     InlineKeyboardButton(
-                        "🔄 Sync",
+                        f"🔄 Sync alias {primary.email}",
                         callback_data=f"{CB_SYNC_PRIMARY}:{primary.id}",
                     ),
                 ]
