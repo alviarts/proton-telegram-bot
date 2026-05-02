@@ -169,6 +169,19 @@ CB_POLL_NOW = "poll_now"
 # can one-click copy without scrolling back through chat history. The
 # alias header itself is also wrapped in ``<code>`` for mobile tap-copy.
 CB_COPY_ACTIVE_EMAIL = "copyactive"
+# Pagination across the two-level keyboard (primary list and alias
+# drill-down). Format:
+#   * primary list page:  ``ppg:<page>``
+#   * alias drill-down:   ``apg:<primary_id>:<page>``
+# Page indices are 0-based. Both stay well under Telegram's 64-byte
+# callback_data limit since they're just small ints.
+CB_PRIMARY_PAGE = "ppg"
+CB_ALIAS_PAGE = "apg"
+# Rows per page on both keyboards. The user asked for "4 baris per
+# halaman" so /list scrolls smoothly on phones without becoming a wall
+# of buttons. Tweak in one place if the UX team ever wants a different
+# default.
+LIST_PAGE_SIZE = 4
 # Two-level primary/alias UI:
 CB_PICK_PRIMARY = "pickp"
 CB_BACK_TO_PRIMARIES = "backp"
@@ -256,6 +269,65 @@ def _bot_bridge_admin(
     return cast(BridgeAdmin, admin)
 
 
+def _paginate_slice(items: list, page: int, page_size: int) -> tuple[list, int, int]:
+    """Slice ``items`` for the requested ``page`` and return navigation context.
+
+    Returns ``(window, page, total_pages)`` where ``window`` is the
+    sublist for the page (clamped into bounds), ``page`` is the
+    normalised page index (negative or out-of-range pages collapse to
+    the nearest valid edge), and ``total_pages`` is at least 1 even for
+    an empty list (so the caller can still render a stable "Page 1/1"
+    label without special-casing).
+    """
+    if page_size <= 0:
+        return items, 0, 1
+    total_pages = max(1, (len(items) + page_size - 1) // page_size)
+    page = max(0, min(page, total_pages - 1))
+    start = page * page_size
+    return items[start : start + page_size], page, total_pages
+
+
+def _build_pagination_row(
+    callback_prefix: str,
+    page: int,
+    total_pages: int,
+) -> list[InlineKeyboardButton] | None:
+    """Build a single ``◀ Prev | Page X/Y | Next ▶`` row, or ``None`` if
+    there's only one page.
+
+    ``callback_prefix`` is the full prefix the row's Prev/Next buttons
+    should encode. For the primary list it's ``"ppg"``; for an alias
+    drill-down it's ``f"apg:{primary_id}"``. Both stay under Telegram's
+    64-byte callback_data ceiling because the suffix is just a small
+    integer.
+
+    The Page-N/M label is wired to ``CB_NOOP`` so tapping it doesn't
+    do anything (the swallow-and-toast path in ``on_callback`` handles
+    the dismissal).
+    """
+    if total_pages <= 1:
+        return None
+    row: list[InlineKeyboardButton] = []
+    if page > 0:
+        row.append(
+            InlineKeyboardButton(
+                "◀ Prev", callback_data=f"{callback_prefix}:{page - 1}"
+            )
+        )
+    row.append(
+        InlineKeyboardButton(
+            f"Page {page + 1}/{total_pages}", callback_data=CB_NOOP
+        )
+    )
+    if page < total_pages - 1:
+        row.append(
+            InlineKeyboardButton(
+                "Next ▶", callback_data=f"{callback_prefix}:{page + 1}"
+            )
+        )
+    return row
+
+
 def _build_primary_keyboard(
     primaries: list[PrimaryAccount],
     alias_counts: dict[int, int] | None = None,
@@ -263,6 +335,8 @@ def _build_primary_keyboard(
     healthcheck_stats: dict[int, tuple[int, int]] | None = None,
     *,
     with_copy_active_button: bool = False,
+    page: int = 0,
+    page_size: int = LIST_PAGE_SIZE,
 ) -> InlineKeyboardMarkup:
     """Top-level keyboard listing every Proton account a user owns.
 
@@ -283,7 +357,8 @@ def _build_primary_keyboard(
             [InlineKeyboardButton("(belum ada email utama)", callback_data=CB_NOOP)]
         )
     else:
-        for primary in primaries:
+        window, page, total_pages = _paginate_slice(primaries, page, page_size)
+        for primary in window:
             count = (alias_counts or {}).get(primary.id, 0)
             marker = "🔒 " if active_primary_id == primary.id else "📧 "
             stats = (healthcheck_stats or {}).get(primary.id)
@@ -312,6 +387,11 @@ def _build_primary_keyboard(
                     ),
                 ]
             )
+        # Pagination row sits directly under the per-primary rows so the
+        # Prev/Next controls feel attached to the list they navigate.
+        nav = _build_pagination_row(CB_PRIMARY_PAGE, page, total_pages)
+        if nav is not None:
+            rows.append(nav)
     if with_copy_active_button:
         rows.append(
             [
@@ -337,15 +417,27 @@ def _build_alias_keyboard_for_primary(
     primary: PrimaryAccount,
     aliases: list[AliasRecord],
     active_alias_id: int | None = None,
+    *,
+    page: int = 0,
+    page_size: int = LIST_PAGE_SIZE,
 ) -> InlineKeyboardMarkup:
-    """Drill-down keyboard showing aliases owned by a single primary."""
+    """Drill-down keyboard showing aliases owned by a single primary.
+
+    ``page`` / ``page_size`` slice the visible aliases so a primary
+    with hundreds of generated addresses doesn't overflow the
+    keyboard. Both default to the standard ``LIST_PAGE_SIZE`` (4 rows
+    per page). The Prev/Next callback embeds the primary id so the
+    callback handler can re-render the same drill-down without
+    needing chat-state.
+    """
     rows: list[list[InlineKeyboardButton]] = []
     if not aliases:
         rows.append(
             [InlineKeyboardButton("(belum ada alias)", callback_data=CB_NOOP)]
         )
     else:
-        for alias in aliases:
+        window, page, total_pages = _paginate_slice(aliases, page, page_size)
+        for alias in window:
             # callback_data must be ≤ 64 bytes (Telegram API), so we use the
             # alias's numeric id rather than the email address itself.
             label = alias.email
@@ -358,6 +450,11 @@ def _build_alias_keyboard_for_primary(
                     )
                 ]
             )
+        nav = _build_pagination_row(
+            f"{CB_ALIAS_PAGE}:{primary.id}", page, total_pages
+        )
+        if nav is not None:
+            rows.append(nav)
     rows.append(
         [
             InlineKeyboardButton(
@@ -3644,10 +3741,64 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     counts,
                     active.primary_id if active else None,
                     healthcheck_stats=healthcheck_stats,
+                    with_copy_active_button=active is not None,
                 )
             )
         except Exception:
             pass
+        return
+    if data.startswith(f"{CB_PRIMARY_PAGE}:"):
+        # Top-level primary list pagination. ``ppg:<page>`` re-renders the
+        # same /list keyboard at the requested page; the message text
+        # itself stays as-is (page count fits in the keyboard footer).
+        try:
+            page = int(data.split(":", 1)[1])
+        except ValueError:
+            return
+        primaries = await db.list_primary_accounts(chat_id)
+        counts = await _alias_count_per_primary(db, chat_id, primaries)
+        healthcheck_stats = await db.get_last_healthcheck_stats(chat_id)
+        active = await db.get_active_alias(chat_id)
+        with contextlib.suppress(BadRequest, Exception):
+            await query.edit_message_reply_markup(
+                reply_markup=_build_primary_keyboard(
+                    primaries,
+                    counts,
+                    active.primary_id if active else None,
+                    healthcheck_stats=healthcheck_stats,
+                    with_copy_active_button=active is not None,
+                    page=page,
+                )
+            )
+        return
+    if data.startswith(f"{CB_ALIAS_PAGE}:"):
+        # Alias drill-down pagination. ``apg:<primary_id>:<page>`` swaps
+        # the visible window of aliases under a primary without changing
+        # the message text (which already shows ``N alias`` total).
+        rest = data.split(":", 2)
+        if len(rest) != 3:
+            return
+        try:
+            primary_id = int(rest[1])
+            page = int(rest[2])
+        except ValueError:
+            return
+        primary = await db.get_primary_account(chat_id, primary_id)
+        if primary is None:
+            return
+        aliases = await db.list_aliases(chat_id, primary_id=primary_id)
+        active = await db.get_active_alias(chat_id)
+        active_alias_id = (
+            active.id
+            if active is not None and active.primary_id == primary_id
+            else None
+        )
+        with contextlib.suppress(BadRequest, Exception):
+            await query.edit_message_reply_markup(
+                reply_markup=_build_alias_keyboard_for_primary(
+                    primary, aliases, active_alias_id, page=page
+                )
+            )
         return
     if data.startswith(f"{CB_PICK_PRIMARY}:"):
         raw_id = data.split(":", 1)[1]

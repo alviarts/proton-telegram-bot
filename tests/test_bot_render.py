@@ -252,3 +252,137 @@ def test_primary_keyboard_empty_state() -> None:
     flat = [b for row in markup.inline_keyboard for b in row]
     assert any("belum ada" in (b.text or "") for b in flat)
     assert any(b.callback_data == "refresh" for b in flat)
+
+
+# ----------------------------------------------------------- pagination
+
+
+def test_primary_keyboard_paginates_long_lists_into_4_row_pages() -> None:
+    """PR-D: with > LIST_PAGE_SIZE primaries, the keyboard shows only
+    page 0 worth of rows + a Prev/Next nav row.
+    """
+    from proton_telegram_bot.bot import LIST_PAGE_SIZE
+
+    primaries = [
+        _fake_primary(pid=i, email=f"v{i}@proton.me")
+        for i in range(1, LIST_PAGE_SIZE + 3)  # one full page + 2 overflow
+    ]
+    markup = _build_primary_keyboard(primaries, page=0)
+    flat = [b for row in markup.inline_keyboard for b in row]
+    pick_buttons = [
+        b for b in flat if (b.callback_data or "").startswith("pickp:")
+    ]
+    assert len(pick_buttons) == LIST_PAGE_SIZE  # only the first page is rendered
+    # Nav row: no "◀ Prev" on page 0, "Next ▶" must be present, and the
+    # central "Page 1/2" label is NOOP-routed.
+    nav_buttons = [
+        b for b in flat if (b.callback_data or "").startswith("ppg:")
+    ]
+    assert any(b.text == "Next ▶" for b in nav_buttons)
+    assert not any(b.text == "◀ Prev" for b in nav_buttons)
+    assert any("Page 1/2" in (b.text or "") for b in flat)
+
+
+def test_primary_keyboard_last_page_has_prev_only() -> None:
+    """On the final page the Next button disappears so the user can't
+    scroll past the end of the list.
+    """
+    from proton_telegram_bot.bot import LIST_PAGE_SIZE
+
+    primaries = [
+        _fake_primary(pid=i, email=f"v{i}@proton.me")
+        for i in range(1, LIST_PAGE_SIZE * 2 + 1)
+    ]
+    markup = _build_primary_keyboard(primaries, page=1)
+    flat = [b for row in markup.inline_keyboard for b in row]
+    nav_buttons = [
+        b for b in flat if (b.callback_data or "").startswith("ppg:")
+    ]
+    assert any(b.text == "◀ Prev" for b in nav_buttons)
+    assert not any(b.text == "Next ▶" for b in nav_buttons)
+    assert any("Page 2/2" in (b.text or "") for b in flat)
+
+
+def test_primary_keyboard_no_pagination_row_for_short_lists() -> None:
+    """A list that fits on one page must NOT render a Prev/Next row."""
+    primaries = [_fake_primary(pid=1, email="v1@proton.me")]
+    markup = _build_primary_keyboard(primaries)
+    flat = [b for row in markup.inline_keyboard for b in row]
+    assert not any((b.callback_data or "").startswith("ppg:") for b in flat)
+    # Page label is also absent.
+    assert not any("Page" in (b.text or "") for b in flat)
+
+
+def test_primary_keyboard_pagination_clamps_out_of_range_page() -> None:
+    """A bogus page index (> total_pages) collapses to the last valid
+    page rather than rendering an empty keyboard.
+    """
+    from proton_telegram_bot.bot import LIST_PAGE_SIZE
+
+    primaries = [
+        _fake_primary(pid=i, email=f"v{i}@proton.me")
+        for i in range(1, LIST_PAGE_SIZE + 2)
+    ]
+    markup = _build_primary_keyboard(primaries, page=99)
+    flat = [b for row in markup.inline_keyboard for b in row]
+    pick_buttons = [
+        b for b in flat if (b.callback_data or "").startswith("pickp:")
+    ]
+    # Total = LIST_PAGE_SIZE + 1, page_size = LIST_PAGE_SIZE. Last
+    # valid page index is 1 → 1 button on that page.
+    assert len(pick_buttons) == 1
+    assert any("Page 2/2" in (b.text or "") for b in flat)
+
+
+def test_alias_keyboard_paginates_drill_down() -> None:
+    """Alias drill-down honours the same 4-row-per-page rule and the
+    Prev/Next callback embeds the primary id.
+    """
+    from proton_telegram_bot.bot import LIST_PAGE_SIZE
+
+    primary = _fake_primary(pid=42, email="vielz@proton.me")
+    aliases = [
+        AliasRecord(id=i, chat_id=1, email=f"v{i}@p.me", status=AliasStatus.AVAILABLE)
+        for i in range(1, LIST_PAGE_SIZE + 3)
+    ]
+    markup = _build_alias_keyboard_for_primary(primary, aliases, page=0)
+    flat = [b for row in markup.inline_keyboard for b in row]
+    pick_buttons = [
+        b for b in flat if (b.callback_data or "").startswith("pick:")
+    ]
+    assert len(pick_buttons) == LIST_PAGE_SIZE
+    nav_buttons = [
+        b for b in flat if (b.callback_data or "").startswith("apg:")
+    ]
+    # Callback prefix carries the primary id so the handler can re-render
+    # the right drill-down without state.
+    assert any((b.callback_data or "").startswith("apg:42:") for b in nav_buttons)
+    assert any(b.text == "Next ▶" for b in nav_buttons)
+
+
+def test_alias_keyboard_no_pagination_row_for_short_lists() -> None:
+    """Single-page alias drill-down: no Prev/Next/Page row."""
+    primary = _fake_primary()
+    aliases = [
+        AliasRecord(id=1, chat_id=1, email="a@p.me", status=AliasStatus.AVAILABLE),
+    ]
+    markup = _build_alias_keyboard_for_primary(primary, aliases)
+    flat = [b for row in markup.inline_keyboard for b in row]
+    assert not any((b.callback_data or "").startswith("apg:") for b in flat)
+    assert not any("Page" in (b.text or "") for b in flat)
+
+
+def test_pagination_callback_data_under_64_bytes() -> None:
+    """Both pagination prefixes stay well under Telegram's 64-byte
+    callback_data ceiling, even with large primary ids and high page
+    numbers.
+    """
+    from proton_telegram_bot.bot import _build_pagination_row
+
+    # Worst case: 12-digit primary id + 4-digit page index (~99 pages
+    # of LIST_PAGE_SIZE means hundreds of aliases per primary).
+    row = _build_pagination_row("apg:999999999999", 99, 200)
+    assert row is not None
+    for button in row:
+        encoded = (button.callback_data or "").encode("utf-8")
+        assert 1 <= len(encoded) <= 64
