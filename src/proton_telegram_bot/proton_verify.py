@@ -315,9 +315,29 @@ async def change_recovery_email(
     await asyncio.sleep(2)
 
     # Step 3: Password re-authentication dialog ("Masukkan kata sandi Anda").
-    # Anchor on the dialog heading so we never grab a stray <input
-    # type="password"> from a hidden form on the underlying page.
+    #
+    # Proton renders this as a Modal-Two component: a wrapper
+    # ``<div class="modal-two">`` containing a native HTML5 ``<dialog
+    # class="modal-two-dialog">``. The native ``<dialog>`` does NOT carry
+    # ``role="dialog"`` (the role is implicit) AND has no ``open``
+    # attribute — by default the user-agent stylesheet sets ``display:
+    # none`` on it, while the wrapper handles visibility via
+    # ``.modal-two-backdrop--in``. Selectors like ``[role='dialog']`` or
+    # ``dialog:has-text(...)`` therefore time out as "not visible" even
+    # though the modal IS on screen, causing Step 3 to be skipped and
+    # Step 5 to fail because the underlying page stays blocked.
+    #
+    # Anchor on ``form#auth-form`` (only present in this modal), with
+    # ``.modal-two`` and text-based fallbacks for forward compatibility.
+    # Submit via Enter key on the password field — works regardless of
+    # whether the Autentikasi button is inside the form or wired to it
+    # via ``form="auth-form"`` (currently it's the latter).
     dialog = page.locator(
+        "form#auth-form, "
+        ".modal-two:has-text('Masukkan kata sandi'), "
+        ".modal-two:has-text('Enter your password'), "
+        ".modal-two-dialog:has-text('Masukkan kata sandi'), "
+        ".modal-two-dialog:has-text('Enter your password'), "
         "[role='dialog']:has-text('Masukkan kata sandi'), "
         "[role='dialog']:has-text('Enter your password'), "
         "dialog:has-text('Masukkan kata sandi'), "
@@ -332,26 +352,46 @@ async def change_recovery_email(
 
     if dialog_visible:
         try:
-            pw_input = dialog.locator("input[type='password']").first
+            # Scope the password input to the auth form when present so
+            # we never grab a stray ``input[type='password']`` from a
+            # hidden form on the underlying page.
+            pw_input = page.locator(
+                "form#auth-form input#password, "
+                "form#auth-form input[type='password'], "
+                ".modal-two input#password, "
+                ".modal-two input[type='password']"
+            ).first
             await pw_input.wait_for(state="visible", timeout=5_000)
             await pw_input.click()
             await pw_input.fill("")
             await pw_input.fill(proton_password)
             logger.info("filled re-auth password in dialog")
 
-            auth_btn = dialog.locator(
-                "button:has-text('Autentikasi'), "
-                "button:has-text('Authenticate'), "
-                "button[type='submit']"
-            ).first
-            await auth_btn.click()
-            logger.info("clicked Autentikasi")
+            # Submit via Enter first — this fires the form's submit
+            # event regardless of where the Autentikasi button lives.
+            await pw_input.press("Enter")
+            logger.info("pressed Enter on re-auth password input")
 
-            # Make sure the dialog actually closes before continuing — if
-            # it stays open, the underlying page is still blocked and
-            # subsequent steps will fail with confusing selector errors.
-            await dialog.wait_for(state="hidden", timeout=15_000)
-            logger.info("re-auth dialog closed")
+            # Wait for the modal to actually close. If Enter didn't take
+            # (e.g. focus shifted), fall back to clicking the
+            # Autentikasi button (linked to the form via ``form="auth-form"``).
+            try:
+                await dialog.wait_for(state="hidden", timeout=8_000)
+                logger.info("re-auth dialog closed after Enter")
+            except Exception:
+                logger.info("Enter did not close re-auth dialog; clicking Autentikasi")
+                auth_btn = page.locator(
+                    "button[form='auth-form'][type='submit'], "
+                    "button[form='auth-form']:has-text('Autentikasi'), "
+                    "button[form='auth-form']:has-text('Authenticate'), "
+                    ".modal-two button:has-text('Autentikasi'), "
+                    ".modal-two button:has-text('Authenticate'), "
+                    ".modal-two button[type='submit']"
+                ).first
+                await auth_btn.click()
+                logger.info("clicked Autentikasi")
+                await dialog.wait_for(state="hidden", timeout=15_000)
+                logger.info("re-auth dialog closed after button click")
         except Exception:
             change_recovery_email.last_failure = {  # type: ignore[attr-defined]
                 "step": "reauth_dialog",
