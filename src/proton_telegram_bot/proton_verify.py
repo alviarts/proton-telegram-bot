@@ -136,7 +136,14 @@ async def _login_proton(
     email: str,
     password: str,
 ) -> int | None:
-    """Log into Proton web and return the user_index from the redirect URL.
+    """Log into Proton web and return the user_index for this session.
+
+    The redirect after submit depends on which products the user has:
+      * Single-product:  ``account.proton.me/u/<N>/...``
+      * Multi-product:   ``account.proton.me/applications`` (Welcome / app
+        picker, e.g. Mail · Calendar · Pass · VPN · Drive · Docs · ...)
+    For the second case we click the Mail tile and read ``user_index``
+    from the resulting ``mail.proton.me/u/<N>/inbox`` URL.
 
     Returns None if login failed. Detailed diagnostics
     (screenshot + HTML + blocker tag) are written to ``DEBUG_DIR`` and
@@ -163,10 +170,11 @@ async def _login_proton(
     await submit_btn.click()
     logger.info("submitted login form")
 
-    # Wait for redirect after login
+    # Wait for any navigation off /login (success), regardless of which
+    # post-login URL Proton picked.
     try:
-        await page.wait_for_url(
-            re.compile(r"account\.proton\.me/u/\d+"),
+        await page.wait_for_function(
+            "() => !window.location.pathname.startsWith('/login')",
             timeout=60_000,
         )
     except Exception:
@@ -178,18 +186,75 @@ async def _login_proton(
             "screenshot": dump,
         }
         logger.error(
-            "Proton login did not redirect to /u/<n>: blocker=%s url=%s dump=%s",
+            "Proton login stuck on /login: blocker=%s url=%s dump=%s",
             blocker,
             page.url,
             dump,
         )
         return None
 
-    # Extract user_index from URL like /u/19/...
-    current_url = page.url
-    m = re.search(r"/u/(\d+)", current_url)
+    # Direct redirect into a product (legacy / single-product accounts).
+    m = re.search(r"/u/(\d+)", page.url)
+    if m:
+        user_index = int(m.group(1))
+        logger.info(
+            "login successful (direct), user_index=%d (url=%s)",
+            user_index,
+            page.url,
+        )
+        return user_index
+
+    # Welcome / app picker. Click Mail to land on mail.proton.me/u/<N>/inbox.
+    logger.info("login landed on app picker (%s); clicking Mail tile", page.url)
+    mail_tile = page.locator(
+        "a[href*='mail.proton.me'], "
+        "a:has-text('Mail'):not(:has-text('Mailto'))"
+    ).first
+    try:
+        await mail_tile.wait_for(state="visible", timeout=15_000)
+        await mail_tile.click()
+    except Exception:
+        blocker = "no_mail_tile"
+        dump = await _dump_page(page, f"login_failed_{blocker}")
+        _login_proton.last_failure = {  # type: ignore[attr-defined]
+            "blocker": blocker,
+            "url": page.url,
+            "screenshot": dump,
+        }
+        logger.error(
+            "could not click Mail tile on Welcome page; url=%s dump=%s",
+            page.url,
+            dump,
+        )
+        return None
+
+    try:
+        await page.wait_for_url(
+            re.compile(r"mail\.proton\.me/u/\d+"),
+            timeout=30_000,
+        )
+    except Exception:
+        blocker = "mail_redirect_failed"
+        dump = await _dump_page(page, f"login_failed_{blocker}")
+        _login_proton.last_failure = {  # type: ignore[attr-defined]
+            "blocker": blocker,
+            "url": page.url,
+            "screenshot": dump,
+        }
+        logger.error(
+            "Mail tile click did not redirect to mail.proton.me/u/<n>; url=%s dump=%s",
+            page.url,
+            dump,
+        )
+        return None
+
+    m = re.search(r"/u/(\d+)", page.url)
     user_index = int(m.group(1)) if m else 0
-    logger.info("login successful, user_index=%d (url=%s)", user_index, current_url)
+    logger.info(
+        "login successful (via Mail tile), user_index=%d (url=%s)",
+        user_index,
+        page.url,
+    )
     return user_index
 
 
