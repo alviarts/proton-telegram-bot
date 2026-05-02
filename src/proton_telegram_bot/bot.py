@@ -60,6 +60,69 @@ from .tempmail import TempMailbox, TempMailError
 
 LOGGER = logging.getLogger(__name__)
 
+
+async def on_error(
+    update: object,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Global error handler registered with ``Application.add_error_handler``.
+
+    Without this, an exception raised inside any handler bubbles up to
+    PTB's dispatcher which logs it at ERROR level and moves on — but
+    the user who triggered the broken handler gets *no reply at all*.
+    From their side the bot looks dead. The user explicitly asked for
+    "antisipasi error mati" / "lebih baik mengulang flow daripada bot
+    tidak merespon": this handler is the catch-all that guarantees a
+    user-visible reply for every uncaught exception, plus a structured
+    log line for debugging.
+
+    Three behaviours:
+
+    1. Always log the exception at ERROR with full traceback so
+       journalctl/log aggregators can surface it.
+    2. Best-effort reply to the user with a generic "ada error, coba
+       lagi" message anchored to the chat the update came from. We
+       wrap the reply in ``contextlib.suppress`` because the original
+       failure may have been *caused* by Telegram being unreachable —
+       no point bubbling another exception out of the error handler.
+    3. Best-effort end any conversation that was active for the user
+       so they're not stuck mid-flow with stale ``user_data`` waiting
+       for a state-machine transition that will never come. PTB
+       doesn't expose a clean "abort conversation for this user" API,
+       so we just clear the per-user data dict — subsequent /connect
+       /sync /setprotonpw entries restart cleanly thanks to
+       ``allow_reentry=True``.
+    """
+    err = context.error
+    LOGGER.exception("uncaught exception in handler", exc_info=err)
+
+    # Best-effort: clear stale ``user_data`` so the next command starts
+    # from a clean slate instead of inheriting half-set keys
+    # (``imap_password``, ``bridge_captcha_iterator``, etc.) from the
+    # broken flow. We never re-raise from inside an error handler.
+    with contextlib.suppress(Exception):
+        if isinstance(context.user_data, dict):
+            context.user_data.clear()
+
+    # Try to reply to whoever triggered this. The update may not be a
+    # ``telegram.Update`` (e.g. ``JobQueue`` errors get a string), so
+    # we duck-type to find ``effective_message`` / ``effective_chat``.
+    chat_id: int | None = None
+    if isinstance(update, Update):
+        if update.effective_chat is not None:
+            chat_id = update.effective_chat.id
+    if chat_id is None:
+        return
+
+    text = (
+        "⚠️ Maaf, ada error tidak terduga saat memproses perintah barusan. "
+        "Bot tetap jalan — coba ulangi perintah, atau /start untuk lihat "
+        "menu utama."
+    )
+    with contextlib.suppress(Exception):
+        await context.bot.send_message(chat_id=chat_id, text=text)
+
+
 # Conversation states for /connect.
 #
 # We deliberately keep this short: the older flow asked for host/port/SSL/
@@ -1364,14 +1427,24 @@ def _build_post_connect_keyboard_with_aliases(
 
 
 SMTP_SMOKE_TIMEOUT_SECONDS = 60
-# When the first smoke-test attempt times out, /connect retries once
-# after a short settle window before rolling back the freshly-added
-# primary. Bridge is occasionally still warming up the SMTP listener
-# (or DNS to the temp-mail provider hasn't fully propagated) the
-# first time we hit it post add-account; a single retry catches the
-# common case without making the user re-run /connect from scratch.
+# When the first smoke-test attempt times out, /connect retries a few
+# times after a short settle window before giving up. Bridge is
+# occasionally still warming up the SMTP listener (or DNS to the
+# temp-mail provider hasn't fully propagated) the first time we hit
+# it post add-account; the retries catch the common case without
+# making the user re-run /connect from scratch.
 SMTP_SMOKE_RETRY_DELAY_SECONDS = 30
-SMTP_SMOKE_MAX_ATTEMPTS = 2
+# Bumped from 2 → 3 so we cover ~3 minutes of Bridge warm-up before
+# considering the smoke test a soft failure.
+SMTP_SMOKE_MAX_ATTEMPTS = 3
+# Hard wall-clock cap for the entire smoke-test phase. Even with all
+# retries combined, ``_finalize_connect`` can never spin in the smoke
+# branch longer than this — wrapping in ``asyncio.wait_for`` makes it
+# impossible for a hung SMTP socket / Mail.tm 500 to keep the
+# /connect coroutine alive and freeze the user's view. Picked to be
+# comfortably > MAX_ATTEMPTS * (TIMEOUT + RETRY_DELAY) so a healthy
+# slow-warm-up still completes naturally.
+SMTP_SMOKE_HARD_CAP_SECONDS = 360
 BRIDGE_SMTP_PORT = 1025
 
 
@@ -1667,13 +1740,33 @@ async def _finalize_connect(
                 parse_mode=ParseMode.HTML,
             )
 
-        smoke_ok = await _smoke_test_with_retry(
-            email=email,
-            imap_username=imap_username,
-            imap_password=imap_password,
-            tempmail=smoke_tempmail,
-            on_retry=_on_retry,
-        )
+        # The smoke test runs under a hard wall-clock cap (``wait_for``)
+        # so even pathological cases — Mail.tm 500ing for minutes,
+        # Bridge SMTP socket accepting but never delivering — can't
+        # keep this coroutine alive past ``SMTP_SMOKE_HARD_CAP_SECONDS``
+        # and starve every other handler. ``concurrent_updates=True``
+        # in __main__ already prevents one user's flow from blocking
+        # another's, but capping the duration makes the *log experience*
+        # reliable: the user always sees either ✅ or ⚠ within bounded
+        # time, never an indefinite "kirim email uji..." stall.
+        try:
+            smoke_ok = await asyncio.wait_for(
+                _smoke_test_with_retry(
+                    email=email,
+                    imap_username=imap_username,
+                    imap_password=imap_password,
+                    tempmail=smoke_tempmail,
+                    on_retry=_on_retry,
+                ),
+                timeout=SMTP_SMOKE_HARD_CAP_SECONDS,
+            )
+        except TimeoutError:
+            LOGGER.warning(
+                "smoke test for %s exceeded hard cap of %ds; treating as soft fail",
+                email,
+                SMTP_SMOKE_HARD_CAP_SECONDS,
+            )
+            smoke_ok = False
         if smoke_ok:
             await _send_connect_log(
                 update,
@@ -1683,30 +1776,55 @@ async def _finalize_connect(
                 parse_mode=ParseMode.HTML,
             )
         else:
+            # Soft-fail: smoke test couldn't verify SMTP delivery, but
+            # the IMAP listener has already started successfully (a
+            # previous call to ``_verify_bridge_login`` confirmed the
+            # credentials, and ``manager.start_for_primary`` returned
+            # without exception). Rolling the primary back here forced
+            # the user to redo the entire /connect flow — including
+            # the recovery-email Playwright dance — for what is often
+            # a transient Mail.tm hiccup. The user pushed back hard
+            # ("lebih baik mengulang flow daripada bot tidak merespon
+            # atau mati"), so we now keep the primary, surface a
+            # warning with concrete next steps, and let the user
+            # verify with /cekimap when they want.
             LOGGER.warning(
-                "smoke test failed for %s after %d attempts; rolling back primary %d",
+                "smoke test failed for %s after %d attempts; KEEPING "
+                "primary %d (listener already up — soft fail)",
                 email,
                 SMTP_SMOKE_MAX_ATTEMPTS,
                 primary_id,
             )
-            await update.effective_message.reply_text(  # type: ignore[union-attr]
-                "❌ <b>Smoke test gagal</b> — email uji tidak sampai ke "
-                f"temp mail dalam {SMTP_SMOKE_MAX_ATTEMPTS}x percobaan "
-                f"({SMTP_SMOKE_TIMEOUT_SECONDS}s + retry "
-                f"{SMTP_SMOKE_RETRY_DELAY_SECONDS}s). Bridge mungkin "
-                "belum benar-benar siap atau IMAP/SMTP tidak jalan.\n\n"
-                "Sesi ini di-rollback. Silakan <b>/connect</b> lagi.",
-                parse_mode=ParseMode.HTML,
+            keyboard = InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "🩺 Jalankan /cekimap sekarang",
+                            callback_data=f"{CB_QUICK_HEALTHCHECK}:{primary_id}",
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "📋 Buka /list",
+                            callback_data=f"{CB_PICK_PRIMARY}:{primary_id}",
+                        )
+                    ],
+                ]
             )
-            with contextlib.suppress(Exception):
-                await manager.stop_for_primary(primary_id)
-            with contextlib.suppress(Exception):
-                await db.delete_primary_account(chat.id, primary_id)
-            bridge_admin = _bot_bridge_admin(context)
-            if bridge_admin is not None:
-                with contextlib.suppress(Exception):
-                    await bridge_admin.remove_account(email)
-            return ConversationHandler.END
+            await update.effective_message.reply_text(  # type: ignore[union-attr]
+                "⚠️ <b>Smoke test belum dapat email uji</b> dalam "
+                f"{SMTP_SMOKE_MAX_ATTEMPTS}x percobaan "
+                f"({SMTP_SMOKE_TIMEOUT_SECONDS}s + retry "
+                f"{SMTP_SMOKE_RETRY_DELAY_SECONDS}s). Mail.tm bisa lemot "
+                "atau Bridge masih warm-up.\n\n"
+                "<b>Akun TIDAK di-rollback</b> — IMAP listener sudah jalan "
+                f"untuk <code>{html.escape(email)}</code>. Cek manual:\n"
+                "• Tap tombol di bawah untuk jalankan health check, atau\n"
+                "• Kirim email uji ke alias dari device lain dan lihat "
+                "apakah bot meneruskannya.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboard,
+            )
 
     # Auto-sync addresses from Proton account API if we have them.
     # The recovery-email Playwright flow stashes the full address list
