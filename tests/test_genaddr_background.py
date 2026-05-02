@@ -604,7 +604,8 @@ class _FakeUpdate:
 class _FakeSettings:
     """Settings with an empty allowlist so ``_gate`` lets everyone through."""
 
-    allowed_user_ids: set[int] = set()
+    def __init__(self) -> None:
+        self.allowed_user_ids: set[int] = set()
 
 
 class _ReEntrantContext:
