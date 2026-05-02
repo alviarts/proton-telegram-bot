@@ -314,24 +314,52 @@ async def change_recovery_email(
 
     await asyncio.sleep(2)
 
-    # Step 3: Password re-authentication dialog
-    pw_input = page.locator(
-        "[role='dialog'] input[type='password'], input[type='password']"
+    # Step 3: Password re-authentication dialog ("Masukkan kata sandi Anda").
+    # Anchor on the dialog heading so we never grab a stray <input
+    # type="password"> from a hidden form on the underlying page.
+    dialog = page.locator(
+        "[role='dialog']:has-text('Masukkan kata sandi'), "
+        "[role='dialog']:has-text('Enter your password'), "
+        "dialog:has-text('Masukkan kata sandi'), "
+        "dialog:has-text('Enter your password')"
     ).first
+    dialog_visible = False
     try:
-        await pw_input.wait_for(state="visible", timeout=10_000)
-        await pw_input.fill(proton_password)
-        logger.info("filled re-auth password")
-
-        auth_btn = page.locator(
-            "button:has-text('Autentikasi'), "
-            "button:has-text('Authenticate'), "
-            "[role='dialog'] button[type='submit']"
-        ).first
-        await auth_btn.click()
-        logger.info("clicked Autentikasi")
+        await dialog.wait_for(state="visible", timeout=10_000)
+        dialog_visible = True
     except Exception:
-        logger.warning("no password re-auth dialog appeared; continuing")
+        logger.info("no password re-auth dialog appeared; continuing")
+
+    if dialog_visible:
+        try:
+            pw_input = dialog.locator("input[type='password']").first
+            await pw_input.wait_for(state="visible", timeout=5_000)
+            await pw_input.click()
+            await pw_input.fill("")
+            await pw_input.fill(proton_password)
+            logger.info("filled re-auth password in dialog")
+
+            auth_btn = dialog.locator(
+                "button:has-text('Autentikasi'), "
+                "button:has-text('Authenticate'), "
+                "button[type='submit']"
+            ).first
+            await auth_btn.click()
+            logger.info("clicked Autentikasi")
+
+            # Make sure the dialog actually closes before continuing — if
+            # it stays open, the underlying page is still blocked and
+            # subsequent steps will fail with confusing selector errors.
+            await dialog.wait_for(state="hidden", timeout=15_000)
+            logger.info("re-auth dialog closed")
+        except Exception:
+            change_recovery_email.last_failure = {  # type: ignore[attr-defined]
+                "step": "reauth_dialog",
+                "url": page.url,
+                "screenshot": await _dump_page(page, "recovery_failed_reauth"),
+            }
+            logger.error("re-auth dialog appeared but could not be completed")
+            return None
 
     await asyncio.sleep(3)
 
