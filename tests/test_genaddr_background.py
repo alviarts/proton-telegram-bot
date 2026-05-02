@@ -566,3 +566,118 @@ async def test_topup_offer_skips_when_at_or_above_target() -> None:
         target=21,
     )
     assert bot.calls == []
+
+
+# ---------------------------------------------------------------------------
+# /genaddr re-entrancy + dedup (PR-A bug fix)
+# ---------------------------------------------------------------------------
+
+
+class _FakeChat:
+    def __init__(self, chat_id: int = 99) -> None:
+        self.id = chat_id
+
+
+class _FakeUser:
+    def __init__(self, user_id: int = 1) -> None:
+        self.id = user_id
+
+
+class _RecordingMessage:
+    """``update.effective_message`` stub that records every reply text."""
+
+    def __init__(self) -> None:
+        self.replies: list[str] = []
+
+    async def reply_text(self, text: str, **_kw: Any) -> None:
+        self.replies.append(text)
+
+
+class _FakeUpdate:
+    def __init__(self) -> None:
+        self.effective_chat = _FakeChat()
+        self.effective_user = _FakeUser()
+        self.effective_message = _RecordingMessage()
+        self.callback_query = None
+
+
+class _FakeSettings:
+    """Settings with an empty allowlist so ``_gate`` lets everyone through."""
+
+    allowed_user_ids: set[int] = set()
+
+
+class _ReEntrantContext:
+    def __init__(self) -> None:
+        self.application = _FakeApp()
+        self.application.bot_data["db"] = object()
+        self.application.bot_data["cipher"] = object()
+        self.application.bot_data["settings"] = _FakeSettings()
+        self.chat_data: dict[str, Any] = self.application.chat_data[99]
+        self.user_data: dict[str, Any] = {}
+        self.args: list[str] = ["vielz", "10"]
+
+
+@pytest.mark.asyncio
+async def test_cmd_genaddr_re_entrancy_warns_only_once() -> None:
+    """Repeated calls while ``genaddr_running`` is set must emit the
+    warning **exactly once** — not once per click. This is the bug
+    the user reported as "Masih ada /genaddr lain yang berjalan"
+    spamming the chat 5x in a row.
+    """
+    update = _FakeUpdate()
+    context = _ReEntrantContext()
+    # Simulate "task already running": cmd_genaddr should bail at the
+    # re-entrancy check before doing any DB lookups, so the user-data
+    # silent-pick/random-suffix flags never get touched.
+    context.chat_data["genaddr_running"] = True
+
+    for _ in range(5):
+        await bot_mod.cmd_genaddr(
+            update,  # type: ignore[arg-type]
+            context,  # type: ignore[arg-type]
+        )
+
+    warnings = [
+        m for m in update.effective_message.replies if "Masih ada /genaddr" in m
+    ]
+    assert len(warnings) == 1, (
+        f"expected exactly one re-entrancy warning, got {len(warnings)}: "
+        f"{update.effective_message.replies}"
+    )
+    # The earlier "Akun yang dipakai: …" disambiguation message must
+    # NOT have been sent — the early bail-out should beat the picker.
+    assert not any("Akun yang dipakai" in m for m in update.effective_message.replies)
+
+
+@pytest.mark.asyncio
+async def test_cmd_genaddr_warning_resets_after_task_finishes() -> None:
+    """Once the background task clears its chat_data flags, a fresh
+    /genaddr issued *while* still running again must warn again
+    (otherwise the second user attempt would be silently swallowed).
+    """
+    update = _FakeUpdate()
+    context = _ReEntrantContext()
+
+    context.chat_data["genaddr_running"] = True
+    await bot_mod.cmd_genaddr(
+        update,  # type: ignore[arg-type]
+        context,  # type: ignore[arg-type]
+    )
+    assert context.chat_data.get("genaddr_warned_running") is True
+
+    # Background task finishes -> the finally block in _run_genaddr_background
+    # pops both flags. Simulate that here.
+    context.chat_data.pop("genaddr_running", None)
+    context.chat_data.pop("genaddr_warned_running", None)
+    # Now flag again as if a new task started, then re-enter.
+    context.chat_data["genaddr_running"] = True
+    update.effective_message.replies.clear()
+    await bot_mod.cmd_genaddr(
+        update,  # type: ignore[arg-type]
+        context,  # type: ignore[arg-type]
+    )
+    warnings = [
+        m for m in update.effective_message.replies if "Masih ada /genaddr" in m
+    ]
+    assert len(warnings) == 1

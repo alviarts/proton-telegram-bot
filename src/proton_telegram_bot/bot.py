@@ -114,6 +114,10 @@ CB_GENADDR_CANCEL = "genaddr_cancel"
 # /genaddr flow without making them re-type the email address.
 CB_QUICK_SETPW = "qsetpw"
 CB_QUICK_GENADDR = "qgenaddr"
+# Post-disconnect re-entry shortcut: the "🔌 Connect lagi" button below
+# the disconnect-done message routes through the existing /connect
+# conversation so the user doesn't have to retype the command.
+CB_CONNECT_AGAIN = "qconnect"
 # /cekimap entry: trigger an end-to-end health check (Bridge SMTP →
 # tempmail) for every alias of a chosen primary. Two callback flavours:
 # ``hcpick:<primary_id>``  — picker entry (from /cekimap menu and /list).
@@ -877,6 +881,36 @@ async def cmd_connect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     return CONNECT_EMAIL
 
 
+async def connect_again_quick_entry(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Callback entry point for the post-disconnect "🔌 Connect lagi"
+    button. Acks the click, removes the keyboard from the disconnect
+    confirmation message so it can't be re-fired, then delegates to
+    :func:`cmd_connect` so step 1/2 lands in the chat exactly the same
+    way as if the user had typed ``/connect``.
+
+    The flag ``context.args = []`` is set explicitly so cmd_connect's
+    "one-shot ``/connect <email>``" branch doesn't trip on a stale
+    args list left by an earlier command.
+    """
+    query = update.callback_query
+    if query is not None:
+        try:
+            await query.answer("🔌 Mulai connect baru…", show_alert=False)
+        except Exception:
+            LOGGER.debug("query.answer failed for CB_CONNECT_AGAIN", exc_info=True)
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            LOGGER.debug(
+                "edit_message_reply_markup failed for CB_CONNECT_AGAIN",
+                exc_info=True,
+            )
+    context.args = []
+    return await cmd_connect(update, context)
+
+
 async def connect_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = (update.effective_message.text or "").strip()  # type: ignore[union-attr]
     if "@" not in text:
@@ -890,6 +924,29 @@ async def connect_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         parse_mode=ParseMode.HTML,
     )
     return CONNECT_PASSWORD
+
+
+def _build_post_disconnect_keyboard() -> InlineKeyboardMarkup:
+    """Single-button keyboard rendered after a successful disconnect.
+
+    The user almost always disconnects an account because they want to
+    swap to a different one — putting the "🔌 Connect lagi" button
+    right below the confirmation message saves a typed ``/connect``
+    command. The callback ``CB_CONNECT_AGAIN`` is wired into the
+    ``connect_conv`` ConversationHandler's ``entry_points`` (alongside
+    the regular ``CommandHandler("connect", …)``) so pressing it lands
+    the user straight in step 1/2 of the flow.
+    """
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "🔌 Connect lagi",
+                    callback_data=CB_CONNECT_AGAIN,
+                )
+            ]
+        ]
+    )
 
 
 def _build_post_connect_keyboard(primary_id: int) -> InlineKeyboardMarkup:
@@ -2661,6 +2718,21 @@ async def cmd_genaddr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     domain = args[2] if len(args) >= 3 else GENADDR_DEFAULT_DOMAIN
     domain = domain.lstrip("@")
 
+    # Re-entrancy check FIRST — before any other side effect (DB lookup,
+    # disambiguation message). Stops the duplicate-message spam when the
+    # user double-clicks a quick-action button: the second click would
+    # previously print "Akun yang dipakai: …" + "Masih ada /genaddr"
+    # both. Now it dedup-guards on a per-chat flag and only emits the
+    # warning once per running task.
+    if context.chat_data.get("genaddr_running"):
+        if not context.chat_data.get("genaddr_warned_running"):
+            await update.effective_message.reply_text(  # type: ignore[union-attr]
+                "⚠️ Masih ada /genaddr lain yang berjalan di chat ini. "
+                "Tunggu selesai atau klik tombol Batalkan di pesan progressnya.",
+            )
+            context.chat_data["genaddr_warned_running"] = True
+        return
+
     db = _bot_db(context)
     # Cipher is fetched lazily inside the background task. Verify it's
     # configured here so the user gets an immediate error instead of one
@@ -2678,20 +2750,18 @@ async def cmd_genaddr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     # Persist the picked primary so subsequent commands keep using the same
     # account until the user explicitly switches via /setprotonpw or /list.
     await db.set_active_primary(chat.id, primary.id)
-    if len(primaries) > 1:
+    # Quick-action callbacks (CB_QUICK_GENADDR) explicitly pick the
+    # primary by id, so the disambiguation message just adds noise.
+    # ``genaddr_silent_pick`` is consumed (popped) here so any later
+    # typed ``/genaddr`` still shows the message in multi-primary chats.
+    silent_pick = bool(context.user_data.pop("genaddr_silent_pick", False))
+    if len(primaries) > 1 and not silent_pick:
         await update.effective_message.reply_text(  # type: ignore[union-attr]
             f"Akun yang dipakai: <b>{html.escape(primary.email)}</b> "
             f"({primary_pick_reason}). Ganti dengan /setprotonpw atau "
             "klik alias di /list.",
             parse_mode=ParseMode.HTML,
         )
-
-    if context.chat_data.get("genaddr_running"):
-        await update.effective_message.reply_text(  # type: ignore[union-attr]
-            "⚠️ Masih ada /genaddr lain yang berjalan di chat ini. "
-            "Tunggu selesai atau klik tombol Batalkan di pesan progressnya.",
-        )
-        return
 
     # The cancel button must remain visible alongside the live status
     # row that narrates the current phase ("🌐 Buka browser…",
@@ -3013,6 +3083,9 @@ async def _run_genaddr_background(
             chat_data.pop("genaddr_cancel_event", None)
             chat_data.pop("genaddr_browser_handle", None)
             chat_data.pop("genaddr_force_close_task", None)
+            # Reset the dedup flag so the next /genaddr's re-entrancy
+            # warning (if any) prints again as a first-time event.
+            chat_data.pop("genaddr_warned_running", None)
         if status is not None:
             try:
                 await status.done(final_status_label)
@@ -3245,7 +3318,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             )
             if suffix:
                 text = f"{text}\n\n{suffix}"
-            await query.edit_message_text(text, parse_mode=ParseMode.HTML)
+            await query.edit_message_text(
+                text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=_build_post_disconnect_keyboard(),
+            )
         except Exception:
             pass
         return
@@ -3309,6 +3386,24 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         # ``qgenaddr:<primary_id>:<count>``. Bridge to /genaddr by
         # synthesising the right context.args + delegating to the real
         # handler so we keep a single code path for the actual generation.
+        #
+        # Strip the inline keyboard from the source message before
+        # delegating: rapid double-clicks used to spam "Akun yang
+        # dipakai…" + "Masih ada /genaddr…" because every click
+        # re-entered cmd_genaddr. Removing the keyboard makes a second
+        # click impossible — Telegram still delivers "callback already
+        # processed" toasts but no new message is emitted.
+        try:
+            await query.answer("⏳ Mulai generate…", show_alert=False)
+        except Exception:
+            LOGGER.debug("query.answer failed for CB_QUICK_GENADDR", exc_info=True)
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            LOGGER.debug(
+                "edit_message_reply_markup failed for CB_QUICK_GENADDR",
+                exc_info=True,
+            )
         parts = data.split(":")
         if len(parts) != 3:
             await query.answer("Tombol tidak valid.", show_alert=True)
@@ -3346,7 +3441,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         # use random 2-digit numeric suffixes (vielz88311, vielz88347, …)
         # instead of the legacy sequential vielz001..vielzNNN cursor —
         # per the user's "yang 11 randomized" request.
+        # ``genaddr_silent_pick`` suppresses the "Akun yang dipakai: …"
+        # disambiguation message: this callback already specified the
+        # primary by id, so the message would just be noise.
         context.user_data["genaddr_random_suffix"] = True
+        context.user_data["genaddr_silent_pick"] = True
         context.args = [base, str(count)]
         await cmd_genaddr(update, context)
         return
@@ -3518,7 +3617,14 @@ def build_handlers() -> list:
     # restart the flow from scratch instead of falling through to the
     # global "unknown command" handler. Same for /sync.
     connect_conv = ConversationHandler(
-        entry_points=[CommandHandler("connect", cmd_connect)],
+        entry_points=[
+            CommandHandler("connect", cmd_connect),
+            # Post-disconnect "🔌 Connect lagi" shortcut. Lands in the
+            # same step-1/2 prompt as the typed command.
+            CallbackQueryHandler(
+                connect_again_quick_entry, pattern=rf"^{CB_CONNECT_AGAIN}$"
+            ),
+        ],
         states={
             CONNECT_EMAIL: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, connect_email),
