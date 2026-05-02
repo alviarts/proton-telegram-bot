@@ -781,3 +781,100 @@ async def fetch_all_addresses_via_browser(
                 await pw.stop()
             except Exception:  # pragma: no cover - best-effort cleanup
                 pass
+
+
+# --------------------------------------------------------------- recovery-email auto-verify
+
+# Buttons that the recovery-link landing page may render before the
+# success state appears. Some link variants auto-verify on load (no
+# button), so we click best-effort and never fail on absence.
+_VERIFY_BUTTON_SELECTORS: tuple[str, ...] = (
+    "button:has-text('Verifikasi email')",
+    "button:has-text('Verifikasi sekarang')",
+    "button:has-text('Verifikasi')",
+    "button:has-text('Verify email')",
+    "button:has-text('Verify now')",
+    "button:has-text('Verify')",
+    "a:has-text('Verifikasi email')",
+    "a:has-text('Verifikasi')",
+    "a:has-text('Verify email')",
+    "a:has-text('Verify')",
+)
+
+# Locators that confirm Proton accepted the recovery-email verification.
+# We treat ANY visible match as success — Proton's wording differs by
+# locale and by which surface (account.proton.me vs verify.proton.me)
+# the link lands on.
+_VERIFY_SUCCESS_SELECTORS: tuple[str, ...] = (
+    "text=/Email\\s+verified/i",
+    "text=/Recovery email.*verified/i",
+    "text=/Email.*berhasil.*diverifikasi/i",
+    "text=/Email.*sudah.*diverifikasi/i",
+    "text=/Email pemulihan.*diverifikasi/i",
+    "text=/Verifikasi.*berhasil/i",
+)
+
+
+async def auto_verify_recovery_link(
+    page: Page,
+    verify_link: str,
+    *,
+    success_timeout_ms: int = 20_000,
+    button_timeout_ms: int = 2_500,
+) -> bool:
+    """Open ``verify_link`` and confirm Proton accepted the recovery email.
+
+    Some Proton recovery-link variants auto-verify on page load; others
+    show a "Verify" / "Verifikasi" confirmation button. We attempt the
+    button click optimistically (best-effort, short timeout) and then
+    poll for any of the recognised success indicators.
+
+    Returns ``True`` on success, ``False`` on navigation failure or
+    when no success indicator appears within ``success_timeout_ms``.
+    Never raises — the caller is expected to fall back to the manual
+    "click the link yourself, then reply ok" flow.
+    """
+    try:
+        await page.goto(
+            verify_link, wait_until="domcontentloaded", timeout=30_000
+        )
+    except Exception:
+        logger.warning(
+            "auto_verify: navigation to verify link failed", exc_info=True
+        )
+        return False
+
+    # Best-effort click on a Verify / Verifikasi button if the link
+    # variant requires it. Proton sometimes renders the button as
+    # ``<button>``, sometimes as an ``<a>`` styled like a button.
+    for sel in _VERIFY_BUTTON_SELECTORS:
+        try:
+            btn = page.locator(sel).first
+            await btn.wait_for(state="visible", timeout=button_timeout_ms)
+            await btn.click()
+            logger.info("auto_verify: clicked confirmation button (%s)", sel)
+            break
+        except Exception:
+            continue
+
+    # Poll for any success indicator. We share a single deadline across
+    # all selectors so the total wait is bounded by ``success_timeout_ms``
+    # regardless of how many indicator variants we try.
+    deadline = time.monotonic() + success_timeout_ms / 1000.0
+    while time.monotonic() < deadline:
+        for sel in _VERIFY_SUCCESS_SELECTORS:
+            try:
+                el = page.locator(sel).first
+                if await el.is_visible():
+                    logger.info("auto_verify: success indicator visible (%s)", sel)
+                    return True
+            except Exception:
+                continue
+        await asyncio.sleep(0.5)
+
+    logger.warning(
+        "auto_verify: no success indicator after %dms for %s",
+        success_timeout_ms,
+        verify_link,
+    )
+    return False
