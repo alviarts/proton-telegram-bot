@@ -182,12 +182,17 @@ def _build_primary_keyboard(
     primaries: list[PrimaryAccount],
     alias_counts: dict[int, int] | None = None,
     active_primary_id: int | None = None,
+    healthcheck_stats: dict[int, tuple[int, int]] | None = None,
 ) -> InlineKeyboardMarkup:
     """Top-level keyboard listing every Proton account a user owns.
 
-    Each row drills into the alias list of that primary. ``alias_counts``
-    annotates each label with ``(N alias)``. ``active_primary_id`` flags the
-    primary whose alias is currently locked (purely visual).
+    Each row drills into the alias list of that primary.
+    ``alias_counts`` annotates each label with the total alias count.
+    ``healthcheck_stats`` (from the last /cekimap run, keyed by
+    ``primary.id``) takes priority and renders as ``ok/total`` so the
+    user can spot a primary whose aliases have started failing.
+    ``active_primary_id`` flags the primary whose alias is currently
+    locked (purely visual).
     """
     rows: list[list[InlineKeyboardButton]] = []
     if not primaries:
@@ -198,24 +203,28 @@ def _build_primary_keyboard(
         for primary in primaries:
             count = (alias_counts or {}).get(primary.id, 0)
             marker = "🔒 " if active_primary_id == primary.id else "📧 "
-            label = f"{marker}{primary.email} ({count} alias)"
-            # Email button on its own row so the "(N alias)" count
-            # never gets truncated by the Telegram client when the
-            # row has to share width with another button.
+            stats = (healthcheck_stats or {}).get(primary.id)
+            if stats is not None:
+                # ``ok/total`` from the most recent /cekimap. Slash
+                # notation is compact enough to fit on one row even
+                # next to the icon-only Sync button.
+                ok, total = stats
+                count_label = f"{ok}/{total}"
+            else:
+                count_label = f"{count}"
+            label = f"{marker}{primary.email} · {count_label}"
+            # Email + Sync stay on the same row. The Sync button is
+            # icon-only ("🔄") so a long primary email + alias count
+            # has room to render without the client clipping the
+            # label on narrow viewports.
             rows.append(
                 [
                     InlineKeyboardButton(
                         label,
                         callback_data=f"{CB_PICK_PRIMARY}:{primary.id}",
                     ),
-                ]
-            )
-            # Per-primary "Sync alias from Proton" trigger on the
-            # next row. Full-width so the icon + label read clearly.
-            rows.append(
-                [
                     InlineKeyboardButton(
-                        f"🔄 Sync alias {primary.email}",
+                        "🔄",
                         callback_data=f"{CB_SYNC_PRIMARY}:{primary.id}",
                     ),
                 ]
@@ -302,6 +311,7 @@ async def _show_primary_list(
     """Render the top-level primary keyboard. Used by /list and /start."""
     primaries = await db.list_primary_accounts(chat_id)
     counts = await _alias_count_per_primary(db, chat_id, primaries)
+    healthcheck_stats = await db.get_last_healthcheck_stats(chat_id)
     active = await db.get_active_alias(chat_id)
     active_primary_id = active.primary_id if active else None
     if primaries:
@@ -319,7 +329,10 @@ async def _show_primary_list(
     await update.effective_message.reply_text(  # type: ignore[union-attr]
         header,
         reply_markup=_build_primary_keyboard(
-            primaries, counts, active_primary_id
+            primaries,
+            counts,
+            active_primary_id,
+            healthcheck_stats=healthcheck_stats,
         ),
         parse_mode=ParseMode.HTML,
     )
@@ -2863,6 +2876,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if data == CB_REFRESH or data == CB_BACK_TO_PRIMARIES:
         primaries = await db.list_primary_accounts(chat_id)
         counts = await _alias_count_per_primary(db, chat_id, primaries)
+        healthcheck_stats = await db.get_last_healthcheck_stats(chat_id)
         active = await db.get_active_alias(chat_id)
         try:
             await query.edit_message_reply_markup(
@@ -2870,6 +2884,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     primaries,
                     counts,
                     active.primary_id if active else None,
+                    healthcheck_stats=healthcheck_stats,
                 )
             )
         except Exception:

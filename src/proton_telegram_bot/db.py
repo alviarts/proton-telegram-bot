@@ -124,6 +124,21 @@ class Database:
             await self.conn.execute(
                 "ALTER TABLE primary_accounts ADD COLUMN proton_password_encrypted TEXT"
             )
+        # Last /cekimap result, surfaced in the /list keyboard as
+        # ``ok/total`` so the user can spot a primary whose aliases
+        # have started failing without re-running the check.
+        if "last_healthcheck_ok" not in primary_cols:
+            await self.conn.execute(
+                "ALTER TABLE primary_accounts ADD COLUMN last_healthcheck_ok INTEGER"
+            )
+        if "last_healthcheck_total" not in primary_cols:
+            await self.conn.execute(
+                "ALTER TABLE primary_accounts ADD COLUMN last_healthcheck_total INTEGER"
+            )
+        if "last_healthcheck_at" not in primary_cols:
+            await self.conn.execute(
+                "ALTER TABLE primary_accounts ADD COLUMN last_healthcheck_at TEXT"
+            )
         await self._backfill_primary_accounts_from_legacy_users()
 
     async def _backfill_primary_accounts_from_legacy_users(self) -> None:
@@ -508,6 +523,48 @@ class Database:
         if row is None:
             return None
         return row["proton_password_encrypted"]
+
+    # ---------------------------------------------------------------- /cekimap stats
+
+    async def set_last_healthcheck(
+        self, primary_id: int, ok: int, total: int
+    ) -> None:
+        """Persist the most recent /cekimap result for a primary so the
+        /list keyboard can render ``ok/total`` next to the email.
+        """
+        await self.conn.execute(
+            "UPDATE primary_accounts "
+            "SET last_healthcheck_ok = ?, "
+            "    last_healthcheck_total = ?, "
+            "    last_healthcheck_at = ? "
+            "WHERE id = ?",
+            (ok, total, _utcnow(), primary_id),
+        )
+        await self.conn.commit()
+
+    async def get_last_healthcheck_stats(
+        self, chat_id: int
+    ) -> dict[int, tuple[int, int]]:
+        """Return ``{primary_id: (ok, total)}`` for every primary that
+        has had at least one /cekimap run. Primaries with no recorded
+        run are absent from the dict (caller falls back to total alias
+        count).
+        """
+        async with self.conn.execute(
+            "SELECT id, last_healthcheck_ok, last_healthcheck_total "
+            "FROM primary_accounts "
+            "WHERE chat_id = ? "
+            "  AND last_healthcheck_total IS NOT NULL",
+            (chat_id,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return {
+            row["id"]: (
+                int(row["last_healthcheck_ok"] or 0),
+                int(row["last_healthcheck_total"] or 0),
+            )
+            for row in rows
+        }
 
     # ---------------------------------------------------------------- alias generator state
 
