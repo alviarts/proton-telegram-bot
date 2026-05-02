@@ -196,6 +196,13 @@ CB_QUICK_GENADDR = "qgenaddr"
 # the disconnect-done message routes through the existing /connect
 # conversation so the user doesn't have to retype the command.
 CB_CONNECT_AGAIN = "qconnect"
+# PR-F lock-active reminder: a transient bubble posted at the end of
+# common commands while an alias is locked, with two actions —
+# ``CB_LOCK_REMINDER_UNLOCK`` releases the lock, and
+# ``CB_LOCK_REMINDER_PICK_NEW`` re-renders the primary list so the
+# user can switch alias.
+CB_LOCK_REMINDER_UNLOCK = "lockunlock"
+CB_LOCK_REMINDER_PICK_NEW = "lockpicknew"
 # /cekimap entry: trigger an end-to-end health check (Bridge SMTP →
 # tempmail) for every alias of a chosen primary. Two callback flavours:
 # ``hcpick:<primary_id>``  — picker entry (from /cekimap menu and /list).
@@ -572,6 +579,81 @@ async def _send_connect_log(
     return msg
 
 
+async def _maybe_send_lock_reminder(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Post a transient lock-active reminder if the chat has an active alias.
+
+    Hooked into the tail of the main commands (``/list``, ``/cekimap``,
+    ``/genaddr``, ``/history``, ``/accounts``) so the user is gently
+    nudged about the still-locked alias every time they interact with
+    the bot. The reminder carries two action buttons:
+
+      * ``🔓 Unlock`` (``CB_LOCK_REMINDER_UNLOCK``) — release the lock.
+      * ``🔄 Ganti alias`` (``CB_LOCK_REMINDER_PICK_NEW``) — re-render
+        the primary list so they can pick a different alias.
+
+    To avoid stacking, we delete the previous reminder for this chat
+    (tracked in ``chat_data['lock_reminder_msg_id']``) before posting a
+    new one. Failures to delete the prior reminder are silently
+    swallowed because the previous message may have already aged out
+    of Telegram's 48 h delete window.
+
+    Best-effort: every Telegram call is wrapped so a transient API
+    failure does NOT propagate up and break the host command's normal
+    completion path.
+    """
+    chat = update.effective_chat
+    if chat is None:
+        return
+    db = _bot_db(context)
+    try:
+        active = await db.get_active_alias(chat.id)
+    except Exception:
+        LOGGER.exception("lock reminder: failed to read active alias")
+        return
+    if active is None:
+        return
+
+    chat_data = cast(dict, context.chat_data)
+    prev_id = chat_data.pop("lock_reminder_msg_id", None)
+    if prev_id is not None:
+        with contextlib.suppress(Exception):
+            await context.bot.delete_message(
+                chat_id=chat.id, message_id=prev_id
+            )
+
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "🔓 Unlock", callback_data=CB_LOCK_REMINDER_UNLOCK
+                ),
+                InlineKeyboardButton(
+                    "🔄 Ganti alias",
+                    callback_data=CB_LOCK_REMINDER_PICK_NEW,
+                ),
+            ]
+        ]
+    )
+    text = (
+        f"🔒 Alias <code>{html.escape(active.email)}</code> masih aktif. "
+        "Email yang masuk akan diforward ke sini sampai kamu unlock."
+    )
+    try:
+        msg = await update.effective_message.reply_text(  # type: ignore[union-attr]
+            text,
+            reply_markup=keyboard,
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        LOGGER.exception("lock reminder: failed to send")
+        return
+    msg_id = getattr(msg, "message_id", None)
+    if isinstance(msg_id, int):
+        chat_data["lock_reminder_msg_id"] = msg_id
+
+
 async def _show_primary_list(
     update: Update, db: Database, chat_id: int
 ) -> None:
@@ -695,6 +777,7 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     db = _bot_db(context)
     await _show_primary_list(update, db, chat.id)
+    await _maybe_send_lock_reminder(update, context)
 
 
 @_gate
@@ -706,6 +789,7 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     consumed = await db.list_aliases(chat.id, status=AliasStatus.CONSUMED)
     if not consumed:
         await update.effective_message.reply_text("Belum ada alias yang sudah terpakai.")  # type: ignore[union-attr]
+        await _maybe_send_lock_reminder(update, context)
         return
     lines = ["Alias yang sudah terpakai:"]
     for alias in consumed:
@@ -713,6 +797,7 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         lines.append(f"• {alias.email} ({when})")
     lines.append("\nUntuk mengaktifkan kembali: /reset <email>")
     await update.effective_message.reply_text("\n".join(lines))  # type: ignore[union-attr]
+    await _maybe_send_lock_reminder(update, context)
 
 
 # --------------------------------------------------------------- /addalias
@@ -2496,6 +2581,7 @@ async def cmd_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     db = _bot_db(context)
     await _show_primary_list(update, db, chat.id)
+    await _maybe_send_lock_reminder(update, context)
 
 
 # --------------------------------------------------------------- /cekimap
@@ -2906,12 +2992,14 @@ async def cmd_cekimap(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await _start_health_check_for_primary(
             update, context, primary_id=primaries[0].id
         )
+        await _maybe_send_lock_reminder(update, context)
         return
     counts = await _alias_count_per_primary(db, chat.id, primaries)
     await update.effective_message.reply_text(  # type: ignore[union-attr]
         "🩺 Pilih email utama yang mau di-cek IMAP listener-nya:",
         reply_markup=_build_cekimap_picker_keyboard(primaries, counts),
     )
+    await _maybe_send_lock_reminder(update, context)
 
 
 # --------------------------------------------------------------- /setprotonpw
@@ -3359,6 +3447,11 @@ async def cmd_genaddr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         proxy_note=proxy_note,
         pattern=pattern,
     )
+    # PR-F: nudge the user about the still-locked alias right after the
+    # background task is launched. The reminder is intentionally posted
+    # AFTER the starter message so it lands underneath, where the user
+    # is most likely looking.
+    await _maybe_send_lock_reminder(update, context)
 
 
 def _launch_genaddr_task(
@@ -4019,6 +4112,37 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await query.answer(
                 "Listener belum jalan — kirim /connect dulu.", show_alert=True
             )
+        return
+    if data == CB_LOCK_REMINDER_UNLOCK:
+        # PR-F lock reminder: release the active alias lock in-place.
+        # Drop the cached reminder id so the next command posts a fresh
+        # one (or, if the user just unlocked, no reminder at all).
+        chat_data = cast(dict, context.chat_data)
+        chat_data.pop("lock_reminder_msg_id", None)
+        active = await db.get_active_alias(chat_id)
+        if active is None:
+            with contextlib.suppress(BadRequest, Exception):
+                await query.edit_message_text(
+                    "Tidak ada alias aktif yang perlu di-unlock."
+                )
+            return
+        await db.set_active_alias(chat_id, None)
+        with contextlib.suppress(BadRequest, Exception):
+            await query.edit_message_text(
+                f"🔓 Kunci dilepas dari <b>{html.escape(active.email)}</b>. "
+                "Pilih alias di /list saat siap menerima email lagi.",
+                parse_mode=ParseMode.HTML,
+            )
+        return
+    if data == CB_LOCK_REMINDER_PICK_NEW:
+        # PR-F lock reminder: jump back into the primary list so the
+        # user can pick a different alias. Delete the reminder bubble
+        # itself so the chat doesn't accumulate stale prompts.
+        chat_data = cast(dict, context.chat_data)
+        chat_data.pop("lock_reminder_msg_id", None)
+        with contextlib.suppress(BadRequest, Exception):
+            await query.delete_message()
+        await _show_primary_list(update, db, chat_id)
         return
     if data == CB_COPY_ACTIVE_EMAIL:
         # Emit a fresh single-line ``<code>email</code>`` message so desktop
