@@ -1619,11 +1619,30 @@ async def _finalize_connect(
         return ConversationHandler.END
 
     if smoke_test_tempmail is not None:
+        # Provision a FRESH tempmail dedicated to the smoke test
+        # instead of reusing the one Proton already sent the recovery
+        # verification email to. The recovery mailbox often still has
+        # the verification message pending in its listing, plus
+        # Mail.tm sometimes delays delivery of a second message to
+        # the same inbox by 60+ seconds — both blow past the 60s
+        # smoke-test deadline. A separate inbox guarantees the only
+        # message we'll ever see is the bot's own probe.
+        smoke_tempmail = smoke_test_tempmail
+        try:
+            async with httpx.AsyncClient() as client:
+                smoke_tempmail = await TempMailbox.create(client)
+        except TempMailError as exc:
+            LOGGER.warning(
+                "smoke test: failed to create fresh tempmail (%s); "
+                "falling back to recovery tempmail %s",
+                exc,
+                smoke_test_tempmail.address,
+            )
         await _send_connect_log(
             update,
             tracker,
             "🧪 Smoke test IMAP/SMTP: kirim email uji ke temp mail "
-            f"(<code>{html.escape(smoke_test_tempmail.address)}</code>)...",
+            f"(<code>{html.escape(smoke_tempmail.address)}</code>)...",
             parse_mode=ParseMode.HTML,
         )
         # On timeout, ``_smoke_test_with_retry`` waits
@@ -1652,7 +1671,7 @@ async def _finalize_connect(
             email=email,
             imap_username=imap_username,
             imap_password=imap_password,
-            tempmail=smoke_test_tempmail,
+            tempmail=smoke_tempmail,
             on_retry=_on_retry,
         )
         if smoke_ok:
