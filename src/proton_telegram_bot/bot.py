@@ -40,6 +40,7 @@ from .bridge_admin import (
 from .config import Settings
 from .crypto import CredentialCipher
 from .db import Database
+from .health_check import run_health_check
 from .manager import ListenerManager, Notifier
 from .models import AliasRecord, AliasStatus, PrimaryAccount
 from .proton_browser import CreationStatus
@@ -98,6 +99,12 @@ CB_GENADDR_CANCEL = "genaddr_cancel"
 # /genaddr flow without making them re-type the email address.
 CB_QUICK_SETPW = "qsetpw"
 CB_QUICK_GENADDR = "qgenaddr"
+# /cekimap entry: trigger an end-to-end health check (Bridge SMTP →
+# tempmail) for every alias of a chosen primary. Two callback flavours:
+# ``hcpick:<primary_id>``  — picker entry (from /cekimap menu and /list).
+# ``qhc:<primary_id>``      — direct trigger (from after-connect message).
+CB_HEALTHCHECK_PICK = "hcpick"
+CB_QUICK_HEALTHCHECK = "qhc"
 
 
 def _is_allowed(settings: Settings, user_id: int | None) -> bool:
@@ -228,6 +235,14 @@ def _build_alias_keyboard_for_primary(
             ),
         ]
     )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "🩺 Cek IMAP listener (background)",
+                callback_data=f"{CB_HEALTHCHECK_PICK}:{primary.id}",
+            )
+        ]
+    )
     return InlineKeyboardMarkup(rows)
 
 
@@ -328,6 +343,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/unlock — Lepas kunci alias yang sedang aktif\n"
         "/history — Lihat alias yang sudah terpakai\n"
         "/reset — Kembalikan alias ke daftar tersedia\n"
+        "/cekimap — Cek IMAP listener semua alias (jalan di background)\n"
         "/cancel — Batalkan dialog /connect"
     )
     greeting = _greeting(update)
@@ -787,7 +803,12 @@ async def connect_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
 
 def _build_post_connect_keyboard(primary_id: int) -> InlineKeyboardMarkup:
-    """Quick-action buttons for an empty newly-connected primary."""
+    """Quick-action buttons for an empty newly-connected primary.
+
+    Used when the just-connected account has no real aliases yet (the
+    user just made a fresh Proton account). Walks them through the
+    setprotonpw → genaddr workflow without re-typing the email address.
+    """
     return InlineKeyboardMarkup(
         [
             [
@@ -800,6 +821,40 @@ def _build_post_connect_keyboard(primary_id: int) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     "✨ Generate 10 alamat sekarang",
                     callback_data=f"{CB_QUICK_GENADDR}:{primary_id}:10",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🩺 Cek IMAP listener (background)",
+                    callback_data=f"{CB_QUICK_HEALTHCHECK}:{primary_id}",
+                )
+            ],
+        ]
+    )
+
+
+def _build_post_connect_keyboard_with_aliases(
+    primary_id: int, alias_count: int
+) -> InlineKeyboardMarkup:
+    """Quick-action buttons for an existing-aliases newly-connected primary.
+
+    Used when /connect lands on an account that already has aliases
+    (auto-sync just imported them, or they were already in the DB from
+    an earlier session). Shows /list and a one-click "Cek listener"
+    button so the user can immediately validate that every alias under
+    this primary actually receives mail.
+    """
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    f"🩺 Cek IMAP listener semua {alias_count} alias",
+                    callback_data=f"{CB_QUICK_HEALTHCHECK}:{primary_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "📋 Buka /list", callback_data=f"{CB_PICK_PRIMARY}:{primary_id}"
                 )
             ],
         ]
@@ -1078,17 +1133,38 @@ async def _finalize_connect(
                 )
 
     aliases = await db.list_aliases(chat.id, primary_id=primary_id)
-    if not aliases:
+    # Real aliases = anything other than the primary email itself. The
+    # inbox-scan auto-add path can occasionally insert the primary as a
+    # row in the alias table (because Bridge surfaces incoming mail with
+    # ``To: vielzNN@proton.me`` for the primary too); from the user's
+    # perspective that is *not* a real alias, so don't count it when
+    # deciding whether the account is "fresh" / needs onboarding.
+    primary_lower = email.lower()
+    real_aliases = [a for a in aliases if a.email.lower() != primary_lower]
+    if not real_aliases:
         await update.effective_message.reply_text(  # type: ignore[union-attr]
             f"ℹ️ Akun <b>{html.escape(email)}</b> belum punya alias.\n\n"  # noqa: RUF001
-            "Klik tombol di bawah untuk lanjut tanpa mengetik perintah:",
+            "<b>Cara cepat bikin alias:</b>\n"
+            "1️⃣  Klik <b>🔐 Simpan password Proton</b> — sekali aja, "
+            "buat akun ini.\n"
+            "2️⃣  Klik <b>✨ Generate 10 alamat sekarang</b> — bot bikin "
+            "10 alias <code>vielz001..vielz010</code> otomatis.\n"
+            "3️⃣  Pakai <b>🩺 Cek IMAP listener</b> kapan aja buat "
+            "validasi semua alias bisa terima email.",
             parse_mode=ParseMode.HTML,
             reply_markup=_build_post_connect_keyboard(primary_id),
         )
     else:
         await update.effective_message.reply_text(  # type: ignore[union-attr]
-            f"📥 Akun ini sudah punya {len(aliases)} alias. "
-            "Kirim /list untuk lihat semuanya."
+            f"📥 Akun <b>{html.escape(email)}</b> sudah punya "
+            f"<b>{len(real_aliases)}</b> alias.\n"
+            "Kirim /list untuk lihat semuanya, atau klik tombol di "
+            "bawah buat validasi semua alias bisa terima email "
+            "(jalan di background, bot tetap bisa dipakai).",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_build_post_connect_keyboard_with_aliases(
+                primary_id, len(real_aliases)
+            ),
         )
     return ConversationHandler.END
 
@@ -1794,6 +1870,143 @@ async def cmd_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await _show_primary_list(update, db, chat.id)
 
 
+# --------------------------------------------------------------- /cekimap
+
+
+def _build_cekimap_picker_keyboard(
+    primaries: list[PrimaryAccount],
+    counts: dict[int, int],
+) -> InlineKeyboardMarkup:
+    """Picker for /cekimap: one row per primary, label shows alias count."""
+    rows: list[list[InlineKeyboardButton]] = []
+    for primary in primaries:
+        count = counts.get(primary.id, 0)
+        label = f"📧 {primary.email} ({count} alias)"
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    label,
+                    callback_data=f"{CB_HEALTHCHECK_PICK}:{primary.id}",
+                )
+            ]
+        )
+    if not rows:
+        rows.append(
+            [InlineKeyboardButton("(belum ada email utama)", callback_data=CB_NOOP)]
+        )
+    return InlineKeyboardMarkup(rows)
+
+
+def _launch_health_check_task(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    chat_id: int,
+    primary: PrimaryAccount,
+    targets: list[str],
+) -> None:
+    """Spawn run_health_check as a tracked background task.
+
+    Keeps a strong reference on ``application.bot_data['health_check_tasks']``
+    so the asyncio task isn't GC'd before it finishes (RUF006), and
+    sweeps completed tasks out of the list when the next one launches
+    so it doesn't grow unbounded.
+    """
+    db = _bot_db(context)
+    bridge_admin = _bot_bridge_admin(context)
+    bot = context.application.bot
+
+    task_list = context.application.bot_data.setdefault(
+        "health_check_tasks", []
+    )
+    # Drop already-finished tasks to keep the list bounded.
+    task_list[:] = [t for t in task_list if not t.done()]
+
+    task = asyncio.create_task(
+        run_health_check(
+            bot=bot,
+            chat_id=chat_id,
+            db=db,
+            bridge_admin=bridge_admin,
+            primary=primary,
+            targets=targets,
+        ),
+        name=f"healthcheck-{primary.id}",
+    )
+    task_list.append(task)
+
+
+async def _start_health_check_for_primary(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    primary_id: int,
+) -> None:
+    """Resolve targets for ``primary_id`` and kick off a background check."""
+    chat = update.effective_chat
+    if chat is None:
+        return
+    db = _bot_db(context)
+    primary = await db.get_primary_account(chat.id, primary_id)
+    if primary is None:
+        await update.effective_message.reply_text(  # type: ignore[union-attr]
+            "❌ Email utama tidak ditemukan."
+        )
+        return
+    aliases = await db.list_aliases(chat.id, primary_id=primary_id)
+    # Validate the primary itself + every alias under it. The primary is
+    # always included even when it doesn't appear in the alias table:
+    # the user expects "email utama" to be checked too (per their
+    # description: "berikan tombol ceklis pada email utama").
+    targets = [primary.email] + [a.email for a in aliases]
+    _launch_health_check_task(
+        context, chat_id=chat.id, primary=primary, targets=targets
+    )
+
+
+@_gate
+async def cmd_cekimap(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Run an end-to-end health check: send a tagged test email from
+    every alias of a chosen primary to a temp mailbox, then report
+    which ones arrived.
+
+    Lets the user validate that all aliases are still routing mail
+    correctly through Bridge — useful for spotting an alias that
+    silently stopped delivering after a Bridge restart, vault rewrite,
+    or upstream Proton config change.
+
+    Runs as a background task so the user can keep using other bot
+    features (read mail, /list, /genaddr, …) while it executes; live
+    progress is posted to the chat as each alias confirms (or times
+    out).
+    """
+    chat = update.effective_chat
+    if chat is None:
+        return
+    db = _bot_db(context)
+    primaries = await db.list_primary_accounts(chat.id)
+    if not primaries:
+        await update.effective_message.reply_text(  # type: ignore[union-attr]
+            "Belum ada email utama. Kirim /connect dulu sebelum /cekimap."
+        )
+        return
+    if len(primaries) == 1:
+        # Single primary → skip the picker, run immediately.
+        await update.effective_message.reply_text(  # type: ignore[union-attr]
+            f"🩺 Memulai health check untuk <b>{html.escape(primaries[0].email)}</b>"
+            "...",
+            parse_mode=ParseMode.HTML,
+        )
+        await _start_health_check_for_primary(
+            update, context, primary_id=primaries[0].id
+        )
+        return
+    counts = await _alias_count_per_primary(db, chat.id, primaries)
+    await update.effective_message.reply_text(  # type: ignore[union-attr]
+        "🩺 Pilih email utama yang mau di-cek IMAP listener-nya:",
+        reply_markup=_build_cekimap_picker_keyboard(primaries, counts),
+    )
+
+
 # --------------------------------------------------------------- /setprotonpw
 
 
@@ -2472,6 +2685,38 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         context.args = [base, str(count)]
         await cmd_genaddr(update, context)
         return
+    if data.startswith(f"{CB_QUICK_HEALTHCHECK}:") or data.startswith(
+        f"{CB_HEALTHCHECK_PICK}:"
+    ):
+        # Both flavours use ``<prefix>:<primary_id>``; route them to the
+        # same launcher. ``qhc`` comes from after-connect / direct
+        # buttons, ``hcpick`` comes from the /cekimap multi-primary
+        # picker.
+        parts = data.split(":")
+        if len(parts) != 2:
+            await query.answer("Tombol tidak valid.", show_alert=True)
+            return
+        try:
+            primary_id = int(parts[1])
+        except ValueError:
+            await query.answer("Tombol tidak valid.", show_alert=True)
+            return
+        primary = await db.get_primary_account(chat_id, primary_id)
+        if primary is None:
+            await query.answer("Akun tidak ditemukan.", show_alert=True)
+            return
+        await query.answer("🩺 Health check dimulai...", show_alert=False)
+        if query.message is not None:
+            # Drop the keyboard so a second click can't double-launch
+            # the same check while the first one is still running.
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+        await _start_health_check_for_primary(
+            update, context, primary_id=primary_id
+        )
+        return
 
 
 # --------------------------------------------------------------- notifier
@@ -2663,6 +2908,7 @@ def build_handlers() -> list:
         CommandHandler("reset", cmd_reset),
         CommandHandler("disconnect", cmd_disconnect),
         CommandHandler("genaddr", cmd_genaddr),
+        CommandHandler("cekimap", cmd_cekimap),
         connect_conv,
         sync_conv,
         setpw_conv,

@@ -222,6 +222,36 @@ class TempMailbox:
         LOGGER.warning("smoke-test token %s not seen in inbox after %d polls", token, max_attempts)
         return False
 
+    async def list_subjects(
+        self,
+        client: httpx.AsyncClient,
+    ) -> list[str]:
+        """Return all subjects currently in the inbox.
+
+        Used by the health-check task: it sends a batch of tagged emails
+        (one per alias) and then polls the inbox in a loop, matching all
+        observed subjects against the expected per-alias tokens at once
+        — much cheaper than calling ``wait_for_subject`` N times in
+        series.
+        """
+        headers = {"Authorization": f"Bearer {self._token}"}
+        try:
+            resp = await client.get(
+                f"{API_BASE}/messages",
+                headers=headers,
+                timeout=15,
+            )
+            resp.raise_for_status()
+        except Exception:
+            LOGGER.debug("list_subjects poll failed", exc_info=True)
+            return []
+        subjects: list[str] = []
+        for msg in resp.json().get("hydra:member", []):
+            subj = msg.get("subject")
+            if isinstance(subj, str):
+                subjects.append(subj)
+        return subjects
+
 
 def _coerce_text(value: object) -> str:
     """Normalize a Mail.tm body field to a single string.
