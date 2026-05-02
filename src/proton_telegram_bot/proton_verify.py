@@ -604,3 +604,118 @@ async def solve_email_verification(
     await asyncio.sleep(3)
     logger.info("verification code submitted successfully")
     return True
+
+
+# ---------------------------------------------------------------- list addresses
+
+
+async def fetch_all_addresses(page: Page) -> list[str] | None:
+    """Return every Status==1 address Proton's account API knows for this user.
+
+    Uses the *already-logged-in* Playwright page to call
+    ``/api/core/v4/addresses`` from inside the browser context. Doing
+    the request via ``page.evaluate(fetch(...))`` reuses the session
+    cookies + ``x-pm-uid`` headers Proton sets on the dashboard, so
+    we don't have to re-do SRP auth (which can trip CAPTCHA on
+    headless requests). Returns a sorted, lower-cased list of email
+    strings or ``None`` on any error.
+
+    The Proton "Pengguna dan alamat" page paginates the address list
+    to a few rows by default ("18 alamat lainnya" expandable). The
+    underlying API call has no such pagination — it returns the full
+    set in one response — so we hit it directly instead of scraping
+    the rendered DOM.
+    """
+    try:
+        result = await page.evaluate(
+            """async () => {
+                const resp = await fetch('/api/core/v4/addresses', {
+                    method: 'GET',
+                    credentials: 'include',
+                    headers: { 'Accept': 'application/json' },
+                });
+                if (!resp.ok) {
+                    return { ok: false, status: resp.status };
+                }
+                const data = await resp.json();
+                return { ok: true, data: data };
+            }"""
+        )
+    except Exception as exc:  # pragma: no cover - network/eval flake
+        logger.warning("fetch_all_addresses page.evaluate failed: %s", exc)
+        return None
+
+    if not isinstance(result, dict) or not result.get("ok"):
+        logger.warning(
+            "fetch_all_addresses got non-OK response: %s", result
+        )
+        return None
+
+    data = result.get("data") or {}
+    raw = data.get("Addresses") or []
+    addresses: list[str] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        # Status: 1 = enabled (the /api endpoint also returns disabled
+        # ones with Status=2; the UI hides them but they still receive
+        # mail until explicitly deleted, so we keep them).
+        email = entry.get("Email")
+        if isinstance(email, str) and "@" in email:
+            addresses.append(email.lower())
+    return sorted(set(addresses))
+
+
+async def fetch_all_addresses_via_browser(
+    email: str,
+    proton_password: str,
+) -> list[str] | None:
+    """Spawn a Playwright session, log into Proton, fetch addresses, close.
+
+    Convenience wrapper for paths that don't already have a logged-in
+    Playwright page (e.g. ``/connect`` taking the existing-creds short
+    path where the recovery-email Playwright flow is skipped).
+
+    Returns the address list from :func:`fetch_all_addresses`, or
+    ``None`` if Playwright isn't installed, login was blocked
+    (CAPTCHA / 2FA / bad creds), or the API call failed.
+    """
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        logger.warning(
+            "playwright not installed; cannot fetch Proton addresses via browser"
+        )
+        return None
+
+    pw = None
+    browser = None
+    try:
+        pw = await async_playwright().start()
+        browser = await pw.chromium.launch(headless=True)
+        ctx = await browser.new_context()
+        page = await ctx.new_page()
+        user_index = await _login_proton(page, email, proton_password)
+        if user_index is None:
+            failure = getattr(_login_proton, "last_failure", {}) or {}
+            logger.warning(
+                "address sync skipped: Proton login blocker=%s url=%s",
+                failure.get("blocker"),
+                failure.get("url"),
+            )
+            return None
+        return await fetch_all_addresses(page)
+    except Exception:
+        logger.exception("fetch_all_addresses_via_browser unexpected failure")
+        return None
+    finally:
+        if browser:
+            try:
+                await browser.close()
+            except Exception:  # pragma: no cover - best-effort cleanup
+                pass
+        if pw:
+            try:
+                await pw.stop()
+            except Exception:  # pragma: no cover - best-effort cleanup
+                pass

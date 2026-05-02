@@ -1028,6 +1028,55 @@ async def _finalize_connect(
                     await bridge_admin.remove_account(email)
             return ConversationHandler.END
 
+    # Auto-sync addresses from Proton account API if we have them.
+    # The recovery-email Playwright flow stashes the full address list
+    # (pulled from /api/core/v4/addresses with the still-logged-in
+    # browser session) into ``user_data["proton_account_addresses"]``.
+    # We persist them as aliases here, after the primary row exists,
+    # so the user doesn't have to run /sync separately to populate
+    # the 18+ existing addresses on a Business account.
+    proton_addresses = user_data.pop("proton_account_addresses", None)
+    if proton_addresses is None:
+        # Existing-creds path skipped the recovery Playwright flow.
+        # Spawn a one-shot browser session purely to fetch the address
+        # list. This adds ~30s to /connect but makes the auto-sync
+        # behaviour consistent across both paths (the user explicitly
+        # asked for "setiap konek otomatis db akan menambah").
+        proton_password = user_data.pop("connect_proton_password", None)
+        if proton_password:
+            from .proton_verify import fetch_all_addresses_via_browser
+
+            await update.effective_message.reply_text(  # type: ignore[union-attr]
+                "🔍 Sync semua alamat Proton ke DB...",
+            )
+            proton_addresses = await fetch_all_addresses_via_browser(
+                email, proton_password
+            )
+    if proton_addresses:
+        # Filter out the primary email — it's not an "alias" in the
+        # /list sense (it IS the primary), and add_aliases would
+        # silently dedupe but we prefer to not even store it.
+        candidate_aliases = [a for a in proton_addresses if a != email.lower()]
+        if candidate_aliases:
+            try:
+                added = await db.add_aliases(
+                    chat.id, candidate_aliases, primary_id=primary_id
+                )
+            except Exception:  # pragma: no cover - DB failure shouldn't block
+                LOGGER.exception(
+                    "could not auto-sync %d Proton addresses for %s",
+                    len(candidate_aliases),
+                    email,
+                )
+                added = 0
+            if added > 0:
+                await update.effective_message.reply_text(  # type: ignore[union-attr]
+                    f"📥 Auto-sync: <b>{added}</b> alias dari "
+                    f"akun Proton ditambahkan ke DB "
+                    f"(total {len(candidate_aliases)} terdeteksi).",
+                    parse_mode=ParseMode.HTML,
+                )
+
     aliases = await db.list_aliases(chat.id, primary_id=primary_id)
     if not aliases:
         await update.effective_message.reply_text(  # type: ignore[union-attr]
@@ -1048,7 +1097,7 @@ async def _setup_tempmail_recovery(
     update: Update,
     email: str,
     proton_password: str,
-) -> tuple[TempMailbox | None, bool]:
+) -> tuple[TempMailbox | None, bool, list[str] | None]:
     """Create a temp mail and set it as recovery email in Proton settings.
 
     Logs into the Proton web UI, navigates to recovery settings, and
@@ -1056,25 +1105,31 @@ async def _setup_tempmail_recovery(
     Sends the recovery-email verification link to the Telegram user
     for manual click.
 
-    Returns a tuple ``(tempmail, ok)`` where:
+    Returns ``(tempmail, ok, addresses)`` where:
       * ``tempmail`` is the disposable mailbox (or ``None`` on early failure).
       * ``ok`` is ``True`` only if the verification link was sent to the
         chat. When ``ok`` is ``False`` the caller MUST NOT proceed to
         Bridge add-account: Proton login or recovery email change failed
         and the user needs to retry ``/connect``.
+      * ``addresses`` is the full list of email addresses Proton's
+        ``/api/core/v4/addresses`` endpoint returned for this user
+        (extracted from the still-logged-in browser session before
+        teardown), so the caller can persist them as aliases. ``None``
+        when the API call failed; an empty list is also possible
+        (very rare, single-address account).
     """
     try:
         from playwright.async_api import async_playwright
     except ImportError:
         LOGGER.warning("playwright not installed; skipping recovery email setup")
-        return None, False
+        return None, False, None
 
     async with httpx.AsyncClient() as client:
         try:
             tempmail = await TempMailbox.create(client)
         except TempMailError as exc:
             LOGGER.warning("failed to create temp mailbox: %s", exc)
-            return None, False
+            return None, False, None
 
         await update.effective_message.reply_text(  # type: ignore[union-attr]
             f"📧 Temp mail dibuat: <code>{html.escape(tempmail.address)}</code>\n"
@@ -1085,7 +1140,11 @@ async def _setup_tempmail_recovery(
         pw = None
         browser = None
         try:
-            from .proton_verify import _login_proton, change_recovery_email
+            from .proton_verify import (
+                _login_proton,
+                change_recovery_email,
+                fetch_all_addresses,
+            )
 
             pw = await async_playwright().start()
             browser = await pw.chromium.launch(headless=True)
@@ -1141,7 +1200,7 @@ async def _setup_tempmail_recovery(
                             )
                     except Exception as exc:
                         LOGGER.debug("could not send login-failure screenshot: %s", exc)
-                return tempmail, False
+                return tempmail, False, None
 
             # Change recovery email and get verification link
             verify_link = await change_recovery_email(
@@ -1149,13 +1208,25 @@ async def _setup_tempmail_recovery(
                 user_index=user_index,
             )
             if verify_link:
+                # Reuse the still-logged-in browser session to pull every
+                # address Proton knows about for this account; we can
+                # then auto-add them as aliases once /connect finishes.
+                # Doing it here (vs. spawning a second browser later)
+                # saves ~30s on the happy path.
+                addresses = await fetch_all_addresses(page)
+                if addresses is not None:
+                    LOGGER.info(
+                        "Proton account %s has %d addresses (will sync after connect)",
+                        email,
+                        len(addresses),
+                    )
                 await update.effective_message.reply_text(  # type: ignore[union-attr]
                     f"📧 Recovery email diubah ke <code>{html.escape(tempmail.address)}</code>\n\n"
                     "Klik link berikut untuk verifikasi recovery email:\n"
                     f"{html.escape(verify_link)}",
                     parse_mode=ParseMode.HTML,
                 )
-                return tempmail, True
+                return tempmail, True, addresses
 
             failure = getattr(change_recovery_email, "last_failure", {}) or {}
             step = failure.get("step", "unknown")
@@ -1178,10 +1249,10 @@ async def _setup_tempmail_recovery(
                         )
                 except Exception as exc:
                     LOGGER.debug("could not send recovery-failure screenshot: %s", exc)
-            return tempmail, False
+            return tempmail, False, None
         except Exception:
             LOGGER.exception("recovery email setup failed")
-            return tempmail, False
+            return tempmail, False, None
         finally:
             if browser:
                 with contextlib.suppress(Exception):
@@ -1287,7 +1358,7 @@ async def _drive_bridge_login(
     # Step 0: set up temp mail + change recovery email BEFORE Bridge login.
     # This must happen before Bridge login because the Bridge CLI stops
     # the service (and thus the Proton web session is separate).
-    tempmail, recovery_ok = await _setup_tempmail_recovery(
+    tempmail, recovery_ok, proton_addresses = await _setup_tempmail_recovery(
         update, email, proton_password
     )
     if not recovery_ok:
@@ -1306,6 +1377,9 @@ async def _drive_bridge_login(
     user_data["bridge_recovery_email"] = email
     user_data["bridge_recovery_proton_password"] = proton_password
     user_data["bridge_recovery_tempmail"] = tempmail
+    # Stash the list pulled from /api/core/v4/addresses so _finalize_connect
+    # can persist them as aliases once IMAP comes up.
+    user_data["proton_account_addresses"] = proton_addresses
     await update.effective_message.reply_text(  # type: ignore[union-attr]
         "👆 Klik link verifikasi di atas dan selesaikan di browser "
         "(buka link, tekan tombol verifikasi di halaman Proton).\n\n"
@@ -1437,9 +1511,17 @@ async def connect_password(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         return ConversationHandler.END
 
+    # Stash the Proton account password so _finalize_connect can pull
+    # the full address list via Playwright in the existing-creds short
+    # path (where _setup_tempmail_recovery is skipped).
+    user_data["connect_proton_password"] = text
+
     bridge_admin = _bot_bridge_admin(context)
     if bridge_admin is None:
         # Legacy path: user typed the Bridge IMAP password directly.
+        # That's the Bridge IMAP password, not the Proton account
+        # password, so address sync wouldn't work — clear the key.
+        user_data.pop("connect_proton_password", None)
         return await _finalize_connect(
             update,
             context,
