@@ -25,6 +25,12 @@ dev = [
     "pytest-asyncio>=0.23.0",
     "ruff>=0.6.0",
 ]
+# Optional deps for the host-side helper scripts in scripts/.
+# Only required when BRIDGE_ADMIN_ENABLED=true.
+bridge-admin = [
+    "msgpack>=1.0.0",
+    "pexpect>=4.9.0",
+]
 
 [project.scripts]
 proton-telegram-bot = "proton_telegram_bot.__main__:main"

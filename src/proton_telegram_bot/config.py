@@ -15,6 +15,7 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
         case_sensitive=False,
+        populate_by_name=True,
     )
 
     telegram_bot_token: str = Field(..., min_length=1)
@@ -26,6 +27,50 @@ class Settings(BaseSettings):
     allowed_user_ids_raw: str = Field(default="", alias="ALLOWED_USER_IDS")
     log_level: str = Field(default="INFO")
     alias_sync_interval_minutes: int = Field(default=5)
+
+    # --- Optional Bridge auto-add support ---
+    # When enabled, /connect can use the user's *Proton account* password to
+    # automatically add the account to the host's Proton Bridge (via
+    # ``bridge --cli``), then extract the per-account IMAP password from the
+    # encrypted vault. This requires the bot to run on the same host as
+    # Bridge with permission to call ``systemctl`` and read the vault key.
+    bridge_admin_enabled: bool = Field(default=False, alias="BRIDGE_ADMIN_ENABLED")
+    bridge_add_account_script: Path = Field(
+        default=Path("scripts/bridge_add_account.py"),
+        alias="BRIDGE_ADD_ACCOUNT_SCRIPT",
+    )
+    bridge_decrypt_vault_script: Path = Field(
+        default=Path("scripts/bridge_decrypt_vault.py"),
+        alias="BRIDGE_DECRYPT_VAULT_SCRIPT",
+    )
+    bridge_vault_path: Path = Field(
+        default=Path("/root/.config/protonmail/bridge-v3/vault.enc"),
+        alias="BRIDGE_VAULT_PATH",
+    )
+    # Shell command (single string passed to ``sh -c``) that prints the
+    # raw vault key to stdout. Default uses the standard ``pass`` keychain
+    # entry that Proton Bridge writes on first run.
+    bridge_vault_key_command: str = Field(
+        default=(
+            "pass show docker-credential-helpers/"
+            "cHJvdG9ubWFpbC9icmlkZ2UtdjMvdXNlcnMvYnJpZGdlLXZhdWx0LWtleQ=="
+            "/bridge-vault-key"
+        ),
+        alias="BRIDGE_VAULT_KEY_COMMAND",
+    )
+    bridge_captcha_url_file: Path = Field(
+        default=Path("/tmp/bridge_captcha_url.txt"),
+        alias="BRIDGE_CAPTCHA_URL_FILE",
+    )
+    bridge_captcha_done_flag: Path = Field(
+        default=Path("/tmp/bridge_captcha_done.flag"),
+        alias="BRIDGE_CAPTCHA_DONE_FLAG",
+    )
+    bridge_captcha_timeout_seconds: int = Field(
+        default=600, alias="BRIDGE_CAPTCHA_TIMEOUT_SECONDS"
+    )
+    bridge_python: str = Field(default="python3", alias="BRIDGE_PYTHON")
+    bridge_sudo: bool = Field(default=False, alias="BRIDGE_SUDO")
 
     @computed_field  # type: ignore[prop-decorator]
     @property

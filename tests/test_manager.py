@@ -179,6 +179,114 @@ async def test_discovered_aliases_adds_and_notifies(db: Database) -> None:
     assert sorted(notifier.discovery_calls[0][1]) == ["new1@proton.me", "new2@proton.me"]
 
 
+async def test_lock_on_other_primary_does_not_drop_email_for_this_primary(
+    db: Database,
+) -> None:
+    """Regression: locking an alias on primary B must not silently drop
+    incoming mail for primary A. This was the multi-primary bug that broke
+    vielz43's inbox after the user clicked vielz003 (under vielz64) in
+    /list — the cross-primary lock check returned early for *every*
+    listener, including the one not holding the lock.
+    """
+    chat_id = 300
+    await db.upsert_user(chat_id)
+    primary_a = await _seed_primary(db, chat_id, "vielz43@proton.me")
+    primary_b = await _seed_primary(db, chat_id, "vielz64@proton.me")
+    await db.add_aliases(
+        chat_id, ["vielz54@proton.me", "vielz55@proton.me"], primary_id=primary_a
+    )
+    await db.add_aliases(
+        chat_id, ["vielz003@proton.me"], primary_id=primary_b
+    )
+    locked = await db.find_alias(chat_id, "vielz003@proton.me")
+    assert locked is not None and locked.primary_id == primary_b
+    await db.set_active_alias(chat_id, locked.id)
+
+    notifier = _RecordingNotifier()
+    manager = ListenerManager(
+        db=db,
+        cipher=CredentialCipher(CredentialCipher.generate_key()),
+        notifier=notifier,
+    )
+
+    # Email arrives via primary_a's listener for one of A's known aliases.
+    # Even though primary_b has a lock, A's mail must still flow.
+    await manager._handle_new_message(
+        chat_id, primary_a, _make_message("vielz54@proton.me"), "1"
+    )
+    assert len(notifier.calls) == 1
+    assert notifier.calls[0][1] == "vielz54@proton.me"
+
+    # Email arrives via primary_b's listener targeting the locked alias.
+    await manager._handle_new_message(
+        chat_id, primary_b, _make_message("vielz003@proton.me"), "2"
+    )
+    assert len(notifier.calls) == 2
+    assert notifier.calls[1][1] == "vielz003@proton.me"
+
+    # Email arrives via primary_b's listener for a *different* primary_b
+    # alias (not the locked one). With B's lock pinned to vielz003, that
+    # email must be dropped.
+    await db.add_aliases(chat_id, ["vielz004@proton.me"], primary_id=primary_b)
+    await manager._handle_new_message(
+        chat_id, primary_b, _make_message("vielz004@proton.me"), "3"
+    )
+    assert len(notifier.calls) == 2  # unchanged
+
+
+async def test_no_lock_forwards_known_alias_of_same_primary(db: Database) -> None:
+    """No active lock + email targets a previously-known alias of the
+    listener's primary → forwarded. This is the "primary baru otomatis
+    aktif" flow: a freshly-connected primary with no alias pinned should
+    forward email to any of its aliases out of the box.
+    """
+    chat_id = 400
+    await db.upsert_user(chat_id)
+    primary_id = await _seed_primary(db, chat_id, "vielz64@proton.me")
+    await db.add_aliases(
+        chat_id, ["vielz003@proton.me", "vielz004@proton.me"], primary_id=primary_id
+    )
+    notifier = _RecordingNotifier()
+    manager = ListenerManager(
+        db=db,
+        cipher=CredentialCipher(CredentialCipher.generate_key()),
+        notifier=notifier,
+    )
+    await manager._handle_new_message(
+        chat_id, primary_id, _make_message("vielz004@proton.me"), "1"
+    )
+    assert [c[1] for c in notifier.calls] == ["vielz004@proton.me"]
+
+
+async def test_no_lock_does_not_forward_brand_new_alias_on_first_email(
+    db: Database,
+) -> None:
+    """Brand-new addresses get auto-added to /list but NOT forwarded the
+    same instant they're discovered, so a third party can't trigger a
+    Telegram notification by emailing a never-seen-before address.
+    """
+    chat_id = 500
+    await db.upsert_user(chat_id)
+    primary_id = await _seed_primary(db, chat_id, "vielz64@proton.me")
+    # No aliases pre-seeded.
+    notifier = _RecordingNotifier()
+    manager = ListenerManager(
+        db=db,
+        cipher=CredentialCipher(CredentialCipher.generate_key()),
+        notifier=notifier,
+    )
+    await manager._handle_new_message(
+        chat_id, primary_id, _make_message("brand-new@proton.me"), "1"
+    )
+    # No notification on first sighting.
+    assert notifier.calls == []
+    # But the alias is now in /list, so a *second* email to it forwards.
+    await manager._handle_new_message(
+        chat_id, primary_id, _make_message("brand-new@proton.me"), "2"
+    )
+    assert [c[1] for c in notifier.calls] == ["brand-new@proton.me"]
+
+
 async def test_handle_message_does_not_rematch_consumed_alias(db: Database) -> None:
     chat_id = 9
     await db.upsert_user(chat_id)

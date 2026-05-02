@@ -149,6 +149,38 @@ and note the credentials it provides:
 > `protonmail-bridge --cli`. See the
 > [Bridge documentation](https://proton.me/support/bridge) for details.
 
+### Optional: auto-register accounts with Bridge
+
+Set `BRIDGE_ADMIN_ENABLED=true` if the bot runs on the Bridge host and
+you'd rather have `/connect` ask for your **Proton account** password
+than the random Bridge IMAP password. The bot will then:
+
+1. Stop `protonmail-bridge.service`.
+2. Drive `bridge --cli login` with the email / Proton password you
+   typed in `/connect`.
+3. If Proton requests human verification, the bot forwards the
+   verification URL to the Telegram chat — solve it in a browser, then
+   reply `ok` and the bot resumes.
+4. Restart `protonmail-bridge.service` and decrypt the vault to pluck
+   out the per-account IMAP password Bridge just generated.
+5. Save the IMAP password to the bot's DB (Fernet-encrypted) and start
+   the listener — no manual copy/paste required.
+
+Requirements (typical setup):
+
+- The bot runs as root (or with `BRIDGE_SUDO=true` plus a sudoers rule)
+  so it can `systemctl start/stop protonmail-bridge.service`.
+- The `pass` keychain entry that Bridge writes on first run is
+  readable by that user. The default
+  `BRIDGE_VAULT_KEY_COMMAND` matches the standard install layout.
+- The `cryptography`, `msgpack`, and `pexpect` packages are installed
+  in the Python environment that runs the helper scripts. They are
+  pulled in via the `[bridge-admin]` extra:
+  `pip install -e '.[bridge-admin]'`.
+
+When `BRIDGE_ADMIN_ENABLED=false` (default), `/connect` works the same
+as before — you paste the Bridge IMAP password manually.
+
 ## Environment variables
 
 | Variable | Required | Description |
@@ -159,6 +191,16 @@ and note the credentials it provides:
 | `ALLOWED_USER_IDS` | no | Comma-separated list of Telegram user IDs allowed to use the bot. Empty = anyone. |
 | `LOG_LEVEL` | no | `DEBUG`, `INFO`, `WARNING`, or `ERROR`. Default: `INFO`. |
 | `ALIAS_SYNC_INTERVAL_MINUTES` | no | How often (in minutes) to re-scan the inbox for new aliases. Default: `5`. |
+| `BRIDGE_ADMIN_ENABLED` | no | Set to `true` to let `/connect` accept your **Proton account** password and auto-register the account with Proton Bridge (instead of asking for the Bridge IMAP password). Requires the bot to run on the Bridge host with permission to call `systemctl` and read the Bridge vault key. Default: `false`. |
+| `BRIDGE_ADD_ACCOUNT_SCRIPT` | no | Path to `bridge_add_account.py`. Default: `scripts/bridge_add_account.py`. |
+| `BRIDGE_DECRYPT_VAULT_SCRIPT` | no | Path to `bridge_decrypt_vault.py`. Default: `scripts/bridge_decrypt_vault.py`. |
+| `BRIDGE_VAULT_PATH` | no | Bridge encrypted-vault file. Default: `/root/.config/protonmail/bridge-v3/vault.enc`. |
+| `BRIDGE_VAULT_KEY_COMMAND` | no | Shell command (run with `sh -c`) that prints the raw vault key on stdout. Default: `pass show docker-credential-helpers/<base64>/bridge-vault-key`. |
+| `BRIDGE_CAPTCHA_URL_FILE` | no | Path the helper uses to write a CAPTCHA verification URL. Default: `/tmp/bridge_captcha_url.txt`. |
+| `BRIDGE_CAPTCHA_DONE_FLAG` | no | Path the bot creates once the user has solved the CAPTCHA. Default: `/tmp/bridge_captcha_done.flag`. |
+| `BRIDGE_CAPTCHA_TIMEOUT_SECONDS` | no | How long the helper waits for the user to solve a CAPTCHA. Default: `600`. |
+| `BRIDGE_PYTHON` | no | Python interpreter used to run the helper scripts. Default: `python3`. |
+| `BRIDGE_SUDO` | no | Set to `true` to wrap helper invocations in `sudo -n …`. Default: `false`. |
 
 ## Telegram commands
 

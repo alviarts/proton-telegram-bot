@@ -6,6 +6,7 @@ import html
 import logging
 from typing import Any, cast
 
+import aioimaplib
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -23,6 +24,14 @@ from telegram.ext import (
 )
 
 from . import address_generator
+from .bridge_admin import (
+    BridgeAdmin,
+    BridgeAdminError,
+    BridgeImapCredentials,
+    CaptchaRequired,
+    LoginFailed,
+    LoginSucceeded,
+)
 from .config import Settings
 from .crypto import CredentialCipher
 from .db import Database
@@ -32,15 +41,20 @@ from .proton_browser import CreationStatus
 
 LOGGER = logging.getLogger(__name__)
 
-# Conversation states for /connect
-(
-    CONNECT_EMAIL,
-    CONNECT_HOST,
-    CONNECT_PORT,
-    CONNECT_USERNAME,
-    CONNECT_PASSWORD,
-    CONNECT_SSL,
-) = range(6)
+# Conversation states for /connect.
+#
+# We deliberately keep this short: the older flow asked for host/port/SSL/
+# username separately, but the answer is *always* 127.0.0.1:1143 + STARTTLS
+# + username==email when the user is running the standard Proton Bridge
+# locally (which is the only supported setup). Asking those four extra
+# questions was pure friction. The constants below are the ones we now
+# hard-code; if a future setup ever needs different values we can wire a
+# dedicated /connect_advanced command instead of bringing the questions
+# back into the default path.
+CONNECT_EMAIL, CONNECT_PASSWORD, CONNECT_BRIDGE_CAPTCHA = range(3)
+CONNECT_DEFAULT_HOST = "127.0.0.1"
+CONNECT_DEFAULT_PORT = 1143
+CONNECT_DEFAULT_SSL = False
 
 # Conversation states for /sync
 SYNC_CAPTCHA = 10
@@ -67,6 +81,11 @@ CB_PICK_PRIMARY = "pickp"
 CB_BACK_TO_PRIMARIES = "backp"
 CB_DEL_PRIMARY = "delp"
 CB_GENADDR_CANCEL = "genaddr_cancel"
+# Quick-action buttons shown after /connect when the new primary has zero
+# aliases. They short-circuit the user back into the right /setprotonpw or
+# /genaddr flow without making them re-type the email address.
+CB_QUICK_SETPW = "qsetpw"
+CB_QUICK_GENADDR = "qgenaddr"
 
 
 def _is_allowed(settings: Settings, user_id: int | None) -> bool:
@@ -108,6 +127,16 @@ def _bot_cipher(context: ContextTypes.DEFAULT_TYPE) -> CredentialCipher:
 
 def _bot_manager(context: ContextTypes.DEFAULT_TYPE) -> ListenerManager:
     return cast(ListenerManager, context.application.bot_data["manager"])
+
+
+def _bot_bridge_admin(
+    context: ContextTypes.DEFAULT_TYPE,
+) -> BridgeAdmin | None:
+    """Return the configured BridgeAdmin, or ``None`` if auto-add is off."""
+    admin = context.application.bot_data.get("bridge_admin")
+    if admin is None or not getattr(admin, "enabled", False):
+        return None
+    return cast(BridgeAdmin, admin)
 
 
 def _build_primary_keyboard(
@@ -239,6 +268,22 @@ async def _show_primary_list(
 # --------------------------------------------------------------- /start
 
 
+def _greeting(update: Update) -> str:
+    """Build a personalised opening line for /start.
+
+    Prefers the Telegram first name (more conversational), falls back to
+    @username, then a plain ``Halo!``. Keeping this in one place so we
+    don't drift between handlers.
+    """
+    user = update.effective_user
+    if user is not None:
+        if user.first_name:
+            return f"Halo, <b>{html.escape(user.first_name)}</b>!"
+        if user.username:
+            return f"Halo, <b>@{html.escape(user.username)}</b>!"
+    return "Halo!"
+
+
 @_gate
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat = update.effective_chat
@@ -246,6 +291,16 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     db = _bot_db(context)
     await db.upsert_user(chat.id)
+    quickstart = (
+        "\n\n<b>Cara pakai (4 langkah):</b>\n"
+        "1️⃣  Buka Proton Bridge di server &amp; login akun Proton-mu.\n"
+        "2️⃣  Kirim <code>/connect</code> — masukkan email + password "
+        "Bridge, sisanya otomatis.\n"
+        "3️⃣  Kirim <code>/setprotonpw</code> — simpan password master "
+        "Proton (sekali aja, dipakai /genaddr).\n"
+        "4️⃣  Kirim <code>/genaddr vielz 10</code> — buat 10 alamat "
+        "<code>vielz001..vielz010</code> otomatis."
+    )
     commands_help = (
         "\n\n<b>Perintah yang tersedia:</b>\n"
         "/start — Tampilkan pesan ini\n"
@@ -263,21 +318,21 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/reset — Kembalikan alias ke daftar tersedia\n"
         "/cancel — Batalkan dialog /connect"
     )
+    greeting = _greeting(update)
     primaries = await db.list_primary_accounts(chat.id)
     if not primaries:
         await update.effective_message.reply_text(  # type: ignore[union-attr]
-            "Halo! Aku akan memberitahumu kalau ada email masuk ke alias Proton-mu.\n\n"
-            "Langkah:\n"
-            "1) Jalankan Proton Bridge dan login akun Proton di sana.\n"
-            "2) Kirim /connect untuk daftarin akun itu ke bot.\n"
-            "3) Kamu bisa /connect lagi untuk akun Proton lain (multi-akun didukung).\n"
-            "4) Kirim /list untuk lihat semua email utama + alias-aliasnya."
+            f"{greeting} Aku akan memberitahumu kalau ada email masuk "
+            "ke alias Proton-mu."
+            + quickstart
             + commands_help,
             parse_mode=ParseMode.HTML,
         )
         return
     await update.effective_message.reply_text(  # type: ignore[union-attr]
-        "Halo!" + commands_help,
+        f"{greeting} Berikut akun Proton-mu yang sudah terdaftar."
+        + quickstart
+        + commands_help,
         parse_mode=ParseMode.HTML,
     )
     await _show_primary_list(update, db, chat.id)
@@ -531,6 +586,72 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # --------------------------------------------------------------- /connect (ConversationHandler)
 
 
+async def _verify_bridge_login(
+    *, host: str, port: int, username: str, password: str, use_ssl: bool
+) -> tuple[bool, str]:
+    """Try a single LOGIN against the user-supplied IMAP creds.
+
+    Returns ``(ok, detail)``. We do this *before* persisting the row so a
+    typo in the Bridge password fails loud — the previous flow happily
+    saved bogus creds, then the listener would silently NONAUTH-loop
+    every two minutes and the user just saw "no email arrives". Bridge
+    runs locally so the round-trip cost is negligible.
+    """
+    try:
+        if use_ssl:
+            client = aioimaplib.IMAP4_SSL(host=host, port=port, timeout=10)
+        else:
+            client = aioimaplib.IMAP4(host=host, port=port, timeout=10)
+        try:
+            await client.wait_hello_from_server()
+            resp = await client.login(username, password)
+            if resp.result != "OK":
+                detail = " | ".join(
+                    line.decode("utf-8", "replace")
+                    if isinstance(line, bytes)
+                    else str(line)
+                    for line in (resp.lines or [])
+                ) or resp.result
+                return False, detail
+            try:
+                await client.logout()
+            except Exception:
+                # Best-effort cleanup; LOGIN already succeeded so we don't
+                # care if LOGOUT errors out.
+                pass
+            return True, ""
+        finally:
+            try:
+                await client.close()
+            except Exception:
+                pass
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+
+
+def _connect_password_prompt(bridge_admin_on: bool) -> str:
+    """Return the right Step 2 prompt depending on auto-add availability.
+
+    With auto-add on, the bot accepts the user's *Proton account*
+    password and handles Bridge enrolment internally — much friendlier
+    than asking the user to copy a 22-character random string out of
+    Bridge's GUI.
+    """
+    if bridge_admin_on:
+        return (
+            "Step 2/2 — kirim <b>password Proton akunmu</b> (yang biasa "
+            "kamu pakai login di proton.me).\n"
+            "Bot akan otomatis daftarkan akun ini ke Proton Bridge & "
+            "ambil password IMAP-nya. Kalau ada CAPTCHA, link verifikasi "
+            "akan dikirim ke chat ini.\n"
+            "💡 <i>Hapus pesan password setelah bot konfirmasi sukses.</i>"
+        )
+    return (
+        "Step 2/2 — kirim password IMAP Bridge (akan disimpan terenkripsi).\n"
+        "💡 <i>Hapus pesan password setelah bot konfirmasi sukses.</i>"
+    )
+
+
 @_gate
 async def cmd_connect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     chat = update.effective_chat
@@ -538,22 +659,54 @@ async def cmd_connect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         return ConversationHandler.END
     db = _bot_db(context)
     existing = await db.list_primary_accounts(chat.id)
-    intro = (
-        "Tambah akun Proton baru. Setiap kali /connect kamu menambahkan satu "
-        "akun email utama (multi-akun didukung)."
-    )
+    bridge_admin_on = _bot_bridge_admin(context) is not None
+
+    if bridge_admin_on:
+        intro = (
+            "Tambah akun Proton baru.\n\n"
+            "<b>Yang kamu butuhkan:</b>\n"
+            "• Alamat email Proton (mis. <code>vielz43@proton.me</code>)\n"
+            "• Password Proton akunmu (bukan password Bridge — bot urus "
+            "Bridge-nya otomatis)\n\n"
+            "Bot akan: daftarkan akun ke Bridge → ambil IMAP password "
+            "otomatis → start listener. Kalau Proton minta CAPTCHA, "
+            "linknya dikirim ke chat ini."
+        )
+    else:
+        intro = (
+            "Tambah akun Proton baru.\n\n"
+            "<b>Yang kamu butuhkan:</b>\n"
+            "• Alamat email Proton (mis. <code>vielz43@proton.me</code>)\n"
+            "• Password IMAP yang di-generate Proton Bridge "
+            "(<i>bukan</i> password Proton akunmu — ambil dari Proton Bridge "
+            "→ akun → 'Mailbox details')\n\n"
+            "Aku otomatis pakai default Bridge: "
+            f"<code>{CONNECT_DEFAULT_HOST}:{CONNECT_DEFAULT_PORT}</code>, "
+            "STARTTLS, username = email."
+        )
     if existing:
         emails = ", ".join(p.email for p in existing)
         intro += (
-            f"\n\nSaat ini terdaftar: <b>{html.escape(emails)}</b>. "
+            f"\n\nSudah terdaftar: <b>{html.escape(emails)}</b>. "
             "Kalau email yang sama dimasukkan ulang, kredensial-nya akan ditimpa."
         )
     await update.effective_message.reply_text(  # type: ignore[union-attr]
         intro,
         parse_mode=ParseMode.HTML,
     )
+    # Allow `/connect <email>` as a one-shot entry to skip the email prompt.
+    args = list(context.args or [])
+    if args and "@" in args[0]:
+        cast(dict, context.user_data)["primary_email"] = args[0].strip().lower()
+        await update.effective_message.reply_text(  # type: ignore[union-attr]
+            _connect_password_prompt(bridge_admin_on),
+            parse_mode=ParseMode.HTML,
+        )
+        return CONNECT_PASSWORD
     await update.effective_message.reply_text(  # type: ignore[union-attr]
-        "Alamat email Proton akun ini? (mis. vielz43@proton.me)"
+        "Step 1/2 — kirim alamat email Proton-nya (mis. "
+        "<code>vielz43@proton.me</code>):",
+        parse_mode=ParseMode.HTML,
     )
     return CONNECT_EMAIL
 
@@ -565,83 +718,108 @@ async def connect_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             "Itu bukan alamat email yang valid. Masukkan email Proton-nya:"
         )
         return CONNECT_EMAIL
-    context.user_data["primary_email"] = text.lower()  # type: ignore[index]
+    cast(dict, context.user_data)["primary_email"] = text.lower()
     await update.effective_message.reply_text(  # type: ignore[union-attr]
-        "Host Bridge? (default: 127.0.0.1)"
-    )
-    return CONNECT_HOST
-
-
-async def connect_host(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = (update.effective_message.text or "").strip()  # type: ignore[union-attr]
-    context.user_data["imap_host"] = text or "127.0.0.1"  # type: ignore[index]
-    await update.effective_message.reply_text("Port? (default Bridge: 1143)")  # type: ignore[union-attr]
-    return CONNECT_PORT
-
-
-async def connect_port(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = (update.effective_message.text or "").strip()  # type: ignore[union-attr]
-    if not text:
-        text = "1143"
-    if not text.isdigit():
-        await update.effective_message.reply_text("Port harus angka. Coba lagi:")  # type: ignore[union-attr]
-        return CONNECT_PORT
-    context.user_data["imap_port"] = int(text)  # type: ignore[index]
-    await update.effective_message.reply_text(  # type: ignore[union-attr]
-        "Username IMAP Bridge? (biasanya sama dengan alamat email di atas — "
-        "tekan Enter / kirim '.' untuk pakai email yang sudah kamu kasih)"
-    )
-    return CONNECT_USERNAME
-
-
-async def connect_username(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = (update.effective_message.text or "").strip()  # type: ignore[union-attr]
-    if not text or text == ".":
-        text = cast(dict, context.user_data)["primary_email"]
-    context.user_data["imap_username"] = text  # type: ignore[index]
-    await update.effective_message.reply_text(  # type: ignore[union-attr]
-        "Password yang di-generate Proton Bridge? (akan disimpan terenkripsi). "
-        "Pesan ini bisa kamu hapus setelah bot mengkonfirmasi."
+        _connect_password_prompt(_bot_bridge_admin(context) is not None),
+        parse_mode=ParseMode.HTML,
     )
     return CONNECT_PASSWORD
 
 
-async def connect_password(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = (update.effective_message.text or "").strip()  # type: ignore[union-attr]
-    if not text:
-        await update.effective_message.reply_text("Password tidak boleh kosong:")  # type: ignore[union-attr]
-        return CONNECT_PASSWORD
-    context.user_data["imap_password"] = text  # type: ignore[index]
-    await update.effective_message.reply_text(  # type: ignore[union-attr]
-        "Pakai SSL/TLS? Ketik 'yes' untuk SSL langsung (jarang), 'no' untuk STARTTLS (default Bridge)."
+def _build_post_connect_keyboard(primary_id: int) -> InlineKeyboardMarkup:
+    """Quick-action buttons for an empty newly-connected primary."""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "🔐 Simpan password Proton",
+                    callback_data=f"{CB_QUICK_SETPW}:{primary_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "✨ Generate 10 alamat sekarang",
+                    callback_data=f"{CB_QUICK_GENADDR}:{primary_id}:10",
+                )
+            ],
+        ]
     )
-    return CONNECT_SSL
 
 
-async def connect_ssl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = (update.effective_message.text or "").strip().lower()  # type: ignore[union-attr]
-    use_ssl = text in {"y", "yes", "true", "1", "ssl"}
+async def _finalize_connect(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    email: str,
+    imap_username: str,
+    imap_password: str,
+) -> int:
+    """Common tail of /connect: verify, save, start listener, friendly reply.
+
+    Both the legacy "user-typed-Bridge-password" path and the new
+    "auto-extracted-from-Bridge-vault" path land here once we hold a
+    plausible IMAP password.
+    """
     chat = update.effective_chat
     if chat is None:
         return ConversationHandler.END
+    user_data = cast(dict, context.user_data)
+    host = CONNECT_DEFAULT_HOST
+    port = CONNECT_DEFAULT_PORT
+    use_ssl = CONNECT_DEFAULT_SSL
+
+    await update.effective_message.reply_text(  # type: ignore[union-attr]
+        f"🔌 Cek login ke Bridge sebagai <b>{html.escape(email)}</b>...",
+        parse_mode=ParseMode.HTML,
+    )
+    ok, detail = await _verify_bridge_login(
+        host=host,
+        port=port,
+        username=imap_username,
+        password=imap_password,
+        use_ssl=use_ssl,
+    )
+    if not ok:
+        await update.effective_message.reply_text(  # type: ignore[union-attr]
+            "❌ Bridge menolak login. Pastikan password yang kamu kirim "
+            "adalah <b>password IMAP yang di-generate Bridge</b> (bukan "
+            "password akun Proton kamu).\n\n"
+            f"Detail: <code>{html.escape(detail)}</code>\n\n"
+            "Kirim password yang benar lagi, atau /cancel untuk batal:",
+            parse_mode=ParseMode.HTML,
+        )
+        return CONNECT_PASSWORD
+
     db = _bot_db(context)
     cipher = _bot_cipher(context)
     manager = _bot_manager(context)
-    user_data = cast(dict, context.user_data)
-    encrypted = cipher.encrypt(user_data["imap_password"])
+    encrypted = cipher.encrypt(imap_password)
     primary_id = await db.add_primary_account(
         chat_id=chat.id,
-        email=user_data["primary_email"],
-        host=user_data["imap_host"],
-        port=user_data["imap_port"],
-        username=user_data["imap_username"],
+        email=email,
+        host=host,
+        port=port,
+        username=imap_username,
         encrypted_password=encrypted,
         use_ssl=use_ssl,
     )
-    user_data.pop("imap_password", None)
+    user_data.pop("primary_email", None)
+    user_data.pop("proton_password", None)
+
+    # Mark the new primary as the active one and clear any stale alias lock
+    # left over from a previous primary. With no alias-lock pinned, the
+    # routing logic in manager.py forwards email to *any* known alias of
+    # this primary out of the box — which is what the user expects when
+    # they say "primary baru otomatis aktif, alias-nya juga".
+    await db.set_active_primary(chat.id, primary_id)
+    await db.set_active_alias(chat.id, None)
+
     await update.effective_message.reply_text(  # type: ignore[union-attr]
-        f"Kredensial untuk <b>{html.escape(user_data['primary_email'])}</b> "
-        "disimpan. Mulai memantau inbox...",
+        f"✅ Tersambung ke <b>{html.escape(email)}</b> — kredensial "
+        "disimpan terenkripsi & jadi akun aktif.\n"
+        "Listener IMAP otomatis menyala; tiap email yang masuk ke alias "
+        "akun ini akan diteruskan ke chat ini.\n\n"
+        "💡 <i>Hapus pesan password-mu di atas sekarang.</i>",
         parse_mode=ParseMode.HTML,
     )
     try:
@@ -651,33 +829,253 @@ async def connect_ssl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
             "failed to start listener after /connect for primary %s", primary_id
         )
         await update.effective_message.reply_text(  # type: ignore[union-attr]
-            f"Gagal terhubung ke Bridge: {exc}\n"
-            "Coba /connect lagi setelah Bridge siap, atau /disconnect untuk hapus."
+            f"Gagal start listener: {exc}\n"
+            "Bridge mungkin belum siap. Coba /connect ulang dalam beberapa detik."
         )
         return ConversationHandler.END
-    await update.effective_message.reply_text(  # type: ignore[union-attr]
-        "Tersambung! Bot akan auto-discover alias dari INBOX akun ini. "
-        "Kirim /list untuk lihat semua email utama."
-    )
-    # Auto-prompt: brand-new primaries usually start with zero aliases. Nudge
-    # the user toward /setprotonpw + /genaddr so they don't have to discover
-    # the feature from /start.
+
     aliases = await db.list_aliases(chat.id, primary_id=primary_id)
     if not aliases:
         await update.effective_message.reply_text(  # type: ignore[union-attr]
-            f"ℹ️ Belum ada alias di <b>{html.escape(user_data['primary_email'])}</b>.\n\n"  # noqa: RUF001
-            "Mau aku generate sekaligus? Langkahnya:\n"
-            "1) <code>/setprotonpw</code> — simpan password master Proton (sekali aja)\n"
-            "2) <code>/genaddr vielz 10</code> — buat 10 alamat <code>vielz001..vielz010@proton.me</code>\n\n"
-            "Aku jalankan otomatis lewat browser headless di sisi server.",
+            f"ℹ️ Akun <b>{html.escape(email)}</b> belum punya alias.\n\n"  # noqa: RUF001
+            "Klik tombol di bawah untuk lanjut tanpa mengetik perintah:",
             parse_mode=ParseMode.HTML,
+            reply_markup=_build_post_connect_keyboard(primary_id),
+        )
+    else:
+        await update.effective_message.reply_text(  # type: ignore[union-attr]
+            f"📥 Akun ini sudah punya {len(aliases)} alias. "
+            "Kirim /list untuk lihat semuanya."
         )
     return ConversationHandler.END
+
+
+async def _drive_bridge_login(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    bridge_admin: BridgeAdmin,
+    email: str,
+    proton_password: str,
+) -> int:
+    """Walk Bridge through ``add_account`` end-to-end on behalf of /connect.
+
+    Yields CAPTCHA URLs back to the user via Telegram, parks the
+    conversation in :data:`CONNECT_BRIDGE_CAPTCHA` until they confirm,
+    and finalises with :func:`_finalize_connect` once Bridge succeeds.
+    """
+    user_data = cast(dict, context.user_data)
+    progress = await update.effective_message.reply_text(  # type: ignore[union-attr]
+        f"🔧 Mendaftarkan <b>{html.escape(email)}</b> ke Proton Bridge "
+        "(stop service → cli login → restart)...",
+        parse_mode=ParseMode.HTML,
+    )
+
+    iterator = bridge_admin.add_account(email, proton_password).__aiter__()
+
+    async def consume() -> tuple[BridgeImapCredentials | None, str | None]:
+        captcha_count = 0
+        while True:
+            try:
+                event = await iterator.__anext__()
+            except StopAsyncIteration:
+                return None, "Bridge selesai tanpa hasil."
+            if isinstance(event, CaptchaRequired):
+                captcha_count += 1
+                user_data["bridge_captcha_iterator"] = iterator
+                user_data["bridge_email"] = email
+                await update.effective_message.reply_text(  # type: ignore[union-attr]
+                    "🔒 Proton minta verifikasi manusia.\n\n"
+                    f"Klik link berikut, selesaikan CAPTCHA / kode email, "
+                    f"lalu kirim <code>ok</code> di sini:\n\n"
+                    f"{event.url}",
+                    parse_mode=ParseMode.HTML,
+                )
+                return None, "__CAPTCHA__"
+            if isinstance(event, LoginFailed):
+                return None, event.reason or "login gagal"
+            if isinstance(event, LoginSucceeded):
+                creds = await bridge_admin.fetch_imap_credentials(email)
+                return creds, None
+
+    try:
+        creds, err = await consume()
+    except BridgeAdminError as exc:
+        await update.effective_message.reply_text(  # type: ignore[union-attr]
+            f"❌ BridgeAdmin error: <code>{html.escape(str(exc))}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return ConversationHandler.END
+    finally:
+        try:
+            await progress.delete()
+        except Exception:
+            pass
+
+    if err == "__CAPTCHA__":
+        return CONNECT_BRIDGE_CAPTCHA
+    if err is not None:
+        await update.effective_message.reply_text(  # type: ignore[union-attr]
+            "❌ Bridge tidak menerima login.\n"
+            f"Detail: <code>{html.escape(err)}</code>\n\n"
+            "Coba /connect lagi dengan password Proton yang benar, "
+            "atau /cancel untuk batal.",
+            parse_mode=ParseMode.HTML,
+        )
+        return ConversationHandler.END
+    if creds is None:
+        await update.effective_message.reply_text(  # type: ignore[union-attr]
+            "❌ Login Bridge sukses tapi password IMAP tidak ditemukan "
+            "di vault. Coba /connect lagi atau cek konfigurasi Bridge."
+        )
+        return ConversationHandler.END
+
+    return await _finalize_connect(
+        update,
+        context,
+        email=creds.email,
+        imap_username=creds.imap_username,
+        imap_password=creds.imap_password,
+    )
+
+
+async def connect_password(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = (update.effective_message.text or "").strip()  # type: ignore[union-attr]
+    if not text:
+        await update.effective_message.reply_text("Password tidak boleh kosong:")  # type: ignore[union-attr]
+        return CONNECT_PASSWORD
+    chat = update.effective_chat
+    if chat is None:
+        return ConversationHandler.END
+    user_data = cast(dict, context.user_data)
+    email = user_data.get("primary_email")
+    if not email:
+        await update.effective_message.reply_text(  # type: ignore[union-attr]
+            "Sesi /connect kedaluwarsa. Mulai lagi dengan /connect."
+        )
+        return ConversationHandler.END
+
+    bridge_admin = _bot_bridge_admin(context)
+    if bridge_admin is None:
+        # Legacy path: user typed the Bridge IMAP password directly.
+        return await _finalize_connect(
+            update,
+            context,
+            email=email,
+            imap_username=email,
+            imap_password=text,
+        )
+
+    # Auto-add path: text is the Proton account password. If the account
+    # is already in Bridge, skip the cli login and go straight to vault
+    # extraction. Otherwise drive the cli login.
+    try:
+        existing = await bridge_admin.fetch_imap_credentials(email)
+    except BridgeAdminError as exc:
+        LOGGER.warning("vault probe failed: %s", exc)
+        existing = None
+    if existing is not None:
+        return await _finalize_connect(
+            update,
+            context,
+            email=existing.email,
+            imap_username=existing.imap_username,
+            imap_password=existing.imap_password,
+        )
+
+    return await _drive_bridge_login(
+        update,
+        context,
+        bridge_admin=bridge_admin,
+        email=email,
+        proton_password=text,
+    )
+
+
+async def connect_bridge_captcha(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    text = (update.effective_message.text or "").strip().lower()  # type: ignore[union-attr]
+    if text not in {"ok", "oke", "okay", "selesai", "done"}:
+        await update.effective_message.reply_text(  # type: ignore[union-attr]
+            "Setelah selesai CAPTCHA, kirim <code>ok</code>. "
+            "Kalau mau batal, kirim /cancel.",
+            parse_mode=ParseMode.HTML,
+        )
+        return CONNECT_BRIDGE_CAPTCHA
+
+    bridge_admin = _bot_bridge_admin(context)
+    if bridge_admin is None:
+        await update.effective_message.reply_text(  # type: ignore[union-attr]
+            "Sesi /connect kedaluwarsa. Mulai lagi dengan /connect."
+        )
+        return ConversationHandler.END
+
+    user_data = cast(dict, context.user_data)
+    iterator = user_data.get("bridge_captcha_iterator")
+    email = user_data.get("bridge_email") or user_data.get("primary_email")
+    if iterator is None or email is None:
+        await update.effective_message.reply_text(  # type: ignore[union-attr]
+            "Sesi /connect kedaluwarsa. Mulai lagi dengan /connect."
+        )
+        return ConversationHandler.END
+
+    await bridge_admin.acknowledge_captcha()
+    await update.effective_message.reply_text(  # type: ignore[union-attr]
+        "▶️ Lanjut login Bridge..."
+    )
+    while True:
+        try:
+            event = await iterator.__anext__()
+        except StopAsyncIteration:
+            await update.effective_message.reply_text(  # type: ignore[union-attr]
+                "Bridge selesai tanpa hasil. Coba /connect lagi."
+            )
+            return ConversationHandler.END
+        if isinstance(event, CaptchaRequired):
+            await update.effective_message.reply_text(  # type: ignore[union-attr]
+                "🔒 Proton minta verifikasi manusia (lagi).\n\n"
+                f"Klik link berikut, selesaikan, lalu kirim <code>ok</code>:\n\n"
+                f"{event.url}",
+                parse_mode=ParseMode.HTML,
+            )
+            return CONNECT_BRIDGE_CAPTCHA
+        if isinstance(event, LoginFailed):
+            await update.effective_message.reply_text(  # type: ignore[union-attr]
+                "❌ Bridge tidak menerima login.\n"
+                f"Detail: <code>{html.escape(event.reason or 'unknown')}</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return ConversationHandler.END
+        if isinstance(event, LoginSucceeded):
+            creds = await bridge_admin.fetch_imap_credentials(email)
+            if creds is None:
+                await update.effective_message.reply_text(  # type: ignore[union-attr]
+                    "❌ Login Bridge sukses tapi password IMAP tidak "
+                    "ditemukan di vault. Coba /connect lagi."
+                )
+                return ConversationHandler.END
+            return await _finalize_connect(
+                update,
+                context,
+                email=creds.email,
+                imap_username=creds.imap_username,
+                imap_password=creds.imap_password,
+            )
 
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_data = cast(dict, context.user_data)
     user_data.pop("imap_password", None)
+    user_data.pop("bridge_captcha_iterator", None)
+    user_data.pop("bridge_email", None)
+    user_data.pop("proton_password", None)
+    bridge_admin = _bot_bridge_admin(context)
+    if bridge_admin is not None:
+        try:
+            await bridge_admin.cancel_captcha()
+        except Exception:
+            LOGGER.exception("failed to clean up bridge captcha state")
     if update.effective_message is not None:
         await update.effective_message.reply_text("Dibatalkan.")
     return ConversationHandler.END
@@ -795,6 +1193,44 @@ async def cmd_setprotonpw(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         reply_markup=InlineKeyboardMarkup(rows),
     )
     return SETPW_PICK_PRIMARY
+
+
+async def setpw_quick_entry(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Entry point for the inline-button shortcut into /setprotonpw.
+
+    Triggered by ``qsetpw:<primary_id>`` callback data emitted by the
+    "Simpan password Proton" button shown after /connect. Skips the
+    picker (we already know which primary the user is configuring) and
+    drops straight to the password-entry state.
+    """
+    query = update.callback_query
+    if query is None or query.data is None:
+        return ConversationHandler.END
+    await query.answer()
+    try:
+        primary_id = int(query.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        return ConversationHandler.END
+    chat_id = query.message.chat_id if query.message else None
+    if chat_id is None:
+        return ConversationHandler.END
+    db = _bot_db(context)
+    primary = await db.get_primary_account(chat_id, primary_id)
+    if primary is None:
+        if query.message is not None:
+            await query.message.reply_text("Akun tidak ditemukan.")
+        return ConversationHandler.END
+    cast(dict, context.user_data)["setpw_primary_id"] = primary.id
+    if query.message is not None:
+        await query.message.reply_text(
+            f"Akan menyimpan password Proton untuk <b>{html.escape(primary.email)}</b>.\n\n"
+            "Kirim password Proton (master password) sekarang. "
+            "<b>Hapus pesan password setelah aku konfirmasi</b>.",
+            parse_mode=ParseMode.HTML,
+        )
+    return SETPW_PASSWORD
 
 
 async def setpw_pick_primary(
@@ -1320,6 +1756,47 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 "Listener belum jalan — kirim /connect dulu.", show_alert=True
             )
         return
+    if data.startswith(f"{CB_QUICK_GENADDR}:"):
+        # Quick-action button shown after /connect. Format:
+        # ``qgenaddr:<primary_id>:<count>``. Bridge to /genaddr by
+        # synthesising the right context.args + delegating to the real
+        # handler so we keep a single code path for the actual generation.
+        parts = data.split(":")
+        if len(parts) != 3:
+            await query.answer("Tombol tidak valid.", show_alert=True)
+            return
+        try:
+            primary_id = int(parts[1])
+            count = int(parts[2])
+        except ValueError:
+            await query.answer("Tombol tidak valid.", show_alert=True)
+            return
+        primary = await db.get_primary_account(chat_id, primary_id)
+        if primary is None:
+            await query.answer("Akun tidak ditemukan.", show_alert=True)
+            return
+        # Check we have a stored Proton password — without it /genaddr will
+        # bail at the browser step. Surface that early so the user can hit
+        # "Simpan password Proton" first.
+        proton_pw = await db.get_proton_password_encrypted(primary_id)
+        if proton_pw is None:
+            if query.message is not None:
+                await query.message.reply_text(
+                    "❌ Password Proton belum tersimpan untuk akun ini. "
+                    "Klik tombol <b>🔐 Simpan password Proton</b> dulu, "
+                    "atau kirim /setprotonpw.",
+                    parse_mode=ParseMode.HTML,
+                )
+            return
+        base = primary.email.split("@", 1)[0]
+        # Persist the picked primary so /genaddr's own selection logic
+        # routes to it without an explicit ``base`` match.
+        await db.set_active_primary(chat_id, primary_id)
+        # Pretend the user typed ``/genaddr <base> <count>`` and run the
+        # real handler. ``context.args`` is read inside cmd_genaddr.
+        context.args = [base, str(count)]
+        await cmd_genaddr(update, context)
+        return
 
 
 # --------------------------------------------------------------- notifier
@@ -1418,16 +1895,37 @@ def _render_email_message(alias_email: str, summary: dict[str, str]) -> str:
 # --------------------------------------------------------------- registration
 
 
+async def cmd_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Catch-all for unrecognized text outside of any active conversation.
+
+    The user explicitly asked: "kalau input belum jelas munculkan 'tidak
+    dikenali, kirim /start'." This handler is registered last in
+    ``build_handlers`` so the conversation handlers and command handlers
+    above always win first.
+    """
+    if update.effective_message is None:
+        return
+    await update.effective_message.reply_text(
+        "🤔 Perintah tidak dikenali. Kirim /start untuk melihat semua "
+        "perintah, atau /list untuk daftar email utama."
+    )
+
+
 def build_handlers() -> list:
     connect_conv = ConversationHandler(
         entry_points=[CommandHandler("connect", cmd_connect)],
         states={
-            CONNECT_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, connect_email)],
-            CONNECT_HOST: [MessageHandler(filters.TEXT & ~filters.COMMAND, connect_host)],
-            CONNECT_PORT: [MessageHandler(filters.TEXT & ~filters.COMMAND, connect_port)],
-            CONNECT_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, connect_username)],
-            CONNECT_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, connect_password)],
-            CONNECT_SSL: [MessageHandler(filters.TEXT & ~filters.COMMAND, connect_ssl)],
+            CONNECT_EMAIL: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, connect_email),
+            ],
+            CONNECT_PASSWORD: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, connect_password),
+            ],
+            CONNECT_BRIDGE_CAPTCHA: [
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND, connect_bridge_captcha
+                ),
+            ],
         },
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
         name="connect",
@@ -1447,7 +1945,14 @@ def build_handlers() -> list:
     )
 
     setpw_conv = ConversationHandler(
-        entry_points=[CommandHandler("setprotonpw", cmd_setprotonpw)],
+        entry_points=[
+            CommandHandler("setprotonpw", cmd_setprotonpw),
+            # Quick-action button after /connect: skip straight to entering
+            # the master password without re-running the picker.
+            CallbackQueryHandler(
+                setpw_quick_entry, pattern=rf"^{CB_QUICK_SETPW}:\d+$"
+            ),
+        ],
         states={
             SETPW_PICK_PRIMARY: [
                 CallbackQueryHandler(setpw_pick_primary, pattern=r"^setpw:\d+$"),
@@ -1476,4 +1981,9 @@ def build_handlers() -> list:
         sync_conv,
         setpw_conv,
         CallbackQueryHandler(on_callback),
+        # Catch-all: unrecognized text → "perintah tidak dikenali, kirim
+        # /start". MUST be the last MessageHandler so conversation states
+        # above always run first.
+        MessageHandler(filters.TEXT & ~filters.COMMAND, cmd_unknown),
+        MessageHandler(filters.COMMAND, cmd_unknown),
     ]
