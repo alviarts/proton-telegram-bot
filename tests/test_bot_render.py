@@ -122,14 +122,44 @@ def test_primary_keyboard_includes_alias_counts_and_active_marker() -> None:
         b for b in flat if (b.callback_data or "").startswith("pickp:")
     ]
     assert len(pick_buttons) == 2
-    # Alias counts are in the labels.
-    assert any("14 alias" in (b.text or "") for b in pick_buttons)
-    assert any("7 alias" in (b.text or "") for b in pick_buttons)
+    # Alias counts are in the labels (compact ``· N`` format).
+    assert any("· 14" in (b.text or "") for b in pick_buttons)
+    assert any("· 7" in (b.text or "") for b in pick_buttons)
     # Active primary gets the lock marker.
     locked_button = next(
         b for b in pick_buttons if (b.callback_data or "") == "pickp:2"
     )
     assert "🔒" in (locked_button.text or "")
+    # Each primary also gets a per-row Sync button on the same row.
+    sync_buttons = [
+        b for b in flat if (b.callback_data or "").startswith("syncp:")
+    ]
+    assert len(sync_buttons) == 2
+
+
+def test_primary_keyboard_renders_healthcheck_stats_when_available() -> None:
+    """When /cekimap has run for a primary, the keyboard label
+    switches from ``· N`` (DB count) to ``· ok/total`` (last health
+    check) so the user can spot a primary whose aliases have
+    started failing.
+    """
+    p1 = _fake_primary(pid=1, email="vielz43@proton.me")
+    p2 = _fake_primary(pid=2, email="vielz22@proton.me")
+    counts = {1: 20, 2: 7}
+    healthcheck_stats = {1: (9, 20)}  # only p1 has run /cekimap
+    markup = _build_primary_keyboard(
+        [p1, p2], counts, healthcheck_stats=healthcheck_stats
+    )
+    flat = [b for row in markup.inline_keyboard for b in row]
+    pick_buttons = [
+        b for b in flat if (b.callback_data or "").startswith("pickp:")
+    ]
+    p1_btn = next(b for b in pick_buttons if (b.callback_data or "") == "pickp:1")
+    p2_btn = next(b for b in pick_buttons if (b.callback_data or "") == "pickp:2")
+    assert "· 9/20" in (p1_btn.text or "")
+    # p2 falls back to plain count because no health check ran.
+    assert "· 7" in (p2_btn.text or "")
+    assert "/" not in (p2_btn.text or "").split("·", 1)[1]
 
 
 def test_primary_keyboard_empty_state() -> None:

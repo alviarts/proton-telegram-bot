@@ -597,6 +597,15 @@ async def run_health_check(
         text=summary,
         parse_mode=ParseMode.HTML,
     )
-    # Keep ``db`` in the signature for future modes (DB-backed history).
-    _ = db
+
+    # Persist the result so /list can render ``ok/total`` next to the
+    # primary's email without re-running the check. Best-effort —
+    # losing the row write doesn't change the user-facing summary.
+    try:
+        await db.set_last_healthcheck(primary.id, total_ok, total)
+    except Exception:
+        LOGGER.debug(
+            "health check: set_last_healthcheck failed", exc_info=True
+        )
+
     _ = send_failures
