@@ -5,6 +5,7 @@ import asyncio
 import contextlib
 import html
 import logging
+import re
 import secrets
 import smtplib
 from email.message import EmailMessage
@@ -45,6 +46,12 @@ from .manager import ListenerManager, Notifier
 from .models import AliasRecord, AliasStatus, PrimaryAccount
 from .proton_browser import CreationStatus
 from .proton_verify import solve_email_verification
+from .status_reporter import (
+    STATUS_BUTTON_CALLBACK,
+    StatusReporter,
+    build_status_keyboard,
+    on_status_button_noop,
+)
 from .tempmail import TempMailbox, TempMailError
 
 LOGGER = logging.getLogger(__name__)
@@ -112,6 +119,12 @@ CB_QUICK_GENADDR = "qgenaddr"
 # ``qhc:<primary_id>``      — direct trigger (from after-connect message).
 CB_HEALTHCHECK_PICK = "hcpick"
 CB_QUICK_HEALTHCHECK = "qhc"
+# /list per-primary "Sync alias" button. Drives a Playwright session
+# back into ``account.proton.me`` for the picked primary, fetches the
+# full address list, and persists any new aliases to the DB. Surfaces
+# progress through a :class:`StatusReporter` button that updates as
+# the scrape moves through its phases.
+CB_SYNC_PRIMARY = "syncp"
 
 
 def _is_allowed(settings: Settings, user_id: int | None) -> bool:
@@ -191,7 +204,14 @@ def _build_primary_keyboard(
                     InlineKeyboardButton(
                         label,
                         callback_data=f"{CB_PICK_PRIMARY}:{primary.id}",
-                    )
+                    ),
+                    # Per-primary "Sync alias from Proton" trigger.
+                    # Sits on the same row as the email so the
+                    # keyboard stays compact even with 5+ accounts.
+                    InlineKeyboardButton(
+                        "🔄 Sync",
+                        callback_data=f"{CB_SYNC_PRIMARY}:{primary.id}",
+                    ),
                 ]
             )
     rows.append(
@@ -1957,6 +1977,177 @@ def _launch_health_check_task(
     task_list.append(task)
 
 
+async def _start_sync_for_primary(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    primary_id: int,
+) -> None:
+    """Re-fetch the canonical address list for a primary from
+    ``account.proton.me`` and persist any new aliases.
+
+    Drives a fresh Playwright session (using the saved Proton password)
+    rather than calling the Bridge or trusting the local DB — the
+    Proton settings page is the source of truth, and a saved password
+    means we don't need any user interaction. Live progress is shown
+    via a :class:`StatusReporter` button on the kickoff message so the
+    chat doesn't sit idle for 30+ seconds while the browser logs in.
+    """
+    chat = update.effective_chat
+    if chat is None:
+        return
+    db = _bot_db(context)
+    primary = await db.get_primary_account(chat.id, primary_id)
+    if primary is None:
+        await update.effective_message.reply_text(  # type: ignore[union-attr]
+            "❌ Email utama tidak ditemukan."
+        )
+        return
+
+    # Pre-flight: bail loudly if no saved Proton password. Without it
+    # we can't drive the browser back into the settings page, and a
+    # silent skip would just leave the user staring at a button that
+    # does nothing.
+    encrypted_pw = await db.get_proton_password_encrypted(primary_id)
+    if encrypted_pw is None:
+        await update.effective_message.reply_text(  # type: ignore[union-attr]
+            f"❌ Password Proton untuk <code>{html.escape(primary.email)}</code> "
+            "belum tersimpan. Klik tombol <b>🔐 Simpan password Proton</b> "
+            "(atau /setprotonpw) dulu sebelum sync.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # Spawn the actual scrape as a background task so the bot stays
+    # responsive while Playwright spins up + logs in (~10-30s).
+    context.application.create_task(
+        _run_sync_for_primary_background(
+            context,
+            chat_id=chat.id,
+            primary=primary,
+            encrypted_password=encrypted_pw,
+        )
+    )
+
+
+async def _run_sync_for_primary_background(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    chat_id: int,
+    primary: PrimaryAccount,
+    encrypted_password: str,
+) -> None:
+    """Background body for the per-primary "Sync alias" button.
+
+    Posts a status message with a live-update button, then walks
+    through: decrypt password → Playwright login → scrape addresses
+    → persist new aliases → final summary. All errors get reported
+    back to the chat as edits to the same status message rather than
+    spamming new ones.
+    """
+    bot = context.application.bot
+    db = _bot_db(context)
+    cipher = _bot_cipher(context)
+
+    header = (
+        f"🔄 Sync alias <b>{html.escape(primary.email)}</b>\n"
+        f"Mengambil daftar alamat dari halaman pengaturan Proton…"
+    )
+    msg = await bot.send_message(
+        chat_id=chat_id,
+        text=header,
+        parse_mode=ParseMode.HTML,
+        reply_markup=build_status_keyboard("🚀 Mulai sync…"),
+    )
+    msg_id = getattr(msg, "message_id", None)
+    if msg_id is None:
+        # Couldn't anchor a status reporter — drop straight to a
+        # bare-bones flow that just posts a final message at the end.
+        msg_id = 0
+    status = StatusReporter(bot, chat_id, msg_id)
+    try:
+        await status.update("🔓 Decrypt password Proton…")
+        try:
+            proton_password = cipher.decrypt(encrypted_password)
+        except Exception:
+            LOGGER.exception("sync: failed to decrypt stored Proton password")
+            await bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "❌ Gagal decrypt password Proton. "
+                    "Mungkin master key berubah — coba /setprotonpw lagi."
+                ),
+            )
+            await status.done("❌ Gagal decrypt password")
+            return
+
+        await status.update("🌐 Buka browser & login Proton…")
+        from .proton_verify import fetch_all_addresses_via_browser
+
+        addresses = await fetch_all_addresses_via_browser(
+            primary.email, proton_password
+        )
+        if addresses is None:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"❌ Gagal ambil daftar alamat untuk "
+                    f"<code>{html.escape(primary.email)}</code>. "
+                    "Login Proton kemungkinan diblok (CAPTCHA / 2FA / "
+                    "password salah). Coba /setprotonpw untuk update "
+                    "password, atau buka browser di account.proton.me "
+                    "untuk klear blokir CAPTCHA."
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+            await status.done("❌ Login Proton gagal")
+            return
+
+        await status.update(
+            f"📋 {len(addresses)} alamat ditemukan, simpan ke DB…"
+        )
+        # Drop the primary's own address from the alias list — it's
+        # already represented by ``primary``. Same dedupe logic as
+        # ``_finalize_connect``.
+        primary_norm = primary.email.lower()
+        alias_addresses = [a for a in addresses if a.lower() != primary_norm]
+        inserted = await db.add_aliases(
+            chat_id, alias_addresses, primary_id=primary.id
+        )
+        skipped = len(alias_addresses) - inserted
+
+        await status.update(f"✅ {inserted} alias baru, {skipped} sudah ada")
+
+        # Final summary as a fresh message — the original kickoff
+        # message stays as a "this is what kicked it off" anchor.
+        summary_lines = [
+            f"✅ Sync <b>{html.escape(primary.email)}</b> selesai.",
+            f"Total alamat di Proton: <b>{len(addresses)}</b>",
+            f"Alias baru ditambahkan: <b>{inserted}</b>",
+            f"Sudah ada di DB: <b>{skipped}</b>",
+        ]
+        await bot.send_message(
+            chat_id=chat_id,
+            text="\n".join(summary_lines),
+            parse_mode=ParseMode.HTML,
+        )
+        await status.done(f"✅ {inserted} alias baru ditambahkan")
+    except Exception as exc:
+        LOGGER.exception("sync: background task crashed")
+        try:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"❌ Sync error untuk "
+                    f"<code>{html.escape(primary.email)}</code>: "
+                    f"<code>{html.escape(str(exc))}</code>"
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+        finally:
+            await status.done("❌ Error")
+
+
 async def _start_health_check_for_primary(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -2858,6 +3049,23 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         context.args = [base, str(count)]
         await cmd_genaddr(update, context)
         return
+    if data.startswith(f"{CB_SYNC_PRIMARY}:"):
+        # Per-primary "🔄 Sync" button on /list. Drives a Playwright
+        # session into account.proton.me to refresh the alias list.
+        parts = data.split(":")
+        if len(parts) != 2:
+            await query.answer("Tombol tidak valid.", show_alert=True)
+            return
+        try:
+            primary_id = int(parts[1])
+        except ValueError:
+            await query.answer("Tombol tidak valid.", show_alert=True)
+            return
+        await query.answer("🔄 Sync alias dimulai...", show_alert=False)
+        await _start_sync_for_primary(
+            update, context, primary_id=primary_id
+        )
+        return
     if data.startswith(f"{CB_QUICK_HEALTHCHECK}:") or data.startswith(
         f"{CB_HEALTHCHECK_PICK}:"
     ):
@@ -3085,6 +3293,14 @@ def build_handlers() -> list:
         connect_conv,
         sync_conv,
         setpw_conv,
+        # Live-status indicator buttons. The button is purely
+        # informational; this handler just acks the tap so Telegram
+        # clients drop the spinner. Must come BEFORE the catch-all
+        # ``on_callback`` so the noop pattern wins.
+        CallbackQueryHandler(
+            on_status_button_noop,
+            pattern=rf"^{re.escape(STATUS_BUTTON_CALLBACK)}$",
+        ),
         CallbackQueryHandler(on_callback),
         # Catch-all: unrecognized text → "perintah tidak dikenali, kirim
         # /start". MUST be the last MessageHandler so conversation states

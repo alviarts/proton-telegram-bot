@@ -131,6 +131,7 @@ class _FakeMessage:
     text: str
     parse_mode: Any = None
     message_id: int | None = None
+    reply_markup: Any = None
 
 
 @dataclass
@@ -145,10 +146,20 @@ class _FakeEdit:
     parse_mode: Any = None
 
 
+@dataclass
+class _FakeMarkupEdit:
+    """Captures edit_message_reply_markup calls — used by
+    :class:`StatusReporter` to update the live-activity button."""
+    chat_id: int
+    message_id: int
+    reply_markup: Any = None
+
+
 class _FakeBot:
     def __init__(self) -> None:
         self.messages: list[_FakeMessage] = []
         self.edits: list[_FakeEdit] = []
+        self.markup_edits: list[_FakeMarkupEdit] = []
         self._next_message_id = 1000
 
     async def send_message(
@@ -157,6 +168,7 @@ class _FakeBot:
         chat_id: int,
         text: str,
         parse_mode: Any = None,
+        reply_markup: Any = None,
     ) -> _FakeMessage:
         self._next_message_id += 1
         msg = _FakeMessage(
@@ -164,6 +176,7 @@ class _FakeBot:
             text=text,
             parse_mode=parse_mode,
             message_id=self._next_message_id,
+            reply_markup=reply_markup,
         )
         self.messages.append(msg)
         return msg
@@ -182,6 +195,21 @@ class _FakeBot:
                 message_id=message_id,
                 text=text,
                 parse_mode=parse_mode,
+            )
+        )
+
+    async def edit_message_reply_markup(
+        self,
+        *,
+        chat_id: int,
+        message_id: int,
+        reply_markup: Any = None,
+    ) -> None:
+        self.markup_edits.append(
+            _FakeMarkupEdit(
+                chat_id=chat_id,
+                message_id=message_id,
+                reply_markup=reply_markup,
             )
         )
 

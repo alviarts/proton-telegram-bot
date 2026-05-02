@@ -47,6 +47,7 @@ from telegram.constants import ParseMode
 from .bridge_admin import BridgeAdmin
 from .db import Database
 from .models import PrimaryAccount
+from .status_reporter import StatusReporter, build_status_keyboard
 
 LOGGER = logging.getLogger(__name__)
 
@@ -385,7 +386,12 @@ async def run_health_check(
         parse_mode=ParseMode.HTML,
     )
 
-    # 3. Rolling progress message — edited in place from now on.
+    # 3. Rolling progress message — edited in place from now on. Also
+    # serves as the anchor for the live-activity status button: while
+    # the progress text shows ``X/N confirmed`` counts, the button
+    # underneath narrates the current phase ("kirim email tes",
+    # "tunggu inbox", "cleanup", …) so the user always knows what the
+    # bot is actually doing right now.
     confirmed: set[str] = set()
     failed: set[str] = set()
     progress_lock = asyncio.Lock()
@@ -396,8 +402,20 @@ async def run_health_check(
             primary.email, len(targets), confirmed, failed, list(targets)
         ),
         parse_mode=ParseMode.HTML,
+        reply_markup=build_status_keyboard("🚀 Mulai health check…"),
     )
     progress_msg_id = getattr(msg, "message_id", None) if msg is not None else None
+    status: StatusReporter | None
+    if progress_msg_id is not None:
+        status = StatusReporter(bot, chat_id, progress_msg_id)
+    else:
+        status = None
+
+    async def _status(label: str, *, force: bool = False) -> None:
+        """Update the live-activity button if we have an anchor."""
+        if status is None:
+            return
+        await status.update(label, force=force)
 
     last_edit = 0.0
     last_text = ""
@@ -433,6 +451,7 @@ async def run_health_check(
         # Capture the current high-water UID so we only consider messages
         # that arrive after we start sending. Bridge accepts concurrent
         # connections; this is independent of the always-on listener.
+        await _status("📡 Baseline UID INBOX…")
         baseline_resp = await imap.uid_search("ALL")
         baseline_uids = (
             _parse_uids(baseline_resp.lines)
@@ -479,12 +498,17 @@ async def run_health_check(
                 return
             expected[alias_email] = token
 
-        for alias_email in targets:
+        for idx, alias_email in enumerate(targets, 1):
+            await _status(
+                f"📤 Kirim ({idx}/{len(targets)}) {alias_email}"
+            )
             await _send_one(alias_email)
 
         await _refresh_progress(force=True)
 
         if not expected:
+            if status is not None:
+                await status.done("❌ Tidak ada email terkirim")
             await bot.send_message(
                 chat_id=chat_id,
                 text=(
@@ -501,6 +525,9 @@ async def run_health_check(
         token_to_alias = {tok: alias for alias, tok in expected.items()}
         all_uids: set[int] = set()
         deadline = time.monotonic() + HEALTH_CHECK_RECEIVE_TIMEOUT_S
+        await _status(
+            f"📥 Tunggu INBOX ({len(confirmed)}/{len(expected)} terkonfirmasi)"
+        )
         while time.monotonic() < deadline:
             await asyncio.sleep(HEALTH_CHECK_POLL_INTERVAL_S)
             try:
@@ -518,6 +545,9 @@ async def run_health_check(
             if confirmed >= set(expected):
                 break
             await _refresh_progress()
+            await _status(
+                f"📥 Polling INBOX ({len(confirmed)}/{len(expected)})"
+            )
 
         # 6. Anything still expected and unseen has timed out.
         for alias in expected:
@@ -529,12 +559,21 @@ async def run_health_check(
         # 7. Cleanup health-check messages from the INBOX so the user
         # doesn't see a pile of [health-check] entries when they open
         # Proton webmail.
+        await _status(f"🧹 Cleanup {len(all_uids)} pesan tes…")
         await _cleanup_inbox(imap, sorted(all_uids))
     finally:
         try:
             await imap.logout()
         except Exception:
             LOGGER.debug("health check: imap.logout raised", exc_info=True)
+        if status is not None:
+            total_ok = len(confirmed)
+            total = len(targets)
+            await status.done(
+                f"✅ Selesai {total_ok}/{total} sync OK"
+                if total_ok == total
+                else f"⚠️ Selesai {total_ok}/{total} sync OK"
+            )
 
     total_ok = len(confirmed)
     total = len(targets)
