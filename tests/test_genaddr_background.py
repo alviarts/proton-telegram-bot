@@ -375,3 +375,58 @@ async def test_final_summary_omits_cekimap_button_when_zero_aliases_created() ->
     # ``reply_markup`` is either absent or explicitly None — never an
     # empty keyboard, so the user doesn't see a dangling button.
     assert summary_kw.get("reply_markup") is None
+
+
+# --------------------------- _maybe_offer_alias_topup -----------------------
+
+@pytest.mark.asyncio
+async def test_topup_offer_posts_button_when_under_target() -> None:
+    """When the alias count is below the soft target, the helper
+    sends a follow-up message with a one-tap genaddr top-up button.
+    """
+    bot = _FakeBot()
+    primary = _make_primary()
+    await bot_mod._maybe_offer_alias_topup(
+        bot,  # type: ignore[arg-type]
+        chat_id=99,
+        primary=primary,
+        current_count=11,
+        target=21,
+    )
+    assert len(bot.calls) == 1
+    text, kw = bot.calls[0]
+    # Mentions both the deficit and the recommendation.
+    assert "11" in text and "21" in text
+    markup = kw.get("reply_markup")
+    assert markup is not None
+    # Single button row.
+    button = markup.inline_keyboard[0][0]
+    assert button.text == "✨ Tambah 10 alamat lagi"
+    # Routes through the existing CB_QUICK_GENADDR pipeline.
+    assert button.callback_data == f"{bot_mod.CB_QUICK_GENADDR}:{primary.id}:10"
+
+
+@pytest.mark.asyncio
+async def test_topup_offer_skips_when_at_or_above_target() -> None:
+    """When the alias count already meets the target, the helper is
+    a no-op so the chat doesn't get a noisy "everything's fine"
+    message after each /cekimap or sync run.
+    """
+    bot = _FakeBot()
+    primary = _make_primary()
+    await bot_mod._maybe_offer_alias_topup(
+        bot,  # type: ignore[arg-type]
+        chat_id=99,
+        primary=primary,
+        current_count=21,
+        target=21,
+    )
+    assert bot.calls == []
+    await bot_mod._maybe_offer_alias_topup(
+        bot,  # type: ignore[arg-type]
+        chat_id=99,
+        primary=primary,
+        current_count=25,
+        target=21,
+    )
+    assert bot.calls == []
