@@ -63,6 +63,108 @@ VERIFY_URL_RE = re.compile(
 )
 
 # ---------------------------------------------------------------------------
+# Proton "Masukkan kata sandi Anda" re-auth modal (Modal-Two component)
+# ---------------------------------------------------------------------------
+# Proton renders this dialog as a wrapper ``<div class="modal-two">``
+# containing a native HTML5 ``<dialog class="modal-two-dialog">``. The
+# native ``<dialog>`` carries no ``role="dialog"`` attribute (the role
+# is implicit) and no ``open`` attribute, so the user-agent stylesheet
+# sets ``display: none`` on it. Visibility is actually controlled by
+# the wrapper via ``.modal-two-backdrop--in``, so selectors like
+# ``[role='dialog']`` or ``dialog:has-text(...)`` time out as "not
+# visible" even when the modal IS on screen.
+#
+# We anchor primary detection on ``form#auth-form`` (only present when
+# this specific modal is open), with ``.modal-two`` and text-based
+# fallbacks for forward compatibility.
+_REAUTH_DIALOG_SELECTOR = (
+    "form#auth-form, "
+    ".modal-two:has-text('Masukkan kata sandi'), "
+    ".modal-two:has-text('Enter your password'), "
+    ".modal-two-dialog:has-text('Masukkan kata sandi'), "
+    ".modal-two-dialog:has-text('Enter your password'), "
+    "[role='dialog']:has-text('Masukkan kata sandi'), "
+    "[role='dialog']:has-text('Enter your password'), "
+    "dialog:has-text('Masukkan kata sandi'), "
+    "dialog:has-text('Enter your password')"
+)
+_REAUTH_PASSWORD_INPUT_SELECTOR = (
+    "form#auth-form input#password, "
+    "form#auth-form input[type='password'], "
+    ".modal-two input#password, "
+    ".modal-two input[type='password']"
+)
+_REAUTH_SUBMIT_BUTTON_SELECTOR = (
+    "button[form='auth-form'][type='submit'], "
+    "button[form='auth-form']:has-text('Autentikasi'), "
+    "button[form='auth-form']:has-text('Authenticate'), "
+    ".modal-two button:has-text('Autentikasi'), "
+    ".modal-two button:has-text('Authenticate'), "
+    ".modal-two button[type='submit']"
+)
+
+
+async def _handle_reauth_modal(
+    page: Page,
+    proton_password: str,
+    *,
+    label: str = "",
+    appear_timeout_ms: int = 10_000,
+) -> bool:
+    """Detect and complete the Proton ``Masukkan kata sandi Anda`` modal.
+
+    Returns:
+      ``True`` if no modal appears OR the modal appears AND is
+      successfully submitted (i.e. we are clear to continue), ``False``
+      if the modal appears but cannot be completed (caller should
+      record a failure and abort).
+
+    Submission strategy: press ``Enter`` on the password input first
+    (the Autentikasi button lives in ``modal-two-footer`` outside the
+    form, only wired via ``form="auth-form"`` — clicking it can be
+    flaky). If that doesn't close the modal within 8s, fall back to
+    clicking the button.
+
+    The ``label`` argument is used purely for logging so the operator
+    can tell which call site (e.g. ``post-Simpan``, ``post-toggle``)
+    triggered the modal.
+    """
+    tag = f"[{label}] " if label else ""
+    dialog = page.locator(_REAUTH_DIALOG_SELECTOR).first
+    try:
+        await dialog.wait_for(state="visible", timeout=appear_timeout_ms)
+    except Exception:
+        logger.info("%sno password re-auth dialog appeared; continuing", tag)
+        return True
+
+    try:
+        pw_input = page.locator(_REAUTH_PASSWORD_INPUT_SELECTOR).first
+        await pw_input.wait_for(state="visible", timeout=5_000)
+        await pw_input.click()
+        await pw_input.fill("")
+        await pw_input.fill(proton_password)
+        logger.info("%sfilled re-auth password in dialog", tag)
+
+        await pw_input.press("Enter")
+        logger.info("%spressed Enter on re-auth password input", tag)
+
+        try:
+            await dialog.wait_for(state="hidden", timeout=8_000)
+            logger.info("%sre-auth dialog closed after Enter", tag)
+            return True
+        except Exception:
+            logger.info("%sEnter did not close re-auth dialog; clicking Autentikasi", tag)
+            auth_btn = page.locator(_REAUTH_SUBMIT_BUTTON_SELECTOR).first
+            await auth_btn.click()
+            logger.info("%sclicked Autentikasi", tag)
+            await dialog.wait_for(state="hidden", timeout=15_000)
+            logger.info("%sre-auth dialog closed after button click", tag)
+            return True
+    except Exception:
+        logger.error("%sre-auth dialog appeared but could not be completed", tag)
+        return False
+
+# ---------------------------------------------------------------------------
 # Selectors for the Bridge verification page (verify.proton.me)
 # ---------------------------------------------------------------------------
 VERIFY_SELECTORS = {
@@ -316,94 +418,24 @@ async def change_recovery_email(
 
     # Step 3: Password re-authentication dialog ("Masukkan kata sandi Anda").
     #
-    # Proton renders this as a Modal-Two component: a wrapper
-    # ``<div class="modal-two">`` containing a native HTML5 ``<dialog
-    # class="modal-two-dialog">``. The native ``<dialog>`` does NOT carry
-    # ``role="dialog"`` (the role is implicit) AND has no ``open``
-    # attribute — by default the user-agent stylesheet sets ``display:
-    # none`` on it, while the wrapper handles visibility via
-    # ``.modal-two-backdrop--in``. Selectors like ``[role='dialog']`` or
-    # ``dialog:has-text(...)`` therefore time out as "not visible" even
-    # though the modal IS on screen, causing Step 3 to be skipped and
-    # Step 5 to fail because the underlying page stays blocked.
-    #
-    # Anchor on ``form#auth-form`` (only present in this modal), with
-    # ``.modal-two`` and text-based fallbacks for forward compatibility.
-    # Submit via Enter key on the password field — works regardless of
-    # whether the Autentikasi button is inside the form or wired to it
-    # via ``form="auth-form"`` (currently it's the latter).
-    dialog = page.locator(
-        "form#auth-form, "
-        ".modal-two:has-text('Masukkan kata sandi'), "
-        ".modal-two:has-text('Enter your password'), "
-        ".modal-two-dialog:has-text('Masukkan kata sandi'), "
-        ".modal-two-dialog:has-text('Enter your password'), "
-        "[role='dialog']:has-text('Masukkan kata sandi'), "
-        "[role='dialog']:has-text('Enter your password'), "
-        "dialog:has-text('Masukkan kata sandi'), "
-        "dialog:has-text('Enter your password')"
-    ).first
-    dialog_visible = False
-    try:
-        await dialog.wait_for(state="visible", timeout=10_000)
-        dialog_visible = True
-    except Exception:
-        logger.info("no password re-auth dialog appeared; continuing")
-
-    if dialog_visible:
-        try:
-            # Scope the password input to the auth form when present so
-            # we never grab a stray ``input[type='password']`` from a
-            # hidden form on the underlying page.
-            pw_input = page.locator(
-                "form#auth-form input#password, "
-                "form#auth-form input[type='password'], "
-                ".modal-two input#password, "
-                ".modal-two input[type='password']"
-            ).first
-            await pw_input.wait_for(state="visible", timeout=5_000)
-            await pw_input.click()
-            await pw_input.fill("")
-            await pw_input.fill(proton_password)
-            logger.info("filled re-auth password in dialog")
-
-            # Submit via Enter first — this fires the form's submit
-            # event regardless of where the Autentikasi button lives.
-            await pw_input.press("Enter")
-            logger.info("pressed Enter on re-auth password input")
-
-            # Wait for the modal to actually close. If Enter didn't take
-            # (e.g. focus shifted), fall back to clicking the
-            # Autentikasi button (linked to the form via ``form="auth-form"``).
-            try:
-                await dialog.wait_for(state="hidden", timeout=8_000)
-                logger.info("re-auth dialog closed after Enter")
-            except Exception:
-                logger.info("Enter did not close re-auth dialog; clicking Autentikasi")
-                auth_btn = page.locator(
-                    "button[form='auth-form'][type='submit'], "
-                    "button[form='auth-form']:has-text('Autentikasi'), "
-                    "button[form='auth-form']:has-text('Authenticate'), "
-                    ".modal-two button:has-text('Autentikasi'), "
-                    ".modal-two button:has-text('Authenticate'), "
-                    ".modal-two button[type='submit']"
-                ).first
-                await auth_btn.click()
-                logger.info("clicked Autentikasi")
-                await dialog.wait_for(state="hidden", timeout=15_000)
-                logger.info("re-auth dialog closed after button click")
-        except Exception:
-            change_recovery_email.last_failure = {  # type: ignore[attr-defined]
-                "step": "reauth_dialog",
-                "url": page.url,
-                "screenshot": await _dump_page(page, "recovery_failed_reauth"),
-            }
-            logger.error("re-auth dialog appeared but could not be completed")
-            return None
+    # Proton requires re-auth on every settings change that touches
+    # account credentials. Our flow triggers it at least twice — once
+    # after Simpan (Step 2) and once after the recovery toggle (Step 4).
+    # Each invocation is its own modal instance (heading IDs differ:
+    # ``modal-147``, ``modal-160``, …), so we must handle it
+    # idempotently every time.
+    if not await _handle_reauth_modal(page, proton_password, label="post-Simpan"):
+        change_recovery_email.last_failure = {  # type: ignore[attr-defined]
+            "step": "reauth_dialog",
+            "url": page.url,
+            "screenshot": await _dump_page(page, "recovery_failed_reauth"),
+        }
+        return None
 
     await asyncio.sleep(3)
 
     # Step 4: Enable "Izinkan pemulihan akun melalui email" toggle if off
+    toggle_clicked = False
     try:
         toggle = page.locator(
             "label:has-text('Izinkan pemulihan akun melalui email'), "
@@ -413,10 +445,27 @@ async def change_recovery_email(
         is_checked = await toggle_parent.is_checked()
         if not is_checked:
             await toggle.click()
+            toggle_clicked = True
             logger.info("enabled 'Izinkan pemulihan akun melalui email' toggle")
             await asyncio.sleep(1)
     except Exception:
         logger.debug("could not find/toggle recovery email switch; may already be on")
+
+    # Step 4b: Toggling the switch is itself a credentialed settings
+    # change, so Proton fires another re-auth modal. Handle it the same
+    # way — fall through silently if it doesn't appear (e.g. toggle was
+    # already on and we never clicked).
+    if toggle_clicked and not await _handle_reauth_modal(
+        page, proton_password, label="post-toggle"
+    ):
+        change_recovery_email.last_failure = {  # type: ignore[attr-defined]
+            "step": "reauth_dialog_after_toggle",
+            "url": page.url,
+            "screenshot": await _dump_page(page, "recovery_failed_reauth_toggle"),
+        }
+        return None
+    if toggle_clicked:
+        await asyncio.sleep(2)
 
     # Step 5: Click "Verifikasi" link
     verify_link = page.locator(
