@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Proton CAPTCHA Verification</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #1a1a2e; color: #eee; min-height: 100vh; display: flex; flex-direction: column; align-items: center; padding: 20px; }
+h1 { font-size: 1.3em; margin-bottom: 10px; color: #6d4aff; }
+.info { font-size: 0.9em; color: #aaa; margin-bottom: 15px; text-align: center; max-width: 500px; }
+#captcha-frame { width: 100%; max-width: 500px; height: 500px; border: 2px solid #333; border-radius: 8px; background: #fff; }
+#result { display: none; margin-top: 20px; padding: 15px; background: #0d3320; border: 2px solid #2ecc71; border-radius: 8px; max-width: 500px; width: 100%; text-align: center; }
+#result h2 { color: #2ecc71; margin-bottom: 10px; }
+#token-box { background: #111; padding: 10px; border-radius: 5px; word-break: break-all; font-family: monospace; font-size: 0.75em; max-height: 120px; overflow-y: auto; margin: 10px 0; user-select: all; cursor: pointer; }
+#copy-btn { background: #6d4aff; color: #fff; border: none; padding: 12px 30px; border-radius: 5px; font-size: 1em; cursor: pointer; margin-top: 5px; }
+#copy-btn:hover { background: #5a3dd6; }
+#copy-btn.copied { background: #2ecc71; }
+.step { color: #ffd700; font-size: 0.85em; margin-top: 10px; }
+</style>
+</head>
+<body>
+<h1>Proton CAPTCHA Verification</h1>
+<p class="info">Selesaikan CAPTCHA di bawah ini. Setelah selesai, token akan muncul untuk di-copy ke Telegram bot.</p>
+<iframe id="captcha-frame" allowtransparency="true"></iframe>
+<div id="result">
+<h2>CAPTCHA Berhasil!</h2>
+<p>Copy token di bawah ini dan kirim ke bot Telegram:</p>
+<div id="token-box"></div>
+<button id="copy-btn" onclick="copyToken()">Copy Token</button>
+<p class="step">Paste token ini di chat Telegram bot Anda</p>
+</div>
+<script>
+var params = new URLSearchParams(window.location.search);
+var verifyToken = params.get('token') || '';
+var methods = params.get('methods') || 'captcha';
+if (verifyToken) {
+    document.getElementById('captcha-frame').src = '/?methods=' + encodeURIComponent(methods) + '&token=' + encodeURIComponent(verifyToken);
+} else {
+    document.body.innerHTML = '<h1 style="color:#ff4444">Error: Missing token parameter</h1>';
+}
+var captchaToken = '';
+window.addEventListener('message', function(event) {
+    if (!event.data) return;
+    var data = event.data;
+    if (typeof data === 'string') { try { data = JSON.parse(data); } catch(e) {} }
+    var token = null;
+    if (typeof data === 'object') {
+        if (data.type === 'human-verification' && data.token) token = data.token;
+        else if (data.token) token = data.token;
+        else if (data.value) token = data.value;
+    } else if (typeof data === 'string' && data.length > 20) { token = data; }
+    if (token) {
+        captchaToken = token;
+        document.getElementById('token-box').textContent = token;
+        document.getElementById('result').style.display = 'block';
+        document.getElementById('captcha-frame').style.display = 'none';
+    }
+});
+function copyToken() {
+    var ta = document.createElement('textarea');
+    ta.value = captchaToken;
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand('copy');
+    document.body.removeChild(ta);
+    var btn = document.getElementById('copy-btn');
+    btn.textContent = 'Copied!';
+    btn.classList.add('copied');
+    setTimeout(function() { btn.textContent = 'Copy Token'; btn.classList.remove('copied'); }, 2000);
+}
+</script>
+</body>
+</html>
