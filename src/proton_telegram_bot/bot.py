@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import html
 import logging
+import re
 from typing import Any, cast
 
 import aioimaplib
+import httpx
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -38,6 +41,8 @@ from .db import Database
 from .manager import ListenerManager, Notifier
 from .models import AliasRecord, AliasStatus, PrimaryAccount
 from .proton_browser import CreationStatus
+from .proton_verify import solve_email_verification
+from .tempmail import TempMailbox, TempMailError
 
 LOGGER = logging.getLogger(__name__)
 
@@ -850,6 +855,153 @@ async def _finalize_connect(
     return ConversationHandler.END
 
 
+async def _setup_tempmail_recovery(
+    update: Update,
+    email: str,
+    proton_password: str,
+) -> TempMailbox | None:
+    """Create a temp mail and set it as recovery email in Proton settings.
+
+    Logs into the Proton web UI, navigates to recovery settings, and
+    replaces the current recovery email with a fresh Mail.tm address.
+    Returns the TempMailbox if successful, None otherwise.
+    """
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        LOGGER.warning("playwright not installed; skipping recovery email setup")
+        return None
+
+    async with httpx.AsyncClient() as client:
+        try:
+            tempmail = await TempMailbox.create(client)
+        except TempMailError as exc:
+            LOGGER.warning("failed to create temp mailbox: %s", exc)
+            return None
+
+        await update.effective_message.reply_text(  # type: ignore[union-attr]
+            f"📧 Temp mail dibuat: <code>{html.escape(tempmail.address)}</code>\n"
+            "Mengubah recovery email di Proton...",
+            parse_mode=ParseMode.HTML,
+        )
+
+        pw = None
+        browser = None
+        try:
+            from .proton_verify import change_recovery_email
+
+            pw = await async_playwright().start()
+            browser = await pw.chromium.launch(headless=True)
+            ctx = await browser.new_context()
+            page = await ctx.new_page()
+
+            # Log into Proton web
+            await page.goto("https://account.proton.me/login", wait_until="networkidle")
+            await page.fill("input[name='username'], input#username", email)
+            await page.fill("input[name='password'], input#password", proton_password)
+            await page.click("button[type='submit']")
+
+            # Wait for login to complete
+            try:
+                await page.wait_for_url(
+                    re.compile(r"account\.proton\.me/(?:u/\d+/|apps|dashboard)"),
+                    timeout=60_000,
+                )
+            except Exception:
+                LOGGER.warning("Proton web login did not complete; skipping recovery email change")
+                return tempmail  # Still return the tempmail for manual use
+
+            ok = await change_recovery_email(page, tempmail.address, tempmail, client)
+            if ok:
+                await update.effective_message.reply_text(  # type: ignore[union-attr]
+                    f"✅ Recovery email diubah ke <code>{html.escape(tempmail.address)}</code>",
+                    parse_mode=ParseMode.HTML,
+                )
+            else:
+                await update.effective_message.reply_text(  # type: ignore[union-attr]
+                    "⚠️ Gagal mengubah recovery email. "
+                    "Verifikasi otomatis mungkin tidak akan berfungsi.",
+                )
+            return tempmail
+        except Exception:
+            LOGGER.exception("recovery email setup failed")
+            return tempmail  # Return tempmail anyway for potential manual use
+        finally:
+            if browser:
+                with contextlib.suppress(Exception):
+                    await browser.close()
+            if pw:
+                with contextlib.suppress(Exception):
+                    await pw.stop()
+
+
+async def _try_auto_verify(
+    update: Update,
+    verify_url: str,
+    bridge_admin: BridgeAdmin,
+    tempmail: TempMailbox | None,
+) -> bool:
+    """Attempt to auto-solve a Proton email verification via temp mail.
+
+    Opens the verification URL in a headless browser, triggers the code
+    send (to the recovery email = our temp mail), polls the temp inbox
+    for the 6-digit code, and submits it.  Returns True on success,
+    False if any step fails (caller should fall back to manual flow).
+    """
+    if "ownership-email" not in verify_url:
+        return False
+    if tempmail is None:
+        # No temp mail available; create one on-the-fly
+        try:
+            async with httpx.AsyncClient() as client:
+                tempmail = await TempMailbox.create(client)
+        except TempMailError as exc:
+            LOGGER.warning("failed to create temp mailbox: %s", exc)
+            return False
+
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        LOGGER.warning("playwright not installed; skipping auto-verify")
+        return False
+
+    async with httpx.AsyncClient() as client:
+        await update.effective_message.reply_text(  # type: ignore[union-attr]
+            f"🤖 Auto-verify via <code>{html.escape(tempmail.address)}</code>...",
+            parse_mode=ParseMode.HTML,
+        )
+
+        pw = None
+        browser = None
+        try:
+            pw = await async_playwright().start()
+            browser = await pw.chromium.launch(headless=True)
+            ctx = await browser.new_context()
+            page = await ctx.new_page()
+
+            solved = await solve_email_verification(
+                page, verify_url, tempmail, client
+            )
+            if solved:
+                await bridge_admin.acknowledge_captcha()
+                await update.effective_message.reply_text(  # type: ignore[union-attr]
+                    "✅ Verifikasi email otomatis berhasil!",
+                )
+                return True
+            LOGGER.warning("auto-verify returned False")
+            return False
+        except Exception:
+            LOGGER.exception("auto-verify failed")
+            return False
+        finally:
+            if browser:
+                with contextlib.suppress(Exception):
+                    await browser.close()
+            if pw:
+                with contextlib.suppress(Exception):
+                    await pw.stop()
+
+
 async def _drive_bridge_login(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -860,11 +1012,20 @@ async def _drive_bridge_login(
 ) -> int:
     """Walk Bridge through ``add_account`` end-to-end on behalf of /connect.
 
-    Yields CAPTCHA URLs back to the user via Telegram, parks the
-    conversation in :data:`CONNECT_BRIDGE_CAPTCHA` until they confirm,
-    and finalises with :func:`_finalize_connect` once Bridge succeeds.
+    When Proton requests email-based human verification, the bot first
+    tries to solve it automatically via a disposable Mail.tm inbox.  If
+    auto-verification fails it falls back to the manual flow (sending
+    the verification URL to the chat).
     """
     user_data = cast(dict, context.user_data)
+
+    # Step 0: set up temp mail + change recovery email BEFORE Bridge login.
+    # This must happen before Bridge login because the Bridge CLI stops
+    # the service (and thus the Proton web session is separate).
+    tempmail = await _setup_tempmail_recovery(
+        update, email, proton_password
+    )
+
     progress = await update.effective_message.reply_text(  # type: ignore[union-attr]
         f"🔧 Mendaftarkan <b>{html.escape(email)}</b> ke Proton Bridge "
         "(stop service → cli login → restart)...",
@@ -882,10 +1043,21 @@ async def _drive_bridge_login(
                 return None, "Bridge selesai tanpa hasil."
             if isinstance(event, CaptchaRequired):
                 captcha_count += 1
+
+                # Try auto-verification for email-based challenges
+                auto_ok = await _try_auto_verify(
+                    update, event.url, bridge_admin, tempmail
+                )
+                if auto_ok:
+                    # Continue consuming events — Bridge should proceed
+                    continue
+
+                # Auto-verify failed: fall back to manual flow
                 user_data["bridge_captcha_iterator"] = iterator
                 user_data["bridge_email"] = email
                 await update.effective_message.reply_text(  # type: ignore[union-attr]
                     "🔒 Proton minta verifikasi manusia.\n\n"
+                    "Auto-verify gagal. Selesaikan manual:\n"
                     f"Klik link berikut, selesaikan CAPTCHA / kode email, "
                     f"lalu kirim <code>ok</code> di sini:\n\n"
                     f"{event.url}",
