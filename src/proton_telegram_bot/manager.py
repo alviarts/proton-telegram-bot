@@ -15,7 +15,6 @@ from .crypto import CredentialCipher
 from .db import Database, credentials_from_primary
 from .email_parser import extract_recipients, find_matching_alias, summarize
 from .imap_listener import IMAPListener
-from .models import AliasStatus
 
 LOGGER = logging.getLogger(__name__)
 
@@ -134,24 +133,10 @@ class ListenerManager:
         message: Message,
         uid: str,
     ) -> None:
-        # Snapshot of *previously known* aliases for this primary, taken
-        # before the auto-add below. Used as the candidate set for routing
-        # so a brand-new auto-discovered alias does not get forwarded the
-        # same instant it's discovered (which would let any sender create
-        # a "back door" by simply emailing an unknown address). Such
-        # addresses still land in /list — they just have to wait for the
-        # next email before routing picks them up.
-        known_aliases = await self._db.list_aliases(
-            chat_id, primary_id=primary_id
-        )
-        known_available_emails = {
-            a.email
-            for a in known_aliases
-            if a.status == AliasStatus.AVAILABLE
-        }
-
         # Auto-add any new recipient addresses found in this message, scoped
-        # to the primary account they came from.
+        # to the primary account they came from. The new aliases will only
+        # become forwarding targets after the user explicitly picks them in
+        # /list (strict lock-mode below).
         recipients = extract_recipients(message)
         if recipients:
             added = await self._db.add_aliases(
@@ -166,51 +151,40 @@ class ListenerManager:
                     uid,
                 )
 
-        # Routing rules (per-primary):
+        # Routing rule (STRICT lock-mode):
         #
-        # If the chat has an active-alias lock AND the locked alias belongs to
-        # this listener's primary, only forward emails that target the locked
-        # alias. This is the "give one alias to one person" workflow.
+        # An email is forwarded ONLY when the chat has an explicit active
+        # alias lock AND the lock belongs to *this* listener's primary AND
+        # the message targets that locked alias. In every other case the
+        # email is dropped.
         #
-        # Otherwise (no lock OR lock is on a different primary), fall back to
-        # forwarding any email that matches a registered alias of THIS
-        # primary. This way locking an alias on Account A does not silently
-        # drop incoming mail to Account B's inbox -- a regression that broke
-        # the multi-primary flow before this fix.
+        # Rationale: without strict gating, every alias auto-discovered from
+        # the inbox immediately becomes a forwarding target, so /unlock has
+        # no effective "stop" semantics and users get spammed with mail to
+        # aliases they did not pick. Picking from /list is the only way to
+        # opt in. /unlock returns to the silent state.
         active = await self._db.get_active_alias(chat_id)
-        if active is not None and active.primary_id == primary_id:
-            matched = find_matching_alias(message, {active.email})
-            if matched is None:
-                LOGGER.debug(
-                    "uid %s does not target active alias %s for chat %s",
-                    uid,
-                    active.email,
-                    chat_id,
-                )
-                return
-            forwarded_alias = active.email
-        else:
-            if not known_available_emails:
-                LOGGER.debug(
-                    "chat %s primary %s has no known aliases yet; ignoring uid %s",
-                    chat_id,
-                    primary_id,
-                    uid,
-                )
-                return
-            matched = find_matching_alias(message, known_available_emails)
-            if matched is None:
-                LOGGER.debug(
-                    "uid %s does not match any alias of primary %s for chat %s",
-                    uid,
-                    primary_id,
-                    chat_id,
-                )
-                return
-            forwarded_alias = matched
+        if active is None or active.primary_id != primary_id:
+            LOGGER.debug(
+                "chat %s primary %s has no active lock for this primary; "
+                "ignoring uid %s",
+                chat_id,
+                primary_id,
+                uid,
+            )
+            return
+        matched = find_matching_alias(message, {active.email})
+        if matched is None:
+            LOGGER.debug(
+                "uid %s does not target active alias %s for chat %s",
+                uid,
+                active.email,
+                chat_id,
+            )
+            return
         summary = summarize(message)
         await self._notifier.notify_email_received(
-            chat_id, forwarded_alias, summary
+            chat_id, active.email, summary
         )
 
     async def _handle_discovered_aliases(

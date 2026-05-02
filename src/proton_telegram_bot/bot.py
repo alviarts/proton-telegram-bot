@@ -811,18 +811,17 @@ async def _finalize_connect(
     user_data.pop("proton_password", None)
 
     # Mark the new primary as the active one and clear any stale alias lock
-    # left over from a previous primary. With no alias-lock pinned, the
-    # routing logic in manager.py forwards email to *any* known alias of
-    # this primary out of the box — which is what the user expects when
-    # they say "primary baru otomatis aktif, alias-nya juga".
+    # left over from a previous primary. Strict lock-mode means email is
+    # only forwarded once the user explicitly picks an alias from /list, so
+    # we deliberately leave ``active_alias_id`` NULL until then.
     await db.set_active_primary(chat.id, primary_id)
     await db.set_active_alias(chat.id, None)
 
     await update.effective_message.reply_text(  # type: ignore[union-attr]
         f"✅ Tersambung ke <b>{html.escape(email)}</b> — kredensial "
         "disimpan terenkripsi & jadi akun aktif.\n"
-        "Listener IMAP otomatis menyala; tiap email yang masuk ke alias "
-        "akun ini akan diteruskan ke chat ini.\n\n"
+        "Listener IMAP otomatis menyala. Email belum diteruskan otomatis: "
+        "buka <b>/list</b> dan pilih alias yang mau dipakai dulu.\n\n"
         "💡 <i>Hapus pesan password-mu di atas sekarang.</i>",
         parse_mode=ParseMode.HTML,
     )
@@ -1310,8 +1309,11 @@ async def cmd_disconnect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             ]
         )
     await update.effective_message.reply_text(  # type: ignore[union-attr]
-        "Pilih akun yang mau dihapus (listener akan dihentikan + kredensial "
-        "+ alias-aliasnya juga dihapus):",
+        "Pilih akun yang mau dihapus. Saya akan:\n"
+        "• stop listener IMAP\n"
+        "• hapus kredensial + semua alias-nya\n"
+        "• logout akun dari Proton Bridge (cache & keychain di-purge)\n"
+        "Jadi kalau /connect lagi nanti, mulai dari nol.",
         reply_markup=InlineKeyboardMarkup(rows),
     )
 
@@ -1876,13 +1878,39 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
         manager = _bot_manager(context)
         await manager.stop_for_primary(primary_id)
+        # Best-effort logout from the host Proton Bridge so a future
+        # /connect for the same email is a clean slate (no cached
+        # credentials, no stale message UID baseline). DB cleanup runs
+        # regardless of the Bridge-side outcome.
+        bridge_admin = _bot_bridge_admin(context)
+        bridge_removed = False
+        if bridge_admin is not None:
+            try:
+                bridge_removed = await bridge_admin.remove_account(primary.email)
+            except Exception:
+                LOGGER.exception(
+                    "bridge_admin.remove_account failed for %s",
+                    primary.email,
+                )
         await db.delete_primary_account(chat_id, primary_id)
-        try:
-            await query.edit_message_text(
-                f"❌ Akun <b>{html.escape(primary.email)}</b> + alias-aliasnya "
-                "dihapus, listener dihentikan.",
-                parse_mode=ParseMode.HTML,
+        if bridge_admin is None:
+            suffix = ""
+        elif bridge_removed:
+            suffix = "Cache Proton Bridge juga sudah di-purge."
+        else:
+            suffix = (
+                "Catatan: Bridge tidak sepenuhnya dibersihkan otomatis — "
+                "kalau /connect berikutnya error, jalankan "
+                "<code>bridge --cli</code> → <code>delete</code> manual."
             )
+        try:
+            text = (
+                f"❌ Akun <b>{html.escape(primary.email)}</b> + alias-aliasnya "
+                "dihapus, listener dihentikan."
+            )
+            if suffix:
+                text = f"{text}\n\n{suffix}"
+            await query.edit_message_text(text, parse_mode=ParseMode.HTML)
         except Exception:
             pass
         return

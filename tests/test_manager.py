@@ -179,14 +179,13 @@ async def test_discovered_aliases_adds_and_notifies(db: Database) -> None:
     assert sorted(notifier.discovery_calls[0][1]) == ["new1@proton.me", "new2@proton.me"]
 
 
-async def test_lock_on_other_primary_does_not_drop_email_for_this_primary(
+async def test_strict_lock_on_other_primary_drops_emails_for_this_primary(
     db: Database,
 ) -> None:
-    """Regression: locking an alias on primary B must not silently drop
-    incoming mail for primary A. This was the multi-primary bug that broke
-    vielz43's inbox after the user clicked vielz003 (under vielz64) in
-    /list — the cross-primary lock check returned early for *every*
-    listener, including the one not holding the lock.
+    """Strict lock-mode: a chat has at most ONE active alias across all
+    primaries. Mail arriving for a primary that does not hold the lock is
+    dropped, regardless of whether the address is a registered alias of
+    that primary.
     """
     chat_id = 300
     await db.upsert_user(chat_id)
@@ -210,35 +209,35 @@ async def test_lock_on_other_primary_does_not_drop_email_for_this_primary(
     )
 
     # Email arrives via primary_a's listener for one of A's known aliases.
-    # Even though primary_b has a lock, A's mail must still flow.
+    # Lock is on primary_b → drop.
     await manager._handle_new_message(
         chat_id, primary_a, _make_message("vielz54@proton.me"), "1"
     )
-    assert len(notifier.calls) == 1
-    assert notifier.calls[0][1] == "vielz54@proton.me"
+    assert notifier.calls == []
 
     # Email arrives via primary_b's listener targeting the locked alias.
     await manager._handle_new_message(
         chat_id, primary_b, _make_message("vielz003@proton.me"), "2"
     )
-    assert len(notifier.calls) == 2
-    assert notifier.calls[1][1] == "vielz003@proton.me"
+    assert len(notifier.calls) == 1
+    assert notifier.calls[0][1] == "vielz003@proton.me"
 
     # Email arrives via primary_b's listener for a *different* primary_b
     # alias (not the locked one). With B's lock pinned to vielz003, that
-    # email must be dropped.
+    # email must also be dropped.
     await db.add_aliases(chat_id, ["vielz004@proton.me"], primary_id=primary_b)
     await manager._handle_new_message(
         chat_id, primary_b, _make_message("vielz004@proton.me"), "3"
     )
-    assert len(notifier.calls) == 2  # unchanged
+    assert len(notifier.calls) == 1  # unchanged
 
 
-async def test_no_lock_forwards_known_alias_of_same_primary(db: Database) -> None:
-    """No active lock + email targets a previously-known alias of the
-    listener's primary → forwarded. This is the "primary baru otomatis
-    aktif" flow: a freshly-connected primary with no alias pinned should
-    forward email to any of its aliases out of the box.
+async def test_strict_no_lock_drops_emails_even_for_known_alias(
+    db: Database,
+) -> None:
+    """Strict lock-mode: with no active lock, emails are dropped even when
+    they target a previously-registered alias. The user must explicitly
+    pick an alias in /list to opt in to forwarding.
     """
     chat_id = 400
     await db.upsert_user(chat_id)
@@ -255,15 +254,22 @@ async def test_no_lock_forwards_known_alias_of_same_primary(db: Database) -> Non
     await manager._handle_new_message(
         chat_id, primary_id, _make_message("vielz004@proton.me"), "1"
     )
-    assert [c[1] for c in notifier.calls] == ["vielz004@proton.me"]
+    assert notifier.calls == []
+    # The alias is still in /list (auto-add was unaffected), so picking it
+    # via /list and re-receiving the email would forward.
+    all_aliases = await db.list_aliases(chat_id)
+    assert sorted(a.email for a in all_aliases) == [
+        "vielz003@proton.me",
+        "vielz004@proton.me",
+    ]
 
 
-async def test_no_lock_does_not_forward_brand_new_alias_on_first_email(
+async def test_strict_brand_new_alias_is_added_but_not_forwarded(
     db: Database,
 ) -> None:
-    """Brand-new addresses get auto-added to /list but NOT forwarded the
-    same instant they're discovered, so a third party can't trigger a
-    Telegram notification by emailing a never-seen-before address.
+    """Brand-new addresses get auto-added to /list but are NEVER forwarded
+    until the user picks them in /list (strict lock-mode). Repeat emails
+    to the same brand-new address still drop until that happens.
     """
     chat_id = 500
     await db.upsert_user(chat_id)
@@ -278,11 +284,18 @@ async def test_no_lock_does_not_forward_brand_new_alias_on_first_email(
     await manager._handle_new_message(
         chat_id, primary_id, _make_message("brand-new@proton.me"), "1"
     )
-    # No notification on first sighting.
     assert notifier.calls == []
-    # But the alias is now in /list, so a *second* email to it forwards.
+    # Second email to same address still drops because no lock yet.
     await manager._handle_new_message(
         chat_id, primary_id, _make_message("brand-new@proton.me"), "2"
+    )
+    assert notifier.calls == []
+    # Now user picks the alias from /list. Subsequent email is forwarded.
+    alias = await db.find_alias(chat_id, "brand-new@proton.me")
+    assert alias is not None
+    await db.set_active_alias(chat_id, alias.id)
+    await manager._handle_new_message(
+        chat_id, primary_id, _make_message("brand-new@proton.me"), "3"
     )
     assert [c[1] for c in notifier.calls] == ["brand-new@proton.me"]
 
