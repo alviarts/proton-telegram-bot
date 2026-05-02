@@ -77,6 +77,52 @@ CONNECT_DEFAULT_HOST = "127.0.0.1"
 CONNECT_DEFAULT_PORT = 1143
 CONNECT_DEFAULT_SSL = False
 
+# Strong refs to fire-and-forget cleanup tasks scheduled at the end
+# of /connect (request #8). asyncio garbage-collects tasks whose only
+# reference is on the call stack, so without keeping a strong ref the
+# 3-second cleanup may never run on a busy event loop. Done callbacks
+# remove the entry so the set doesn't grow unbounded.
+_CONNECT_CLEANUP_TASKS: set[asyncio.Task[Any]] = set()
+
+# Domain auto-suffix for /connect: when the user types just a username
+# (no ``@`` in the input) the bot appends ``@proton.me`` automatically
+# so they don't have to type it every time. The two fallback domains
+# are surfaced in the hint message so the user knows what to do if
+# the auto-suffix landed on the wrong one — they can resend with
+# ``user@protonmail.com`` or ``user@pm.me`` explicitly.
+CONNECT_DEFAULT_DOMAIN = "proton.me"
+CONNECT_FALLBACK_DOMAINS: tuple[str, ...] = ("protonmail.com", "pm.me")
+
+
+def _resolve_connect_email(raw: str) -> tuple[str, bool]:
+    """Normalise a /connect email input.
+
+    Returns ``(email, was_auto_suffixed)``. When the user typed just a
+    username (e.g. ``vielz883``) we append ``@proton.me`` and set the
+    flag so the caller can show a one-line hint pointing at the
+    fallback domains. Whitespace is stripped and the result is
+    lower-cased to match the rest of the codebase's address handling.
+    """
+    text = raw.strip().lower()
+    if "@" in text:
+        return text, False
+    return f"{text}@{CONNECT_DEFAULT_DOMAIN}", True
+
+
+def _connect_domain_hint_html(email: str) -> str:
+    """One-line HTML hint shown when ``/connect`` auto-suffixed a domain.
+
+    Tells the user which domain we picked and how to override it
+    cheaply (just resend with the explicit domain).
+    """
+    fallback_list = ", ".join(
+        f"<code>@{html.escape(d)}</code>" for d in CONNECT_FALLBACK_DOMAINS
+    )
+    return (
+        f"📧 Auto-isi: <code>{html.escape(email)}</code>\n"
+        f"<i>Kalau salah domain, kirim ulang dengan {fallback_list}.</i>"
+    )
+
 # Conversation states for /sync
 SYNC_CAPTCHA = 10
 
@@ -351,6 +397,33 @@ async def _render_primary_alias_list(
             primary, aliases, active_alias_id
         ),
     )
+
+
+async def _send_connect_log(
+    update: Update,
+    tracker: TaskMessageTracker | None,
+    text: str,
+    **kwargs: Any,
+) -> Any:
+    """Send a /connect status line and (optionally) register it for cleanup.
+
+    The whole /connect success-path emits ~6-10 progress messages
+    (Bridge probe, smoke test, auto-sync, …) that the user explicitly
+    asked to vanish 3 seconds after success: "saya kedepan nya tidak
+    ada mau chat log seperti ini lagi otomatis hilang bila sudah
+    berhasil". Wrapping every transient ``reply_text`` through this
+    helper keeps the call sites short while making the tracking
+    intent obvious. When ``tracker`` is ``None`` (legacy /connect
+    path or error-only branches) the helper degrades to a plain
+    ``reply_text`` so persistent error messages don't accidentally
+    get scheduled for deletion.
+    """
+    msg = await update.effective_message.reply_text(  # type: ignore[union-attr]
+        text, **kwargs
+    )
+    if tracker is not None:
+        tracker.track(msg)
+    return msg
 
 
 async def _show_primary_list(
@@ -865,9 +938,18 @@ async def cmd_connect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         parse_mode=ParseMode.HTML,
     )
     # Allow `/connect <email>` as a one-shot entry to skip the email prompt.
+    # Accepts either a full address (``vielz@proton.me``) or just the
+    # username (``vielz``); :func:`_resolve_connect_email` does the
+    # auto-suffix and tells us whether to show the domain hint.
     args = list(context.args or [])
-    if args and "@" in args[0]:
-        cast(dict, context.user_data)["primary_email"] = args[0].strip().lower()
+    if args and args[0].strip():
+        email, was_suffixed = _resolve_connect_email(args[0])
+        cast(dict, context.user_data)["primary_email"] = email
+        if was_suffixed:
+            await update.effective_message.reply_text(  # type: ignore[union-attr]
+                _connect_domain_hint_html(email),
+                parse_mode=ParseMode.HTML,
+            )
         await update.effective_message.reply_text(  # type: ignore[union-attr]
             _connect_password_prompt(bridge_admin_on),
             parse_mode=ParseMode.HTML,
@@ -913,12 +995,22 @@ async def connect_again_quick_entry(
 
 async def connect_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = (update.effective_message.text or "").strip()  # type: ignore[union-attr]
-    if "@" not in text:
+    if not text:
         await update.effective_message.reply_text(  # type: ignore[union-attr]
             "Itu bukan alamat email yang valid. Masukkan email Proton-nya:"
         )
         return CONNECT_EMAIL
-    cast(dict, context.user_data)["primary_email"] = text.lower()
+    # Accept bare username — :func:`_resolve_connect_email` auto-suffixes
+    # ``@proton.me`` (the most common case). The domain hint message
+    # below tells the user how to retry with a fallback domain
+    # (``@protonmail.com`` / ``@pm.me``) if Proton rejects the login.
+    email, was_suffixed = _resolve_connect_email(text)
+    cast(dict, context.user_data)["primary_email"] = email
+    if was_suffixed:
+        await update.effective_message.reply_text(  # type: ignore[union-attr]
+            _connect_domain_hint_html(email),
+            parse_mode=ParseMode.HTML,
+        )
     await update.effective_message.reply_text(  # type: ignore[union-attr]
         _connect_password_prompt(_bot_bridge_admin(context) is not None),
         parse_mode=ParseMode.HTML,
@@ -949,35 +1041,47 @@ def _build_post_disconnect_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def _build_post_connect_keyboard(primary_id: int) -> InlineKeyboardMarkup:
+def _build_post_connect_keyboard(
+    primary_id: int, *, master_password_saved: bool = False
+) -> InlineKeyboardMarkup:
     """Quick-action buttons for an empty newly-connected primary.
 
     Used when the just-connected account has no real aliases yet (the
     user just made a fresh Proton account). Walks them through the
     setprotonpw → genaddr workflow without re-typing the email address.
+
+    When ``master_password_saved`` is true (the auto-save in
+    :func:`_finalize_connect` succeeded — request #9), the
+    "🔐 Simpan password Proton" row is omitted because there's
+    nothing left to save.
     """
-    return InlineKeyboardMarkup(
-        [
+    rows: list[list[InlineKeyboardButton]] = []
+    if not master_password_saved:
+        rows.append(
             [
                 InlineKeyboardButton(
                     "🔐 Simpan password Proton",
                     callback_data=f"{CB_QUICK_SETPW}:{primary_id}",
                 )
-            ],
-            [
-                InlineKeyboardButton(
-                    "✨ Generate 20 alamat sekarang",
-                    callback_data=f"{CB_QUICK_GENADDR}:{primary_id}:20",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "🩺 Cek IMAP listener (background)",
-                    callback_data=f"{CB_QUICK_HEALTHCHECK}:{primary_id}",
-                )
-            ],
+            ]
+        )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "✨ Generate 20 alamat sekarang",
+                callback_data=f"{CB_QUICK_GENADDR}:{primary_id}:20",
+            )
         ]
     )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "🩺 Cek IMAP listener (background)",
+                callback_data=f"{CB_QUICK_HEALTHCHECK}:{primary_id}",
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
 
 
 def _build_post_connect_keyboard_with_aliases(
@@ -1096,6 +1200,7 @@ async def _finalize_connect(
     imap_password: str,
     smoke_test_tempmail: TempMailbox | None = None,
     pre_probe_settle_seconds: float = 0.0,
+    tracker: TaskMessageTracker | None = None,
 ) -> int:
     """Common tail of /connect: verify, save, start listener, friendly reply.
 
@@ -1124,7 +1229,9 @@ async def _finalize_connect(
     use_ssl = CONNECT_DEFAULT_SSL
 
     if pre_probe_settle_seconds > 0:
-        await update.effective_message.reply_text(  # type: ignore[union-attr]
+        await _send_connect_log(
+            update,
+            tracker,
             f"⏳ Menunggu Bridge selesai inisialisasi "
             f"<b>{html.escape(email)}</b> "
             f"({int(pre_probe_settle_seconds)}s)...",
@@ -1132,7 +1239,9 @@ async def _finalize_connect(
         )
         await asyncio.sleep(pre_probe_settle_seconds)
 
-    await update.effective_message.reply_text(  # type: ignore[union-attr]
+    await _send_connect_log(
+        update,
+        tracker,
         f"🔌 Cek login ke Bridge sebagai <b>{html.escape(email)}</b>...",
         parse_mode=ParseMode.HTML,
     )
@@ -1182,12 +1291,35 @@ async def _finalize_connect(
     await db.set_active_primary(chat.id, primary_id)
     await db.set_active_alias(chat.id, None)
 
-    await update.effective_message.reply_text(  # type: ignore[union-attr]
+    # Auto-store the Proton account password as the master password for
+    # /genaddr (request #9: "otomatis set protonpw dari awal connect").
+    # Only the Bridge-admin path populates ``connect_proton_password``;
+    # the legacy path uses the Bridge IMAP password (which would not
+    # work for the Proton web UI) and explicitly clears the key, so
+    # ``proton_master`` is None there. The post-connect CTA keyboard
+    # below uses ``master_password_saved`` to skip the now-redundant
+    # "🔐 Simpan password Proton" button.
+    proton_master = user_data.get("connect_proton_password")
+    master_password_saved = False
+    if proton_master:
+        try:
+            await db.set_proton_password(
+                chat.id, primary_id, cipher.encrypt(proton_master)
+            )
+            master_password_saved = True
+        except Exception:  # pragma: no cover - DB write shouldn't block /connect
+            LOGGER.exception(
+                "auto-save proton master password failed for primary %d",
+                primary_id,
+            )
+
+    await _send_connect_log(
+        update,
+        tracker,
         f"✅ Tersambung ke <b>{html.escape(email)}</b> — kredensial "
         "disimpan terenkripsi & jadi akun aktif.\n"
         "Listener IMAP otomatis menyala. Email belum diteruskan otomatis: "
-        "buka <b>/list</b> dan pilih alias yang mau dipakai dulu.\n\n"
-        "💡 <i>Hapus pesan password-mu di atas sekarang.</i>",
+        "buka <b>/list</b> dan pilih alias yang mau dipakai dulu.",
         parse_mode=ParseMode.HTML,
     )
     try:
@@ -1203,7 +1335,9 @@ async def _finalize_connect(
         return ConversationHandler.END
 
     if smoke_test_tempmail is not None:
-        await update.effective_message.reply_text(  # type: ignore[union-attr]
+        await _send_connect_log(
+            update,
+            tracker,
             "🧪 Smoke test IMAP/SMTP: kirim email uji ke temp mail "
             f"(<code>{html.escape(smoke_test_tempmail.address)}</code>)...",
             parse_mode=ParseMode.HTML,
@@ -1215,7 +1349,9 @@ async def _finalize_connect(
             tempmail=smoke_test_tempmail,
         )
         if smoke_ok:
-            await update.effective_message.reply_text(  # type: ignore[union-attr]
+            await _send_connect_log(
+                update,
+                tracker,
                 "✅ <b>IMAP/SMTP berjalan sempurna</b> — email uji "
                 "diterima di temp mail.",
                 parse_mode=ParseMode.HTML,
@@ -1261,7 +1397,9 @@ async def _finalize_connect(
         if proton_password:
             from .proton_verify import fetch_all_addresses_via_browser
 
-            await update.effective_message.reply_text(  # type: ignore[union-attr]
+            await _send_connect_log(
+                update,
+                tracker,
                 "🔍 Sync semua alamat Proton ke DB...",
             )
             proton_addresses = await fetch_all_addresses_via_browser(
@@ -1285,7 +1423,9 @@ async def _finalize_connect(
                 )
                 added = 0
             if added > 0:
-                await update.effective_message.reply_text(  # type: ignore[union-attr]
+                await _send_connect_log(
+                    update,
+                    tracker,
                     f"📥 Auto-sync: <b>{added}</b> alias dari "
                     f"akun Proton ditambahkan ke DB "
                     f"(total {len(candidate_aliases)} terdeteksi).",
@@ -1302,19 +1442,42 @@ async def _finalize_connect(
     primary_lower = email.lower()
     real_aliases = [a for a in aliases if a.email.lower() != primary_lower]
     if not real_aliases:
+        # When the auto-save in /connect succeeded the "1️⃣ Simpan
+        # password Proton" step is already done, so re-word the
+        # onboarding text accordingly. The keyboard helper drops
+        # the matching button via ``master_password_saved=True``.
+        if master_password_saved:
+            onboarding_text = (
+                f"ℹ️ Akun <b>{html.escape(email)}</b> belum punya alias.\n\n"  # noqa: RUF001
+                "<b>Cara cepat bikin alias:</b>\n"
+                "1️⃣  Password Proton sudah otomatis disimpan dari /connect — "
+                "✅ siap dipakai.\n"
+                "2️⃣  Klik <b>✨ Generate 20 alamat sekarang</b> — bot bikin "
+                "20 alias <code>vielz001..vielz020</code> otomatis di background.\n"
+                "   Bot kirim update tiap 5 alias (5/20, 10/20, ...) dan kamu "
+                "tetap bisa pakai perintah lain sambil generate jalan.\n"
+                "3️⃣  Pakai <b>🩺 Cek IMAP listener</b> kapan aja buat "
+                "validasi semua alias bisa terima email."
+            )
+        else:
+            onboarding_text = (
+                f"ℹ️ Akun <b>{html.escape(email)}</b> belum punya alias.\n\n"  # noqa: RUF001
+                "<b>Cara cepat bikin alias:</b>\n"
+                "1️⃣  Klik <b>🔐 Simpan password Proton</b> — sekali aja, "
+                "buat akun ini.\n"
+                "2️⃣  Klik <b>✨ Generate 20 alamat sekarang</b> — bot bikin "
+                "20 alias <code>vielz001..vielz020</code> otomatis di background.\n"
+                "   Bot kirim update tiap 5 alias (5/20, 10/20, ...) dan kamu "
+                "tetap bisa pakai perintah lain sambil generate jalan.\n"
+                "3️⃣  Pakai <b>🩺 Cek IMAP listener</b> kapan aja buat "
+                "validasi semua alias bisa terima email."
+            )
         await update.effective_message.reply_text(  # type: ignore[union-attr]
-            f"ℹ️ Akun <b>{html.escape(email)}</b> belum punya alias.\n\n"  # noqa: RUF001
-            "<b>Cara cepat bikin alias:</b>\n"
-            "1️⃣  Klik <b>🔐 Simpan password Proton</b> — sekali aja, "
-            "buat akun ini.\n"
-            "2️⃣  Klik <b>✨ Generate 20 alamat sekarang</b> — bot bikin "
-            "20 alias <code>vielz001..vielz020</code> otomatis di background.\n"
-            "   Bot kirim update tiap 5 alias (5/20, 10/20, ...) dan kamu "
-            "tetap bisa pakai perintah lain sambil generate jalan.\n"
-            "3️⃣  Pakai <b>🩺 Cek IMAP listener</b> kapan aja buat "
-            "validasi semua alias bisa terima email.",
+            onboarding_text,
             parse_mode=ParseMode.HTML,
-            reply_markup=_build_post_connect_keyboard(primary_id),
+            reply_markup=_build_post_connect_keyboard(
+                primary_id, master_password_saved=master_password_saved
+            ),
         )
     else:
         await update.effective_message.reply_text(  # type: ignore[union-attr]
@@ -1328,6 +1491,28 @@ async def _finalize_connect(
                 primary_id, len(real_aliases)
             ),
         )
+
+    # Request #8 — auto-cleanup the verbose log messages 3 seconds
+    # after success. The CTA messages above are intentionally NOT
+    # tracked because they're the user's interaction surface for the
+    # next step (Simpan password / Generate / Cek IMAP). The cleanup
+    # task is fire-and-forget so the conversation handler can return
+    # immediately; PTB's main event loop keeps running it. The task
+    # ref is parked in :data:`_CONNECT_CLEANUP_TASKS` to keep it alive
+    # against asyncio's "task that has never been awaited gets GC'd"
+    # rule (RUF006).
+    if tracker is not None and len(tracker) > 0:
+        cleanup_task = asyncio.create_task(
+            tracker.cleanup(),
+            name=f"connect-cleanup-{chat.id}",
+        )
+        _CONNECT_CLEANUP_TASKS.add(cleanup_task)
+        cleanup_task.add_done_callback(_CONNECT_CLEANUP_TASKS.discard)
+    # Drop the stash so a follow-up /connect in the same chat starts
+    # with a fresh tracker (the old one's ids are already scheduled
+    # for deletion).
+    user_data.pop("connect_log_tracker", None)
+
     return ConversationHandler.END
 
 
@@ -1335,6 +1520,8 @@ async def _setup_tempmail_recovery(
     update: Update,
     email: str,
     proton_password: str,
+    *,
+    tracker: TaskMessageTracker | None = None,
 ) -> tuple[TempMailbox | None, bool, list[str] | None]:
     """Create a temp mail and set it as recovery email in Proton settings.
 
@@ -1369,7 +1556,9 @@ async def _setup_tempmail_recovery(
             LOGGER.warning("failed to create temp mailbox: %s", exc)
             return None, False, None
 
-        await update.effective_message.reply_text(  # type: ignore[union-attr]
+        await _send_connect_log(
+            update,
+            tracker,
             f"📧 Temp mail dibuat: <code>{html.escape(tempmail.address)}</code>\n"
             "Mengubah recovery email di Proton...",
             parse_mode=ParseMode.HTML,
@@ -1460,7 +1649,9 @@ async def _setup_tempmail_recovery(
                         email,
                         len(addresses),
                     )
-                await update.effective_message.reply_text(  # type: ignore[union-attr]
+                await _send_connect_log(
+                    update,
+                    tracker,
                     f"📧 Recovery email diubah ke <code>{html.escape(tempmail.address)}</code>\n\n"
                     "Klik link berikut untuk verifikasi recovery email:\n"
                     f"{html.escape(verify_link)}",
@@ -1576,6 +1767,7 @@ async def _drive_bridge_login(
     bridge_admin: BridgeAdmin,
     email: str,
     proton_password: str,
+    tracker: TaskMessageTracker | None = None,
 ) -> int:
     """Walk Bridge through ``add_account`` end-to-end on behalf of /connect.
 
@@ -1599,7 +1791,7 @@ async def _drive_bridge_login(
     # This must happen before Bridge login because the Bridge CLI stops
     # the service (and thus the Proton web session is separate).
     tempmail, recovery_ok, proton_addresses = await _setup_tempmail_recovery(
-        update, email, proton_password
+        update, email, proton_password, tracker=tracker
     )
     if not recovery_ok:
         # Recovery email step failed: do NOT attempt Bridge add-account.
@@ -1620,7 +1812,13 @@ async def _drive_bridge_login(
     # Stash the list pulled from /api/core/v4/addresses so _finalize_connect
     # can persist them as aliases once IMAP comes up.
     user_data["proton_account_addresses"] = proton_addresses
-    await update.effective_message.reply_text(  # type: ignore[union-attr]
+    # Track the "👆 Klik link" prompt: cleanup only fires AFTER the
+    # user has confirmed (sent "ok") and _finalize_connect ran, so
+    # at that point the prompt has served its purpose and is safe
+    # to delete alongside the rest of the success log.
+    await _send_connect_log(
+        update,
+        tracker,
         "👆 Klik link verifikasi di atas dan selesaikan di browser "
         "(buka link, tekan tombol verifikasi di halaman Proton).\n\n"
         "Begitu Proton mengonfirmasi recovery email <b>terverifikasi</b>, "
@@ -1639,6 +1837,7 @@ async def _perform_bridge_add_account(
     email: str,
     proton_password: str,
     tempmail: TempMailbox | None,
+    tracker: TaskMessageTracker | None = None,
 ) -> int:
     """Run ``bridge add_account`` and the smoke test for ``email``.
 
@@ -1732,11 +1931,19 @@ async def _perform_bridge_add_account(
         imap_password=creds.imap_password,
         smoke_test_tempmail=tempmail,
         pre_probe_settle_seconds=30.0,
+        tracker=tracker,
     )
 
 
 async def connect_password(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = (update.effective_message.text or "").strip()  # type: ignore[union-attr]
+    # Security: scrub the user's password message from the chat as
+    # soon as we've read it. Telegram bots can delete user messages
+    # in private chats up to 48h old, which is exactly the window we
+    # need. We do this BEFORE any other side effect so that a transient
+    # bot crash mid-handler still gets the password off-screen.
+    with contextlib.suppress(Exception):
+        await update.effective_message.delete()  # type: ignore[union-attr]
     if not text:
         await update.effective_message.reply_text("Password tidak boleh kosong:")  # type: ignore[union-attr]
         return CONNECT_PASSWORD
@@ -1761,6 +1968,8 @@ async def connect_password(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         # Legacy path: user typed the Bridge IMAP password directly.
         # That's the Bridge IMAP password, not the Proton account
         # password, so address sync wouldn't work — clear the key.
+        # No tracker on this path: the legacy flow emits only ~2-3
+        # log lines so the cleanup churn isn't worth the complexity.
         user_data.pop("connect_proton_password", None)
         return await _finalize_connect(
             update,
@@ -1769,6 +1978,20 @@ async def connect_password(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             imap_username=email,
             imap_password=text,
         )
+
+    # Bridge-admin path: build a tracker that follows the entire
+    # success log (probe → smoke test → auto-sync → "Tersambung")
+    # so it can be 3-second-deleted after :func:`_finalize_connect`
+    # finishes. The tracker is stashed in ``user_data`` so the
+    # recovery-email wait state (``CONNECT_RECOVERY_VERIFY``) can
+    # restore it after the user confirms the verification click —
+    # otherwise the wait would discard the tracked ids and the
+    # post-add log would persist.
+    bot = context.bot if hasattr(context, "bot") else None
+    tracker: TaskMessageTracker | None = None
+    if bot is not None:
+        tracker = TaskMessageTracker(bot, chat.id)
+        user_data["connect_log_tracker"] = tracker
 
     # Auto-add path: text is the Proton account password. If the account
     # is already in Bridge AND the cached IMAP creds actually work, skip
@@ -1804,6 +2027,7 @@ async def connect_password(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 email=existing.email,
                 imap_username=existing.imap_username,
                 imap_password=existing.imap_password,
+                tracker=tracker,
             )
         LOGGER.info(
             "vault has %s but Bridge IMAP rejected (%s); running full re-add",
@@ -1817,6 +2041,7 @@ async def connect_password(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         bridge_admin=bridge_admin,
         email=email,
         proton_password=text,
+        tracker=tracker,
     )
 
 
@@ -1850,6 +2075,10 @@ async def connect_recovery_verify(
         )
         return ConversationHandler.END
 
+    # Restore the tracker stashed at the start of ``connect_password``
+    # so the success-log cleanup in :func:`_finalize_connect` includes
+    # everything emitted before the recovery-verify wait state.
+    tracker = user_data.get("connect_log_tracker")
     return await _perform_bridge_add_account(
         update,
         context,
@@ -1857,6 +2086,7 @@ async def connect_recovery_verify(
         email=email,
         proton_password=proton_password,
         tempmail=tempmail,
+        tracker=tracker,
     )
 
 
@@ -1931,6 +2161,7 @@ async def connect_bridge_captcha(
                 imap_password=creds.imap_password,
                 smoke_test_tempmail=user_data.get("bridge_smoke_tempmail"),
                 pre_probe_settle_seconds=30.0,
+                tracker=user_data.get("connect_log_tracker"),
             )
 
 
@@ -1941,6 +2172,11 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_data.pop("bridge_email", None)
     user_data.pop("bridge_smoke_tempmail", None)
     user_data.pop("proton_password", None)
+    # Drop the success-log tracker stash (request #8). On cancel we
+    # deliberately do NOT cleanup the chat: the user might want to
+    # see the partial log to understand what failed.
+    user_data.pop("connect_log_tracker", None)
+    user_data.pop("connect_proton_password", None)
     bridge_admin = _bot_bridge_admin(context)
     if bridge_admin is not None:
         try:
