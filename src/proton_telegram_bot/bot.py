@@ -77,7 +77,14 @@ SETPW_PICK_PRIMARY, SETPW_PASSWORD = 20, 21
 
 # Throttle: at most one progress edit every N addresses to stay well under
 # Telegram's edit_message rate limit during long /genaddr runs.
+# Kept for backwards-compat callers; the new background flow uses
+# ``GENADDR_NOTIFY_EVERY`` for fresh-message progress instead.
 GENADDR_PROGRESS_EVERY = 1
+# Per how many newly-created addresses the background /genaddr task should
+# post a fresh progress message into the chat. The user's UX request was
+# "laporan text per 5 alias sudah selesai", so the default is 5; users with
+# big batches still get a steady drip of updates without spamming the chat.
+GENADDR_NOTIFY_EVERY = 5
 
 # Limits applied at the bot layer (the alias generator has its own MAX_BATCH).
 GENADDR_DEFAULT_DOMAIN = "proton.me"
@@ -2278,7 +2285,10 @@ async def cmd_genaddr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     domain = domain.lstrip("@")
 
     db = _bot_db(context)
-    cipher = _bot_cipher(context)
+    # Cipher is fetched lazily inside the background task. Verify it's
+    # configured here so the user gets an immediate error instead of one
+    # that only surfaces after they've waited for the browser to spin up.
+    _bot_cipher(context)
     primaries = await db.list_primary_accounts(chat.id)
     if not primaries:
         await update.effective_message.reply_text(  # type: ignore[union-attr]
@@ -2311,11 +2321,16 @@ async def cmd_genaddr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
     proxy_provider = context.application.bot_data.get("proxy_provider")
     proxy_note = " via proxy rotasi" if proxy_provider is not None else ""
-    progress_message = await update.effective_message.reply_text(  # type: ignore[union-attr]
-        f"⏳ Menyiapkan browser & login ke <b>{html.escape(primary.email)}</b>"
-        f"{proxy_note}...\n"
-        f"Akan membuat <b>{count}</b> alamat dengan pola "
-        f"<code>{html.escape(base)}NNN@{html.escape(domain)}</code>.",
+    # Background mode: send a single starting message, then return so the
+    # bot stays responsive. Progress comes in as separate messages every
+    # ``GENADDR_NOTIFY_EVERY`` successes, mirroring the /cekimap UX.
+    await update.effective_message.reply_text(  # type: ignore[union-attr]
+        f"🚀 Mulai generate <b>{count}</b> alamat di background untuk "
+        f"<b>{html.escape(primary.email)}</b>{proxy_note}.\n"
+        f"Pola: <code>{html.escape(base)}NNN@{html.escape(domain)}</code>\n"
+        f"Bot tetap responsif — kamu bisa kirim /list, /cekimap, atau "
+        f"perintah lain sambil generate jalan. Update tiap "
+        f"<b>{GENADDR_NOTIFY_EVERY}</b> alamat sukses.",
         parse_mode=ParseMode.HTML,
         reply_markup=cancel_keyboard,
     )
@@ -2330,55 +2345,129 @@ async def cmd_genaddr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     context.chat_data["genaddr_cancel_event"] = cancel_event
     context.chat_data["genaddr_browser_handle"] = browser_handle
 
+    _launch_genaddr_task(
+        context,
+        chat_id=chat.id,
+        primary=primary,
+        base=base,
+        count=count,
+        domain=domain,
+        cancel_event=cancel_event,
+        browser_handle=browser_handle,
+        proxy_provider=proxy_provider,
+    )
+
+
+def _launch_genaddr_task(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    chat_id: int,
+    primary: PrimaryAccount,
+    base: str,
+    count: int,
+    domain: str,
+    cancel_event: asyncio.Event,
+    browser_handle: dict[str, object],
+    proxy_provider,
+) -> None:
+    """Spawn ``_run_genaddr_background`` as a tracked asyncio task.
+
+    Mirrors the ``_launch_health_check_task`` pattern: keeps a strong
+    reference on ``application.bot_data['genaddr_tasks']`` so the task
+    isn't GC'd before completion, and sweeps already-finished tasks out
+    of the list on every new launch.
+    """
+    task_list = context.application.bot_data.setdefault("genaddr_tasks", [])
+    task_list[:] = [t for t in task_list if not t.done()]
+    task = asyncio.create_task(
+        _run_genaddr_background(
+            context,
+            chat_id=chat_id,
+            primary=primary,
+            base=base,
+            count=count,
+            domain=domain,
+            cancel_event=cancel_event,
+            browser_handle=browser_handle,
+            proxy_provider=proxy_provider,
+        ),
+        name=f"genaddr-{primary.id}-{count}",
+    )
+    task_list.append(task)
+
+
+async def _run_genaddr_background(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    chat_id: int,
+    primary: PrimaryAccount,
+    base: str,
+    count: int,
+    domain: str,
+    cancel_event: asyncio.Event,
+    browser_handle: dict[str, object],
+    proxy_provider,
+) -> None:
+    """Run the actual address-creation batch as a background task.
+
+    Posts a fresh Telegram message every ``GENADDR_NOTIFY_EVERY`` newly
+    created addresses (instead of editing one progress message in place)
+    so the user sees a steady stream of "🔄 5/20 selesai" / "🔄 10/20 …"
+    notifications while the bot remains free to handle other commands.
+    """
+    bot = context.application.bot
+    db = _bot_db(context)
+    cipher = _bot_cipher(context)
+
     successes: list[str] = []
     failures: list[tuple[str, str]] = []
+    last_notified_count = 0
 
     async def _on_progress(success_count: int, target: int, result) -> None:
-        # ``result`` is an AddressCreationResult — deliberately untyped here
-        # to avoid widening the bot.py imports; we only use a few fields.
-        # ``success_count`` is the number of successful addresses so far
-        # (NOT the attempt index): the orchestrator now loops until we
-        # reach ``target`` successes, attempting more names if some fail.
+        nonlocal last_notified_count
         if result.status is CreationStatus.SUCCESS:
             successes.append(result.email)
         else:
             failures.append((result.email, result.status.value))
-        attempts = len(successes) + len(failures)
-        # Throttle by attempts (every Nth attempt OR when target reached)
-        # so failures still drive UI updates -- otherwise the bot would
-        # look frozen during a long string of duplicates.
+        # Only post a new message when we cross a multiple of NOTIFY_EVERY
+        # (or on the very last success), so the chat doesn't get spammed
+        # for every single address.
+        if success_count == last_notified_count:
+            return
         if (
-            attempts % GENADDR_PROGRESS_EVERY != 0
+            success_count % GENADDR_NOTIFY_EVERY != 0
             and success_count != target
-            and result.status is not CreationStatus.SUCCESS
         ):
             return
+        last_notified_count = success_count
+        # Show the last 5 created emails as a hint of what just landed,
+        # so the user can immediately verify progress is real.
+        recent_window = successes[
+            max(0, success_count - GENADDR_NOTIFY_EVERY) : success_count
+        ]
+        recent_html = ", ".join(html.escape(e) for e in recent_window)
         try:
-            await progress_message.edit_text(
-                f"✅ <b>{success_count}/{target}</b> sukses pada "
-                f"<b>{html.escape(primary.email)}</b>\n"
-                f"⏳ {attempts} percobaan · ⚠️ {len(failures)} gagal/duplikat\n"
-                f"Terakhir: <code>{html.escape(result.email)}</code> "
-                f"({html.escape(result.status.value)})",
+            await bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"🔄 <b>{success_count}/{target}</b> alamat sukses di "
+                    f"<b>{html.escape(primary.email)}</b>\n"
+                    f"⚠️ Gagal/duplikat sejauh ini: <b>{len(failures)}</b>\n"
+                    f"Terbaru: <code>{recent_html}</code>"
+                ),
                 parse_mode=ParseMode.HTML,
-                # Critical: re-pass the cancel keyboard on every edit.
-                # ``edit_text`` without ``reply_markup`` *removes* the
-                # inline keyboard, which is what made the Cancel button
-                # disappear after the first progress update.
-                reply_markup=cancel_keyboard,
             )
         except Exception:
-            # Telegram occasionally rejects identical edits or rate-limits;
-            # losing a progress update is fine, the final summary is what
-            # matters.
-            LOGGER.debug("genaddr progress edit failed", exc_info=True)
+            # Losing a progress update is fine — the final summary is
+            # what matters.
+            LOGGER.debug("genaddr background progress send failed", exc_info=True)
 
     try:
         try:
             summary = await address_generator.run_batch(
                 db=db,
                 cipher=cipher,
-                chat_id=chat.id,
+                chat_id=chat_id,
                 primary=primary,
                 base=base,
                 count=count,
@@ -2390,53 +2479,74 @@ async def cmd_genaddr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 proxy_provider=proxy_provider,
             )
         except address_generator.AddressGenerationError as exc:
-            await progress_message.edit_text(
-                f"❌ Tidak bisa mulai: {html.escape(str(exc))}\n\n"
-                "Kalau belum, set password Proton dengan /setprotonpw.",
+            await bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"❌ /genaddr untuk <b>{html.escape(primary.email)}</b> "
+                    f"tidak bisa mulai: {html.escape(str(exc))}\n\n"
+                    "Kalau belum, set password Proton dengan /setprotonpw."
+                ),
                 parse_mode=ParseMode.HTML,
             )
             return
         except Exception as exc:
-            LOGGER.exception("genaddr crashed")
-            await progress_message.edit_text(
-                "❌ Browser otomasi crash.\n"
-                f"Detail: <code>{html.escape(str(exc) or type(exc).__name__)}</code>\n\n"
-                "Screenshot + HTML halaman terakhir disimpan di "
-                "<code>/tmp/proton-browser-debug/</code> dalam container.\n"
-                "Ambil dengan: <code>docker compose cp bot:/tmp/proton-browser-debug ./debug</code>",
+            LOGGER.exception("genaddr background crashed")
+            await bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"❌ /genaddr untuk <b>{html.escape(primary.email)}</b>: "
+                    f"browser otomasi crash.\n"
+                    f"Detail: <code>"
+                    f"{html.escape(str(exc) or type(exc).__name__)}</code>\n\n"
+                    "Screenshot + HTML halaman terakhir disimpan di "
+                    "<code>/tmp/proton-browser-debug/</code> dalam container.\n"
+                    "Ambil dengan: <code>docker compose cp "
+                    "bot:/tmp/proton-browser-debug ./debug</code>"
+                ),
                 parse_mode=ParseMode.HTML,
             )
             return
     finally:
-        # Clear chat_data so the next /genaddr can run + the cancel button
-        # in any later message becomes a no-op.
-        context.chat_data.pop("genaddr_running", None)
-        context.chat_data.pop("genaddr_cancel_event", None)
-        context.chat_data.pop("genaddr_browser_handle", None)
-        context.chat_data.pop("genaddr_force_close_task", None)
+        chat_data = context.application.chat_data.get(chat_id)
+        if chat_data is not None:
+            chat_data.pop("genaddr_running", None)
+            chat_data.pop("genaddr_cancel_event", None)
+            chat_data.pop("genaddr_browser_handle", None)
+            chat_data.pop("genaddr_force_close_task", None)
 
     final_lines = [
-        f"✅ Selesai. Sukses: <b>{len(summary.created)}</b>, "
+        f"✨ <b>/genaddr selesai</b> di <b>{html.escape(primary.email)}</b>.",
+        f"Sukses: <b>{len(summary.created)}</b>, "
         f"sudah ada: <b>{len(summary.already_existing)}</b>, "
         f"gagal: <b>{len(summary.failed)}</b>.",
     ]
     if summary.captcha_interrupted_at:
         final_lines.append(
-            f"⚠️ Berhenti di <code>{html.escape(summary.captcha_interrupted_at)}</code> "
+            f"⚠️ Berhenti di <code>"
+            f"{html.escape(summary.captcha_interrupted_at)}</code> "
             "karena CAPTCHA. Solve manual lalu jalankan ulang /genaddr."
         )
     if summary.aborted_reason and not summary.captcha_interrupted_at:
         final_lines.append(f"ℹ️ {html.escape(summary.aborted_reason)}")  # noqa: RUF001
     if summary.created:
         sample = ", ".join(r.email for r in summary.created[:5])
-        more = "" if len(summary.created) <= 5 else f" (+{len(summary.created) - 5} lagi)"
+        more = (
+            "" if len(summary.created) <= 5
+            else f" (+{len(summary.created) - 5} lagi)"
+        )
         final_lines.append(f"Contoh: <code>{html.escape(sample)}</code>{more}")
-    final_lines.append("\n/list untuk lihat semua alamat per akun.")
-    await progress_message.edit_text(
-        "\n".join(final_lines),
-        parse_mode=ParseMode.HTML,
-        reply_markup=None,
+    final_lines.append(
+        "\nKlik /list buat lihat semuanya, atau /cekimap untuk validasi "
+        "alias yang baru dibuat sudah bisa terima email."
     )
+    try:
+        await bot.send_message(
+            chat_id=chat_id,
+            text="\n".join(final_lines),
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        LOGGER.exception("genaddr final summary send failed")
 
 
 # --------------------------------------------------------------- callback queries
