@@ -826,8 +826,8 @@ def _build_post_connect_keyboard(primary_id: int) -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
-                    "✨ Generate 10 alamat sekarang",
-                    callback_data=f"{CB_QUICK_GENADDR}:{primary_id}:10",
+                    "✨ Generate 20 alamat sekarang",
+                    callback_data=f"{CB_QUICK_GENADDR}:{primary_id}:20",
                 )
             ],
             [
@@ -1154,8 +1154,10 @@ async def _finalize_connect(
             "<b>Cara cepat bikin alias:</b>\n"
             "1️⃣  Klik <b>🔐 Simpan password Proton</b> — sekali aja, "
             "buat akun ini.\n"
-            "2️⃣  Klik <b>✨ Generate 10 alamat sekarang</b> — bot bikin "
-            "10 alias <code>vielz001..vielz010</code> otomatis.\n"
+            "2️⃣  Klik <b>✨ Generate 20 alamat sekarang</b> — bot bikin "
+            "20 alias <code>vielz001..vielz020</code> otomatis di background.\n"
+            "   Bot kirim update tiap 5 alias (5/20, 10/20, ...) dan kamu "
+            "tetap bisa pakai perintah lain sambil generate jalan.\n"
             "3️⃣  Pakai <b>🩺 Cek IMAP listener</b> kapan aja buat "
             "validasi semua alias bisa terima email.",
             parse_mode=ParseMode.HTML,

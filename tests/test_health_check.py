@@ -35,7 +35,7 @@ def test_post_connect_keyboard_has_all_three_onboarding_buttons() -> None:
     rows = kb.inline_keyboard
     callbacks = [btn.callback_data for row in rows for btn in row]
     assert f"{CB_QUICK_SETPW}:42" in callbacks
-    assert f"{CB_QUICK_GENADDR}:42:10" in callbacks
+    assert f"{CB_QUICK_GENADDR}:42:20" in callbacks
     assert f"{CB_QUICK_HEALTHCHECK}:42" in callbacks
 
 
