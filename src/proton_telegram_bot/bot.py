@@ -58,7 +58,12 @@ LOGGER = logging.getLogger(__name__)
 # hard-code; if a future setup ever needs different values we can wire a
 # dedicated /connect_advanced command instead of bringing the questions
 # back into the default path.
-CONNECT_EMAIL, CONNECT_PASSWORD, CONNECT_BRIDGE_CAPTCHA = range(3)
+(
+    CONNECT_EMAIL,
+    CONNECT_PASSWORD,
+    CONNECT_BRIDGE_CAPTCHA,
+    CONNECT_RECOVERY_VERIFY,
+) = range(4)
 CONNECT_DEFAULT_HOST = "127.0.0.1"
 CONNECT_DEFAULT_PORT = 1143
 CONNECT_DEFAULT_SSL = False
@@ -594,46 +599,70 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def _verify_bridge_login(
-    *, host: str, port: int, username: str, password: str, use_ssl: bool
+    *,
+    host: str,
+    port: int,
+    username: str,
+    password: str,
+    use_ssl: bool,
+    attempts: int = 1,
+    backoff_seconds: float = 5.0,
 ) -> tuple[bool, str]:
-    """Try a single LOGIN against the user-supplied IMAP creds.
+    """Try LOGIN against the user-supplied IMAP creds, with optional retries.
 
     Returns ``(ok, detail)``. We do this *before* persisting the row so a
     typo in the Bridge password fails loud — the previous flow happily
     saved bogus creds, then the listener would silently NONAUTH-loop
     every two minutes and the user just saw "no email arrives". Bridge
     runs locally so the round-trip cost is negligible.
+
+    A freshly added account often needs a few seconds before its IMAP
+    listener accepts logins, so callers running this immediately after
+    ``bridge add_account`` should pass ``attempts > 1``. We only retry
+    on connection-level errors (TimeoutError, ConnectionRefused, ...);
+    a "BAD" / "NO" auth response is final.
     """
-    try:
-        if use_ssl:
-            client = aioimaplib.IMAP4_SSL(host=host, port=port, timeout=10)
-        else:
-            client = aioimaplib.IMAP4(host=host, port=port, timeout=10)
+    last_detail = ""
+    for attempt in range(1, max(1, attempts) + 1):
         try:
-            await client.wait_hello_from_server()
-            resp = await client.login(username, password)
-            if resp.result != "OK":
-                detail = " | ".join(
-                    line.decode("utf-8", "replace")
-                    if isinstance(line, bytes)
-                    else str(line)
-                    for line in (resp.lines or [])
-                ) or resp.result
-                return False, detail
+            if use_ssl:
+                client = aioimaplib.IMAP4_SSL(host=host, port=port, timeout=10)
+            else:
+                client = aioimaplib.IMAP4(host=host, port=port, timeout=10)
             try:
-                await client.logout()
-            except Exception:
-                # Best-effort cleanup; LOGIN already succeeded so we don't
-                # care if LOGOUT errors out.
-                pass
-            return True, ""
-        finally:
-            try:
-                await client.close()
-            except Exception:
-                pass
-    except Exception as exc:
-        return False, f"{type(exc).__name__}: {exc}"
+                await client.wait_hello_from_server()
+                resp = await client.login(username, password)
+                if resp.result != "OK":
+                    detail = " | ".join(
+                        line.decode("utf-8", "replace")
+                        if isinstance(line, bytes)
+                        else str(line)
+                        for line in (resp.lines or [])
+                    ) or resp.result
+                    return False, detail
+                try:
+                    await client.logout()
+                except Exception:
+                    # Best-effort cleanup; LOGIN already succeeded so we don't
+                    # care if LOGOUT errors out.
+                    pass
+                return True, ""
+            finally:
+                try:
+                    await client.close()
+                except Exception:
+                    pass
+        except Exception as exc:
+            last_detail = f"{type(exc).__name__}: {exc}"
+            LOGGER.info(
+                "bridge IMAP login attempt %d/%d failed: %s",
+                attempt,
+                attempts,
+                last_detail,
+            )
+            if attempt < attempts:
+                await asyncio.sleep(backoff_seconds)
+    return False, last_detail
 
 
 def _connect_password_prompt(bridge_admin_on: bool) -> str:
@@ -851,12 +880,17 @@ async def _finalize_connect(
         f"🔌 Cek login ke Bridge sebagai <b>{html.escape(email)}</b>...",
         parse_mode=ParseMode.HTML,
     )
+    # Retry: a freshly added Bridge account often takes 5–15s before its
+    # IMAP listener fully comes up. The previous one-shot probe failed
+    # immediately with TimeoutError on a perfectly valid account.
     ok, detail = await _verify_bridge_login(
         host=host,
         port=port,
         username=imap_username,
         password=imap_password,
         use_ssl=use_ssl,
+        attempts=4,
+        backoff_seconds=5.0,
     )
     if not ok:
         await update.effective_message.reply_text(  # type: ignore[union-attr]
@@ -1197,6 +1231,15 @@ async def _drive_bridge_login(
     tries to solve it automatically via a disposable Mail.tm inbox.  If
     auto-verification fails it falls back to the manual flow (sending
     the verification URL to the chat).
+
+    After ``_setup_tempmail_recovery`` posts the verification link to the
+    chat we **wait for the user to confirm they actually clicked it**
+    before kicking off ``bridge add_account``. Firing add-account in
+    parallel with the click race-conditioned with Proton: the new
+    recovery email was still flagged "Belum diverifikasi", so Proton
+    treated the freshly added Bridge session as risky and Bridge IMAP
+    came up half-initialised — leading to the ``TimeoutError`` we kept
+    seeing on the post-add IMAP login probe.
     """
     user_data = cast(dict, context.user_data)
 
@@ -1215,6 +1258,40 @@ async def _drive_bridge_login(
         # confusing TimeoutError after a broken recovery flow.
         return ConversationHandler.END
 
+    # Hand off to the recovery-verify wait state. The verification link
+    # has already been DM'd from inside ``_setup_tempmail_recovery``;
+    # we just need the user to click it and reply "ok" before we
+    # proceed to bridge add-account.
+    user_data["bridge_recovery_email"] = email
+    user_data["bridge_recovery_proton_password"] = proton_password
+    user_data["bridge_recovery_tempmail"] = tempmail
+    await update.effective_message.reply_text(  # type: ignore[union-attr]
+        "👆 Klik link verifikasi di atas dan selesaikan di browser "
+        "(buka link, tekan tombol verifikasi di halaman Proton).\n\n"
+        "Begitu Proton mengonfirmasi recovery email <b>terverifikasi</b>, "
+        "kirim <code>ok</code> di sini supaya bot lanjut daftar ke Bridge.\n"
+        "Kirim /cancel untuk batal.",
+        parse_mode=ParseMode.HTML,
+    )
+    return CONNECT_RECOVERY_VERIFY
+
+
+async def _perform_bridge_add_account(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    bridge_admin: BridgeAdmin,
+    email: str,
+    proton_password: str,
+    tempmail: TempMailbox | None,
+) -> int:
+    """Run ``bridge add_account`` and the smoke test for ``email``.
+
+    Extracted from ``_drive_bridge_login`` so it can be invoked **after**
+    the user has confirmed they clicked the recovery-email verification
+    link, without duplicating the iterator/CAPTCHA bookkeeping.
+    """
+    user_data = cast(dict, context.user_data)
     progress = await update.effective_message.reply_text(  # type: ignore[union-attr]
         f"🔧 Mendaftarkan <b>{html.escape(email)}</b> ke Proton Bridge "
         "(stop service → cli login → restart)...",
@@ -1368,6 +1445,46 @@ async def connect_password(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         bridge_admin=bridge_admin,
         email=email,
         proton_password=text,
+    )
+
+
+_RECOVERY_VERIFY_OK_TOKENS = {
+    "ok", "oke", "okay", "selesai", "done", "sudah", "udah", "yes", "ya",
+}
+
+
+async def connect_recovery_verify(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Wait for the user to confirm they clicked the recovery-email
+    verification link before kicking off ``bridge add_account``."""
+    text = (update.effective_message.text or "").strip().lower()  # type: ignore[union-attr]
+    if text not in _RECOVERY_VERIFY_OK_TOKENS:
+        await update.effective_message.reply_text(  # type: ignore[union-attr]
+            "Setelah klik link verifikasi & Proton bilang sukses, kirim "
+            "<code>ok</code> di sini. /cancel untuk batal.",
+            parse_mode=ParseMode.HTML,
+        )
+        return CONNECT_RECOVERY_VERIFY
+
+    user_data = cast(dict, context.user_data)
+    email = user_data.get("bridge_recovery_email")
+    proton_password = user_data.get("bridge_recovery_proton_password")
+    tempmail = user_data.get("bridge_recovery_tempmail")
+    bridge_admin = _bot_bridge_admin(context)
+    if bridge_admin is None or not email or not proton_password:
+        await update.effective_message.reply_text(  # type: ignore[union-attr]
+            "Sesi /connect kedaluwarsa. Mulai lagi dengan /connect."
+        )
+        return ConversationHandler.END
+
+    return await _perform_bridge_add_account(
+        update,
+        context,
+        bridge_admin=bridge_admin,
+        email=email,
+        proton_password=proton_password,
+        tempmail=tempmail,
     )
 
 
@@ -2350,6 +2467,11 @@ def build_handlers() -> list:
             CONNECT_BRIDGE_CAPTCHA: [
                 MessageHandler(
                     filters.TEXT & ~filters.COMMAND, connect_bridge_captcha
+                ),
+            ],
+            CONNECT_RECOVERY_VERIFY: [
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND, connect_recovery_verify
                 ),
             ],
         },
