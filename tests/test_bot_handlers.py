@@ -63,6 +63,29 @@ def test_build_handlers_has_callback_query_router() -> None:
     assert any(isinstance(h, CallbackQueryHandler) for h in handlers)
 
 
+def test_connect_again_callback_is_a_connect_conv_entry_point() -> None:
+    """Post-disconnect "🔌 Connect lagi" button must enter the connect
+    conversation directly. This guards against accidentally dropping
+    the CallbackQueryHandler from connect_conv.entry_points and
+    silently breaking the shortcut.
+    """
+    from proton_telegram_bot.bot import CB_CONNECT_AGAIN
+
+    handlers = build_handlers()
+    connect_conv = next(
+        h
+        for h in handlers
+        if isinstance(h, ConversationHandler) and h.name == "connect"
+    )
+    callback_entries = [
+        e for e in connect_conv.entry_points if isinstance(e, CallbackQueryHandler)
+    ]
+    assert callback_entries, "connect_conv must accept a callback entry point"
+    assert any(
+        CB_CONNECT_AGAIN in e.pattern.pattern for e in callback_entries
+    ), f"no entry point matches {CB_CONNECT_AGAIN!r}"
+
+
 # ----------------------------- _pick_primary_for_genaddr ---------------------
 
 

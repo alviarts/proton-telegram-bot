@@ -52,6 +52,7 @@ from .status_reporter import (
     build_status_keyboard,
     on_status_button_noop,
 )
+from .task_message_tracker import TaskMessageTracker
 from .tempmail import TempMailbox, TempMailError
 
 LOGGER = logging.getLogger(__name__)
@@ -113,6 +114,10 @@ CB_GENADDR_CANCEL = "genaddr_cancel"
 # /genaddr flow without making them re-type the email address.
 CB_QUICK_SETPW = "qsetpw"
 CB_QUICK_GENADDR = "qgenaddr"
+# Post-disconnect re-entry shortcut: the "🔌 Connect lagi" button below
+# the disconnect-done message routes through the existing /connect
+# conversation so the user doesn't have to retype the command.
+CB_CONNECT_AGAIN = "qconnect"
 # /cekimap entry: trigger an end-to-end health check (Bridge SMTP →
 # tempmail) for every alias of a chosen primary. Two callback flavours:
 # ``hcpick:<primary_id>``  — picker entry (from /cekimap menu and /list).
@@ -311,6 +316,41 @@ async def _alias_count_per_primary(
         aliases = await db.list_aliases(chat_id, primary_id=primary.id)
         counts[primary.id] = len(aliases)
     return counts
+
+
+async def _render_primary_alias_list(
+    bot: Any, db: Database, chat_id: int, primary: PrimaryAccount
+) -> Any:
+    """Send a fresh per-primary alias keyboard.
+
+    Used as the ``after`` callback of :class:`TaskMessageTracker` so
+    long-running tasks (``/cekimap``, ``/genaddr``, sync) collapse all
+    their transient progress messages into a single canonical "back to
+    /list" view for the primary that just finished. The message
+    intentionally mirrors the inline keyboard rendered by the
+    per-primary callback in :func:`on_callback` (drill-down view) so
+    the user lands somewhere they already recognise.
+    """
+    try:
+        aliases = await db.list_aliases(chat_id, primary_id=primary.id)
+    except Exception:
+        LOGGER.debug(
+            "render_primary_alias_list: list_aliases failed", exc_info=True
+        )
+        return None
+    active = await db.get_active_alias(chat_id)
+    active_alias_id = active.id if active and active.primary_id == primary.id else None
+    return await bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"📧 Alias di <b>{html.escape(primary.email)}</b> "
+            f"({len(aliases)} alias):"
+        ),
+        parse_mode=ParseMode.HTML,
+        reply_markup=_build_alias_keyboard_for_primary(
+            primary, aliases, active_alias_id
+        ),
+    )
 
 
 async def _show_primary_list(
@@ -841,6 +881,36 @@ async def cmd_connect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     return CONNECT_EMAIL
 
 
+async def connect_again_quick_entry(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Callback entry point for the post-disconnect "🔌 Connect lagi"
+    button. Acks the click, removes the keyboard from the disconnect
+    confirmation message so it can't be re-fired, then delegates to
+    :func:`cmd_connect` so step 1/2 lands in the chat exactly the same
+    way as if the user had typed ``/connect``.
+
+    The flag ``context.args = []`` is set explicitly so cmd_connect's
+    "one-shot ``/connect <email>``" branch doesn't trip on a stale
+    args list left by an earlier command.
+    """
+    query = update.callback_query
+    if query is not None:
+        try:
+            await query.answer("🔌 Mulai connect baru…", show_alert=False)
+        except Exception:
+            LOGGER.debug("query.answer failed for CB_CONNECT_AGAIN", exc_info=True)
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            LOGGER.debug(
+                "edit_message_reply_markup failed for CB_CONNECT_AGAIN",
+                exc_info=True,
+            )
+    context.args = []
+    return await cmd_connect(update, context)
+
+
 async def connect_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = (update.effective_message.text or "").strip()  # type: ignore[union-attr]
     if "@" not in text:
@@ -854,6 +924,29 @@ async def connect_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         parse_mode=ParseMode.HTML,
     )
     return CONNECT_PASSWORD
+
+
+def _build_post_disconnect_keyboard() -> InlineKeyboardMarkup:
+    """Single-button keyboard rendered after a successful disconnect.
+
+    The user almost always disconnects an account because they want to
+    swap to a different one — putting the "🔌 Connect lagi" button
+    right below the confirmation message saves a typed ``/connect``
+    command. The callback ``CB_CONNECT_AGAIN`` is wired into the
+    ``connect_conv`` ConversationHandler's ``entry_points`` (alongside
+    the regular ``CommandHandler("connect", …)``) so pressing it lands
+    the user straight in step 1/2 of the flow.
+    """
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "🔌 Connect lagi",
+                    callback_data=CB_CONNECT_AGAIN,
+                )
+            ]
+        ]
+    )
 
 
 def _build_post_connect_keyboard(primary_id: int) -> InlineKeyboardMarkup:
@@ -1993,31 +2086,51 @@ def _launch_health_check_task(
     async def _run_then_offer_topup() -> None:
         """Run /cekimap and, when it finishes, offer to top the
         primary up to the soft alias target if it's still under.
+
+        All transient health-check messages (started header, rolling
+        progress, final summary) are tracked via
+        :class:`TaskMessageTracker` and auto-deleted after a short
+        delay. After cleanup we re-render the per-primary alias list
+        so the chat lands back at the canonical /list view.
+
+        The topup-offer CTA is intentionally **not** tracked: it
+        persists below the new /list as a call-to-action button.
         """
+        tracker = TaskMessageTracker(bot, chat_id)
         try:
-            await run_health_check(
-                bot=bot,
-                chat_id=chat_id,
-                db=db,
-                bridge_admin=bridge_admin,
-                primary=primary,
-                targets=targets,
-            )
-        finally:
             try:
-                aliases = await db.list_aliases(
-                    chat_id, primary_id=primary.id
-                )
-                await _maybe_offer_alias_topup(
-                    bot,
+                await run_health_check(
+                    bot=bot,
                     chat_id=chat_id,
+                    db=db,
+                    bridge_admin=bridge_admin,
                     primary=primary,
-                    current_count=len(aliases),
+                    targets=targets,
+                    tracker=tracker,
                 )
-            except Exception:
-                LOGGER.debug(
-                    "post-cekimap topup offer failed", exc_info=True
+            finally:
+                # Topup offer runs even on failure: the user might
+                # still want to add aliases despite a flaky run.
+                try:
+                    aliases = await db.list_aliases(
+                        chat_id, primary_id=primary.id
+                    )
+                    await _maybe_offer_alias_topup(
+                        bot,
+                        chat_id=chat_id,
+                        primary=primary,
+                        current_count=len(aliases),
+                    )
+                except Exception:
+                    LOGGER.debug(
+                        "post-cekimap topup offer failed", exc_info=True
+                    )
+        finally:
+            await tracker.cleanup(
+                after=lambda: _render_primary_alias_list(
+                    bot, db, chat_id, primary
                 )
+            )
 
     task = asyncio.create_task(
         _run_then_offer_topup(),
@@ -2605,6 +2718,21 @@ async def cmd_genaddr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     domain = args[2] if len(args) >= 3 else GENADDR_DEFAULT_DOMAIN
     domain = domain.lstrip("@")
 
+    # Re-entrancy check FIRST — before any other side effect (DB lookup,
+    # disambiguation message). Stops the duplicate-message spam when the
+    # user double-clicks a quick-action button: the second click would
+    # previously print "Akun yang dipakai: …" + "Masih ada /genaddr"
+    # both. Now it dedup-guards on a per-chat flag and only emits the
+    # warning once per running task.
+    if context.chat_data.get("genaddr_running"):
+        if not context.chat_data.get("genaddr_warned_running"):
+            await update.effective_message.reply_text(  # type: ignore[union-attr]
+                "⚠️ Masih ada /genaddr lain yang berjalan di chat ini. "
+                "Tunggu selesai atau klik tombol Batalkan di pesan progressnya.",
+            )
+            context.chat_data["genaddr_warned_running"] = True
+        return
+
     db = _bot_db(context)
     # Cipher is fetched lazily inside the background task. Verify it's
     # configured here so the user gets an immediate error instead of one
@@ -2622,7 +2750,12 @@ async def cmd_genaddr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     # Persist the picked primary so subsequent commands keep using the same
     # account until the user explicitly switches via /setprotonpw or /list.
     await db.set_active_primary(chat.id, primary.id)
-    if len(primaries) > 1:
+    # Quick-action callbacks (CB_QUICK_GENADDR) explicitly pick the
+    # primary by id, so the disambiguation message just adds noise.
+    # ``genaddr_silent_pick`` is consumed (popped) here so any later
+    # typed ``/genaddr`` still shows the message in multi-primary chats.
+    silent_pick = bool(context.user_data.pop("genaddr_silent_pick", False))
+    if len(primaries) > 1 and not silent_pick:
         await update.effective_message.reply_text(  # type: ignore[union-attr]
             f"Akun yang dipakai: <b>{html.escape(primary.email)}</b> "
             f"({primary_pick_reason}). Ganti dengan /setprotonpw atau "
@@ -2630,16 +2763,14 @@ async def cmd_genaddr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             parse_mode=ParseMode.HTML,
         )
 
-    if context.chat_data.get("genaddr_running"):
-        await update.effective_message.reply_text(  # type: ignore[union-attr]
-            "⚠️ Masih ada /genaddr lain yang berjalan di chat ini. "
-            "Tunggu selesai atau klik tombol Batalkan di pesan progressnya.",
-        )
-        return
-
-    cancel_keyboard = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("❌ Batalkan", callback_data=CB_GENADDR_CANCEL)]]
-    )
+    # The cancel button must remain visible alongside the live status
+    # row that narrates the current phase ("🌐 Buka browser…",
+    # "🔓 Login Proton…", …). Pass it as ``extra_rows`` to the
+    # StatusReporter so every editMessageReplyMarkup tick keeps the
+    # button on screen.
+    cancel_button_row = [
+        InlineKeyboardButton("❌ Batalkan", callback_data=CB_GENADDR_CANCEL)
+    ]
     proxy_provider = context.application.bot_data.get("proxy_provider")
     proxy_note = " via proxy rotasi" if proxy_provider is not None else ""
     # Quick-action button (CB_QUICK_GENADDR) sets this flag in user_data
@@ -2662,10 +2793,12 @@ async def cmd_genaddr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         pattern = (
             f"<code>{html.escape(base)}NNN@{html.escape(domain)}</code>"
         )
-    # Background mode: send a single starting message, then return so the
-    # bot stays responsive. Progress comes in as separate messages every
-    # ``GENADDR_NOTIFY_EVERY`` successes, mirroring the /cekimap UX.
-    await update.effective_message.reply_text(  # type: ignore[union-attr]
+    # Background mode: send a single starting message that doubles as
+    # the live-status anchor (button row above ❌ Batalkan narrates the
+    # current phase, mirroring /cekimap). The background task edits
+    # this message's reply_markup via StatusReporter; the body stays
+    # as the contextual header (count, pattern, proxy note).
+    starter_message = await update.effective_message.reply_text(  # type: ignore[union-attr]
         f"🚀 Mulai generate <b>{count}</b> alamat di background untuk "
         f"<b>{html.escape(primary.email)}</b>{proxy_note}.\n"
         f"Pola: {pattern}\n"
@@ -2673,7 +2806,9 @@ async def cmd_genaddr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         f"perintah lain sambil generate jalan. Update tiap "
         f"<b>{GENADDR_NOTIFY_EVERY}</b> alamat sukses.",
         parse_mode=ParseMode.HTML,
-        reply_markup=cancel_keyboard,
+        reply_markup=build_status_keyboard(
+            "🚀 Mulai…", extra_rows=[cancel_button_row]
+        ),
     )
 
     cancel_event = asyncio.Event()
@@ -2697,6 +2832,8 @@ async def cmd_genaddr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         browser_handle=browser_handle,
         proxy_provider=proxy_provider,
         random_suffix=random_suffix,
+        starter_message=starter_message,
+        cancel_button_row=cancel_button_row,
     )
 
 
@@ -2712,6 +2849,8 @@ def _launch_genaddr_task(
     browser_handle: dict[str, object],
     proxy_provider,
     random_suffix: bool = False,
+    starter_message: Any = None,
+    cancel_button_row: list[InlineKeyboardButton] | None = None,
 ) -> None:
     """Spawn ``_run_genaddr_background`` as a tracked asyncio task.
 
@@ -2734,6 +2873,8 @@ def _launch_genaddr_task(
             browser_handle=browser_handle,
             proxy_provider=proxy_provider,
             random_suffix=random_suffix,
+            starter_message=starter_message,
+            cancel_button_row=cancel_button_row,
         ),
         name=f"genaddr-{primary.id}-{count}",
     )
@@ -2752,17 +2893,56 @@ async def _run_genaddr_background(
     browser_handle: dict[str, object],
     proxy_provider,
     random_suffix: bool = False,
+    starter_message: Any = None,
+    cancel_button_row: list[InlineKeyboardButton] | None = None,
 ) -> None:
     """Run the actual address-creation batch as a background task.
 
-    Posts a fresh Telegram message every ``GENADDR_NOTIFY_EVERY`` newly
-    created addresses (instead of editing one progress message in place)
-    so the user sees a steady stream of "🔄 5/20 selesai" / "🔄 10/20 …"
-    notifications while the bot remains free to handle other commands.
+    Three layers of feedback during the run:
+
+    * **Live status button** on the starter message — narrates the
+      current phase ("🌐 Buka browser…", "🪄 1/20 sukses", "🔁 Rotasi
+      proxy"). Edits :attr:`starter_message.message_id` via
+      ``editMessageReplyMarkup`` so the parent text isn't churned.
+      The ❌ Batalkan row stays pinned underneath it.
+    * **Periodic progress messages** every ``GENADDR_NOTIFY_EVERY``
+      successes with the last batch of newly-created emails so the
+      user can sanity-check.
+    * **Final summary** with optional "🩺 Cek hasil sekarang" CTA.
+
+    All transient messages are tracked via :class:`TaskMessageTracker`
+    and auto-deleted after a short delay, after which a fresh
+    per-primary ``/list`` keyboard is rendered. Cancellation runs
+    through the same path so the cancelled chat ends up just as clean.
     """
     bot = context.application.bot
     db = _bot_db(context)
     cipher = _bot_cipher(context)
+
+    tracker = TaskMessageTracker(bot, chat_id)
+    tracker.track(starter_message)
+
+    starter_msg_id = (
+        getattr(starter_message, "message_id", None)
+        if starter_message is not None
+        else None
+    )
+    extra_rows = [cancel_button_row] if cancel_button_row else None
+    status: StatusReporter | None = (
+        StatusReporter(
+            bot,
+            chat_id,
+            starter_msg_id,
+            extra_rows=extra_rows,
+            idle_label="✅ Selesai",
+        )
+        if starter_msg_id is not None
+        else None
+    )
+
+    async def _status(label: str, *, force: bool = False) -> None:
+        if status is not None:
+            await status.update(label, force=force)
 
     successes: list[str] = []
     failures: list[tuple[str, str]] = []
@@ -2774,6 +2954,22 @@ async def _run_genaddr_background(
             successes.append(result.email)
         else:
             failures.append((result.email, result.status.value))
+
+        # Live status: narrate every attempt so the user always sees
+        # the bot working. The 1.5s throttle inside StatusReporter
+        # absorbs bursts without rate-limiting Telegram.
+        if result.status is CreationStatus.SUCCESS:
+            label = (
+                f"🪄 {success_count}/{target} sukses · "
+                f"{result.email}"
+            )
+        else:
+            label = (
+                f"⚠️ {len(failures)} gagal/duplikat · "
+                f"{result.email}"
+            )
+        await _status(label)
+
         # Only post a new message when we cross a multiple of NOTIFY_EVERY
         # (or on the very last success), so the chat doesn't get spammed
         # for every single address.
@@ -2792,23 +2988,28 @@ async def _run_genaddr_background(
         ]
         recent_html = ", ".join(html.escape(e) for e in recent_window)
         try:
-            await bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    f"🔄 <b>{success_count}/{target}</b> alamat sukses di "
-                    f"<b>{html.escape(primary.email)}</b>\n"
-                    f"⚠️ Gagal/duplikat sejauh ini: <b>{len(failures)}</b>\n"
-                    f"Terbaru: <code>{recent_html}</code>"
-                ),
-                parse_mode=ParseMode.HTML,
+            tracker.track(
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"🔄 <b>{success_count}/{target}</b> alamat sukses di "
+                        f"<b>{html.escape(primary.email)}</b>\n"
+                        f"⚠️ Gagal/duplikat sejauh ini: <b>{len(failures)}</b>\n"
+                        f"Terbaru: <code>{recent_html}</code>"
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
             )
         except Exception:
             # Losing a progress update is fine — the final summary is
             # what matters.
             LOGGER.debug("genaddr background progress send failed", exc_info=True)
 
+    summary = None
+    final_status_label = "✅ Selesai"
     try:
         try:
+            await _status("🌐 Buka browser proxy & login Proton…", force=True)
             summary = await address_generator.run_batch(
                 db=db,
                 cipher=cipher,
@@ -2825,33 +3026,56 @@ async def _run_genaddr_background(
                 random_suffix=random_suffix,
             )
         except address_generator.AddressGenerationError as exc:
-            await bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    f"❌ /genaddr untuk <b>{html.escape(primary.email)}</b> "
-                    f"tidak bisa mulai: {html.escape(str(exc))}\n\n"
-                    "Kalau belum, set password Proton dengan /setprotonpw."
-                ),
-                parse_mode=ParseMode.HTML,
+            final_status_label = "❌ Tidak bisa mulai"
+            tracker.track(
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"❌ /genaddr untuk <b>{html.escape(primary.email)}</b> "
+                        f"tidak bisa mulai: {html.escape(str(exc))}\n\n"
+                        "Kalau belum, set password Proton dengan /setprotonpw."
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
             )
-            return
         except Exception as exc:
             LOGGER.exception("genaddr background crashed")
-            await bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    f"❌ /genaddr untuk <b>{html.escape(primary.email)}</b>: "
-                    f"browser otomasi crash.\n"
-                    f"Detail: <code>"
-                    f"{html.escape(str(exc) or type(exc).__name__)}</code>\n\n"
-                    "Screenshot + HTML halaman terakhir disimpan di "
-                    "<code>/tmp/proton-browser-debug/</code> dalam container.\n"
-                    "Ambil dengan: <code>docker compose cp "
-                    "bot:/tmp/proton-browser-debug ./debug</code>"
-                ),
-                parse_mode=ParseMode.HTML,
+            final_status_label = "❌ Browser crash"
+            tracker.track(
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"❌ /genaddr untuk <b>{html.escape(primary.email)}</b>: "
+                        f"browser otomasi crash.\n"
+                        f"Detail: <code>"
+                        f"{html.escape(str(exc) or type(exc).__name__)}</code>\n\n"
+                        "Screenshot + HTML halaman terakhir disimpan di "
+                        "<code>/tmp/proton-browser-debug/</code> dalam container.\n"
+                        "Ambil dengan: <code>docker compose cp "
+                        "bot:/tmp/proton-browser-debug ./debug</code>"
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
             )
-            return
+
+        if summary is not None:
+            if cancel_event.is_set():
+                final_status_label = (
+                    f"❌ Dibatalkan ({len(summary.created)} sudah jadi)"
+                )
+            elif summary.captcha_interrupted_at:
+                final_status_label = "⚠️ CAPTCHA — selesai sebagian"
+            else:
+                final_status_label = (
+                    f"✅ Selesai · {len(summary.created)}/{count} sukses"
+                )
+            await _post_genaddr_summary(
+                bot=bot,
+                chat_id=chat_id,
+                primary=primary,
+                summary=summary,
+                tracker=tracker,
+            )
     finally:
         chat_data = context.application.chat_data.get(chat_id)
         if chat_data is not None:
@@ -2859,7 +3083,38 @@ async def _run_genaddr_background(
             chat_data.pop("genaddr_cancel_event", None)
             chat_data.pop("genaddr_browser_handle", None)
             chat_data.pop("genaddr_force_close_task", None)
+            # Reset the dedup flag so the next /genaddr's re-entrancy
+            # warning (if any) prints again as a first-time event.
+            chat_data.pop("genaddr_warned_running", None)
+        if status is not None:
+            try:
+                await status.done(final_status_label)
+            except Exception:
+                LOGGER.debug(
+                    "genaddr: status.done failed", exc_info=True
+                )
+        await tracker.cleanup(
+            after=lambda: _render_primary_alias_list(
+                bot, db, chat_id, primary
+            )
+        )
 
+
+async def _post_genaddr_summary(
+    *,
+    bot: Any,
+    chat_id: int,
+    primary: PrimaryAccount,
+    summary: Any,
+    tracker: TaskMessageTracker,
+) -> None:
+    """Send the final ``/genaddr selesai`` summary message.
+
+    Split out from :func:`_run_genaddr_background` so the (long)
+    summary-formatting block doesn't clutter the orchestration. The
+    summary is tracked too — it disappears after the cleanup delay so
+    the chat returns to a clean ``/list`` view.
+    """
     final_lines = [
         f"✨ <b>/genaddr selesai</b> di <b>{html.escape(primary.email)}</b>.",
         f"Sukses: <b>{len(summary.created)}</b>, "
@@ -2903,11 +3158,13 @@ async def _run_genaddr_background(
             ]
         )
     try:
-        await bot.send_message(
-            chat_id=chat_id,
-            text="\n".join(final_lines),
-            parse_mode=ParseMode.HTML,
-            reply_markup=reply_markup,
+        tracker.track(
+            await bot.send_message(
+                chat_id=chat_id,
+                text="\n".join(final_lines),
+                parse_mode=ParseMode.HTML,
+                reply_markup=reply_markup,
+            )
         )
     except Exception:
         LOGGER.exception("genaddr final summary send failed")
@@ -3061,7 +3318,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             )
             if suffix:
                 text = f"{text}\n\n{suffix}"
-            await query.edit_message_text(text, parse_mode=ParseMode.HTML)
+            await query.edit_message_text(
+                text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=_build_post_disconnect_keyboard(),
+            )
         except Exception:
             pass
         return
@@ -3125,6 +3386,24 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         # ``qgenaddr:<primary_id>:<count>``. Bridge to /genaddr by
         # synthesising the right context.args + delegating to the real
         # handler so we keep a single code path for the actual generation.
+        #
+        # Strip the inline keyboard from the source message before
+        # delegating: rapid double-clicks used to spam "Akun yang
+        # dipakai…" + "Masih ada /genaddr…" because every click
+        # re-entered cmd_genaddr. Removing the keyboard makes a second
+        # click impossible — Telegram still delivers "callback already
+        # processed" toasts but no new message is emitted.
+        try:
+            await query.answer("⏳ Mulai generate…", show_alert=False)
+        except Exception:
+            LOGGER.debug("query.answer failed for CB_QUICK_GENADDR", exc_info=True)
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            LOGGER.debug(
+                "edit_message_reply_markup failed for CB_QUICK_GENADDR",
+                exc_info=True,
+            )
         parts = data.split(":")
         if len(parts) != 3:
             await query.answer("Tombol tidak valid.", show_alert=True)
@@ -3162,7 +3441,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         # use random 2-digit numeric suffixes (vielz88311, vielz88347, …)
         # instead of the legacy sequential vielz001..vielzNNN cursor —
         # per the user's "yang 11 randomized" request.
+        # ``genaddr_silent_pick`` suppresses the "Akun yang dipakai: …"
+        # disambiguation message: this callback already specified the
+        # primary by id, so the message would just be noise.
         context.user_data["genaddr_random_suffix"] = True
+        context.user_data["genaddr_silent_pick"] = True
         context.args = [base, str(count)]
         await cmd_genaddr(update, context)
         return
@@ -3334,7 +3617,14 @@ def build_handlers() -> list:
     # restart the flow from scratch instead of falling through to the
     # global "unknown command" handler. Same for /sync.
     connect_conv = ConversationHandler(
-        entry_points=[CommandHandler("connect", cmd_connect)],
+        entry_points=[
+            CommandHandler("connect", cmd_connect),
+            # Post-disconnect "🔌 Connect lagi" shortcut. Lands in the
+            # same step-1/2 prompt as the typed command.
+            CallbackQueryHandler(
+                connect_again_quick_entry, pattern=rf"^{CB_CONNECT_AGAIN}$"
+            ),
+        ],
         states={
             CONNECT_EMAIL: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, connect_email),

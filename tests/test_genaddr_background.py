@@ -34,6 +34,13 @@ def _make_primary(email: str = "vielz883@proton.me") -> PrimaryAccount:
     )
 
 
+class _FakeMessage:
+    """Minimal stand-in for ``telegram.Message`` (only ``message_id``)."""
+
+    def __init__(self, message_id: int) -> None:
+        self.message_id = message_id
+
+
 class _FakeBot:
     def __init__(self) -> None:
         self.messages: list[str] = []
@@ -41,10 +48,30 @@ class _FakeBot:
         # ``reply_markup`` attached to the final-summary message without
         # disrupting the existing text-only assertions.
         self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.deleted_message_ids: list[int] = []
+        self.markup_edits: list[tuple[int, int, Any]] = []
+        self._next_id = 1000
 
-    async def send_message(self, *, chat_id: int, text: str, **kw: Any) -> None:
+    def _next_message_id(self) -> int:
+        self._next_id += 1
+        return self._next_id
+
+    async def send_message(
+        self, *, chat_id: int, text: str, **kw: Any
+    ) -> _FakeMessage:
         self.messages.append(text)
         self.calls.append((text, kw))
+        return _FakeMessage(self._next_message_id())
+
+    async def delete_message(
+        self, *, chat_id: int, message_id: int
+    ) -> None:
+        self.deleted_message_ids.append(message_id)
+
+    async def edit_message_reply_markup(
+        self, *, chat_id: int, message_id: int, reply_markup: Any = None
+    ) -> None:
+        self.markup_edits.append((chat_id, message_id, reply_markup))
 
 
 class _FakeApp:
@@ -377,6 +404,115 @@ async def test_final_summary_omits_cekimap_button_when_zero_aliases_created() ->
     assert summary_kw.get("reply_markup") is None
 
 
+# ----------------------- TaskMessageTracker integration --------------------
+
+
+async def test_background_genaddr_deletes_transient_messages_on_completion() -> None:
+    """Every transient progress message (starter + per-5 progress +
+    final summary) must be tracked and deleted after the task ends so
+    the chat returns to the canonical /list view.
+
+    Locks the user-approved "auto bersih setelah selesai" UX.
+    """
+    context = _FakeContext()
+    primary = _make_primary()
+    starter = _FakeMessage(message_id=999)
+
+    async def _fake_run_batch(**kw: Any) -> BatchSummary:
+        progress = kw["progress"]
+        results = []
+        for i in range(1, 11):
+            r = _success(f"vielz{i:03d}")
+            results.append(r)
+            await progress(i, 10, r)
+        return BatchSummary(
+            primary=primary,
+            base="vielz",
+            requested=10,
+            domain="proton.me",
+            results=results,
+        )
+
+    with patch.object(bot_mod.address_generator, "run_batch", _fake_run_batch):
+        await bot_mod._run_genaddr_background(
+            context,  # type: ignore[arg-type]
+            chat_id=99,
+            primary=primary,
+            base="vielz",
+            count=10,
+            domain="proton.me",
+            cancel_event=__import__("asyncio").Event(),
+            browser_handle={},
+            proxy_provider=None,
+            starter_message=starter,
+            cancel_button_row=None,
+        )
+
+    bot = context.application.bot
+    # During the run we emit: starter (passed in) + 2 progress (at 5/10
+    # successes) + 1 final summary = 4 transient messages. After the
+    # task ends the tracker must delete each of them.
+    assert len(bot.deleted_message_ids) >= 4, (
+        f"expected >=4 deletes (starter + 2 progress + summary), "
+        f"got {len(bot.deleted_message_ids)}: {bot.deleted_message_ids}"
+    )
+    # The starter id we provided manually must be among the deleted.
+    assert 999 in bot.deleted_message_ids
+
+
+async def test_background_genaddr_status_reporter_edits_starter_message() -> None:
+    """The live-status row replaces the starter's reply_markup via
+    ``editMessageReplyMarkup``. Each progress callback should trigger
+    at least one edit (subject to the StatusReporter throttle, which
+    we bypass with ``force=True`` on the initial label).
+    """
+    context = _FakeContext()
+    primary = _make_primary()
+    starter = _FakeMessage(message_id=777)
+
+    async def _fake_run_batch(**kw: Any) -> BatchSummary:
+        progress = kw["progress"]
+        results = []
+        for i in range(1, 4):
+            r = _success(f"vielz{i:03d}")
+            results.append(r)
+            await progress(i, 3, r)
+        return BatchSummary(
+            primary=primary,
+            base="vielz",
+            requested=3,
+            domain="proton.me",
+            results=results,
+        )
+
+    with patch.object(bot_mod.address_generator, "run_batch", _fake_run_batch):
+        await bot_mod._run_genaddr_background(
+            context,  # type: ignore[arg-type]
+            chat_id=99,
+            primary=primary,
+            base="vielz",
+            count=3,
+            domain="proton.me",
+            cancel_event=__import__("asyncio").Event(),
+            browser_handle={},
+            proxy_provider=None,
+            starter_message=starter,
+            cancel_button_row=None,
+        )
+
+    bot = context.application.bot
+    # The very first status update + the final ``status.done`` are both
+    # ``force``'d, so we should see at least 2 edit_message_reply_markup
+    # calls — one for "🌐 Buka browser proxy…" and one for the final
+    # "✅ Selesai · …" label.
+    assert len(bot.markup_edits) >= 2, (
+        f"expected at least 2 markup edits (initial + done), got "
+        f"{len(bot.markup_edits)}"
+    )
+    # All edits target the starter message id we passed in.
+    assert all(mid == 777 for _chat, mid, _markup in bot.markup_edits)
+
+
 # --------------------------- _maybe_offer_alias_topup -----------------------
 
 @pytest.mark.asyncio
@@ -430,3 +566,119 @@ async def test_topup_offer_skips_when_at_or_above_target() -> None:
         target=21,
     )
     assert bot.calls == []
+
+
+# ---------------------------------------------------------------------------
+# /genaddr re-entrancy + dedup (PR-A bug fix)
+# ---------------------------------------------------------------------------
+
+
+class _FakeChat:
+    def __init__(self, chat_id: int = 99) -> None:
+        self.id = chat_id
+
+
+class _FakeUser:
+    def __init__(self, user_id: int = 1) -> None:
+        self.id = user_id
+
+
+class _RecordingMessage:
+    """``update.effective_message`` stub that records every reply text."""
+
+    def __init__(self) -> None:
+        self.replies: list[str] = []
+
+    async def reply_text(self, text: str, **_kw: Any) -> None:
+        self.replies.append(text)
+
+
+class _FakeUpdate:
+    def __init__(self) -> None:
+        self.effective_chat = _FakeChat()
+        self.effective_user = _FakeUser()
+        self.effective_message = _RecordingMessage()
+        self.callback_query = None
+
+
+class _FakeSettings:
+    """Settings with an empty allowlist so ``_gate`` lets everyone through."""
+
+    def __init__(self) -> None:
+        self.allowed_user_ids: set[int] = set()
+
+
+class _ReEntrantContext:
+    def __init__(self) -> None:
+        self.application = _FakeApp()
+        self.application.bot_data["db"] = object()
+        self.application.bot_data["cipher"] = object()
+        self.application.bot_data["settings"] = _FakeSettings()
+        self.chat_data: dict[str, Any] = self.application.chat_data[99]
+        self.user_data: dict[str, Any] = {}
+        self.args: list[str] = ["vielz", "10"]
+
+
+@pytest.mark.asyncio
+async def test_cmd_genaddr_re_entrancy_warns_only_once() -> None:
+    """Repeated calls while ``genaddr_running`` is set must emit the
+    warning **exactly once** — not once per click. This is the bug
+    the user reported as "Masih ada /genaddr lain yang berjalan"
+    spamming the chat 5x in a row.
+    """
+    update = _FakeUpdate()
+    context = _ReEntrantContext()
+    # Simulate "task already running": cmd_genaddr should bail at the
+    # re-entrancy check before doing any DB lookups, so the user-data
+    # silent-pick/random-suffix flags never get touched.
+    context.chat_data["genaddr_running"] = True
+
+    for _ in range(5):
+        await bot_mod.cmd_genaddr(
+            update,  # type: ignore[arg-type]
+            context,  # type: ignore[arg-type]
+        )
+
+    warnings = [
+        m for m in update.effective_message.replies if "Masih ada /genaddr" in m
+    ]
+    assert len(warnings) == 1, (
+        f"expected exactly one re-entrancy warning, got {len(warnings)}: "
+        f"{update.effective_message.replies}"
+    )
+    # The earlier "Akun yang dipakai: …" disambiguation message must
+    # NOT have been sent — the early bail-out should beat the picker.
+    assert not any("Akun yang dipakai" in m for m in update.effective_message.replies)
+
+
+@pytest.mark.asyncio
+async def test_cmd_genaddr_warning_resets_after_task_finishes() -> None:
+    """Once the background task clears its chat_data flags, a fresh
+    /genaddr issued *while* still running again must warn again
+    (otherwise the second user attempt would be silently swallowed).
+    """
+    update = _FakeUpdate()
+    context = _ReEntrantContext()
+
+    context.chat_data["genaddr_running"] = True
+    await bot_mod.cmd_genaddr(
+        update,  # type: ignore[arg-type]
+        context,  # type: ignore[arg-type]
+    )
+    assert context.chat_data.get("genaddr_warned_running") is True
+
+    # Background task finishes -> the finally block in _run_genaddr_background
+    # pops both flags. Simulate that here.
+    context.chat_data.pop("genaddr_running", None)
+    context.chat_data.pop("genaddr_warned_running", None)
+    # Now flag again as if a new task started, then re-enter.
+    context.chat_data["genaddr_running"] = True
+    update.effective_message.replies.clear()
+    await bot_mod.cmd_genaddr(
+        update,  # type: ignore[arg-type]
+        context,  # type: ignore[arg-type]
+    )
+    warnings = [
+        m for m in update.effective_message.replies if "Masih ada /genaddr" in m
+    ]
+    assert len(warnings) == 1
