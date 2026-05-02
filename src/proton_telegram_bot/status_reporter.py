@@ -58,12 +58,24 @@ STATUS_UPDATE_INTERVAL_S = 1.5
 DEFAULT_IDLE_LABEL = "✅ Selesai"
 
 
-def build_status_keyboard(label: str) -> InlineKeyboardMarkup:
-    """Wrap ``label`` in a single-button inline keyboard."""
+def build_status_keyboard(
+    label: str,
+    *,
+    extra_rows: list[list[InlineKeyboardButton]] | None = None,
+) -> InlineKeyboardMarkup:
+    """Wrap ``label`` in an inline keyboard.
+
+    ``extra_rows`` are appended below the status row. This is how
+    ``/genaddr`` keeps its ❌ Batalkan button visible while the live
+    status row above it narrates the current phase.
+    """
     truncated = _truncate_label(label)
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton(text=truncated, callback_data=STATUS_BUTTON_CALLBACK)]]
-    )
+    rows: list[list[InlineKeyboardButton]] = [
+        [InlineKeyboardButton(text=truncated, callback_data=STATUS_BUTTON_CALLBACK)]
+    ]
+    if extra_rows:
+        rows.extend(extra_rows)
+    return InlineKeyboardMarkup(rows)
 
 
 def _truncate_label(label: str) -> str:
@@ -101,12 +113,18 @@ class StatusReporter:
         *,
         idle_label: str = DEFAULT_IDLE_LABEL,
         update_interval_s: float = STATUS_UPDATE_INTERVAL_S,
+        extra_rows: list[list[InlineKeyboardButton]] | None = None,
     ) -> None:
         self._bot = bot
         self._chat_id = chat_id
         self._message_id = message_id
         self._idle_label = idle_label
         self._update_interval_s = update_interval_s
+        # Persisted across edits so a "Batalkan" / similar control row
+        # stays visible alongside the rotating status label.
+        self._extra_rows: list[list[InlineKeyboardButton]] = (
+            [list(row) for row in extra_rows] if extra_rows else []
+        )
         self._last_label: str | None = None
         self._last_edit_at = 0.0
         self._lock = asyncio.Lock()
@@ -143,7 +161,9 @@ class StatusReporter:
                 await self._bot.edit_message_reply_markup(
                     chat_id=self._chat_id,
                     message_id=self._message_id,
-                    reply_markup=build_status_keyboard(truncated),
+                    reply_markup=build_status_keyboard(
+                        truncated, extra_rows=self._extra_rows or None
+                    ),
                 )
             except Exception as exc:
                 # The most common case is "message is not modified",

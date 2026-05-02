@@ -48,6 +48,7 @@ from .bridge_admin import BridgeAdmin
 from .db import Database
 from .models import PrimaryAccount
 from .status_reporter import StatusReporter, build_status_keyboard
+from .task_message_tracker import TaskMessageTracker
 
 LOGGER = logging.getLogger(__name__)
 
@@ -288,6 +289,7 @@ async def run_health_check(
     bridge_admin: BridgeAdmin | None,
     primary: PrimaryAccount,
     targets: list[str],
+    tracker: TaskMessageTracker | None = None,
 ) -> None:
     """Run a Mode-A health check for ``targets`` (alias emails) under
     ``primary``. Posts an initial "started" message, a rolling progress
@@ -307,32 +309,39 @@ async def run_health_check(
             seen.add(norm)
             deduped.append(norm)
     targets = deduped
+
+    def _track(msg):
+        """Pass through ``msg`` and remember its id for cleanup."""
+        if tracker is not None:
+            tracker.track(msg)
+        return msg
+
     if not targets:
-        await bot.send_message(
+        _track(await bot.send_message(
             chat_id=chat_id,
             text="⚠️ Tidak ada alias untuk dicek.",
-        )
+        ))
         return
 
     if bridge_admin is None:
-        await bot.send_message(
+        _track(await bot.send_message(
             chat_id=chat_id,
             text="❌ Bridge admin nonaktif — health check butuh akses Bridge "
             "vault untuk ambil kredensial SMTP.",
-        )
+        ))
         return
 
     try:
         creds = await bridge_admin.fetch_imap_credentials(primary.email)
     except Exception as exc:
         LOGGER.exception("health check: fetch_imap_credentials failed")
-        await bot.send_message(
+        _track(await bot.send_message(
             chat_id=chat_id,
             text=f"❌ Gagal ambil kredensial Bridge: {exc!s}",
-        )
+        ))
         return
     if creds is None:
-        await bot.send_message(
+        _track(await bot.send_message(
             chat_id=chat_id,
             text=(
                 f"❌ Bridge tidak punya kredensial untuk "
@@ -340,7 +349,7 @@ async def run_health_check(
                 f"ini dulu."
             ),
             parse_mode=ParseMode.HTML,
-        )
+        ))
         return
 
     # 1. Pre-flight IMAP login check. Do this *before* sending the
@@ -359,7 +368,7 @@ async def run_health_check(
         )
     except Exception as exc:
         LOGGER.exception("health check: pre-flight IMAP login failed")
-        await bot.send_message(
+        _track(await bot.send_message(
             chat_id=chat_id,
             text=(
                 f"❌ Login Bridge IMAP gagal untuk "
@@ -370,12 +379,12 @@ async def run_health_check(
                 f"(bot akan reuse cookie/SRP yang ada kalau masih valid)."
             ),
             parse_mode=ParseMode.HTML,
-        )
+        ))
         return
 
     # 2. "Started" header — kept above the rolling line so the user has
     # context that doesn't get overwritten.
-    await bot.send_message(
+    _track(await bot.send_message(
         chat_id=chat_id,
         text=(
             f"🩺 Health check <b>{primary.email}</b> dimulai.\n"
@@ -384,7 +393,7 @@ async def run_health_check(
             f"Bot tetap bisa dipakai sambil menunggu hasil."
         ),
         parse_mode=ParseMode.HTML,
-    )
+    ))
 
     # 3. Rolling progress message — edited in place from now on. Also
     # serves as the anchor for the live-activity status button: while
@@ -396,14 +405,14 @@ async def run_health_check(
     failed: set[str] = set()
     progress_lock = asyncio.Lock()
 
-    msg = await bot.send_message(
+    msg = _track(await bot.send_message(
         chat_id=chat_id,
         text=_format_progress(
             primary.email, len(targets), confirmed, failed, list(targets)
         ),
         parse_mode=ParseMode.HTML,
         reply_markup=build_status_keyboard("🚀 Mulai health check…"),
-    )
+    ))
     progress_msg_id = getattr(msg, "message_id", None) if msg is not None else None
     status: StatusReporter | None
     if progress_msg_id is not None:
@@ -509,14 +518,14 @@ async def run_health_check(
         if not expected:
             if status is not None:
                 await status.done("❌ Tidak ada email terkirim")
-            await bot.send_message(
+            _track(await bot.send_message(
                 chat_id=chat_id,
                 text=(
                     f"🩺 Health check selesai — <b>0/{len(targets)}</b> sync. "
                     f"Tidak ada email yang berhasil dikirim."
                 ),
                 parse_mode=ParseMode.HTML,
-            )
+            ))
             return
 
         # 5. Poll INBOX for tokens. One scan handles every alias at
@@ -592,11 +601,11 @@ async def run_health_check(
             f"Routing alias baru di Proton kadang butuh 5-10 menit untuk "
             f"propagate. Coba /cekimap lagi nanti."
         )
-    await bot.send_message(
+    _track(await bot.send_message(
         chat_id=chat_id,
         text=summary,
         parse_mode=ParseMode.HTML,
-    )
+    ))
 
     # Persist the result so /list can render ``ok/total`` next to the
     # primary's email without re-running the check. Best-effort —
