@@ -8,6 +8,7 @@ import logging
 import re
 import secrets
 import smtplib
+from collections.abc import Awaitable, Callable
 from email.message import EmailMessage
 from typing import Any, cast
 
@@ -1363,6 +1364,14 @@ def _build_post_connect_keyboard_with_aliases(
 
 
 SMTP_SMOKE_TIMEOUT_SECONDS = 60
+# When the first smoke-test attempt times out, /connect retries once
+# after a short settle window before rolling back the freshly-added
+# primary. Bridge is occasionally still warming up the SMTP listener
+# (or DNS to the temp-mail provider hasn't fully propagated) the
+# first time we hit it post add-account; a single retry catches the
+# common case without making the user re-run /connect from scratch.
+SMTP_SMOKE_RETRY_DELAY_SECONDS = 30
+SMTP_SMOKE_MAX_ATTEMPTS = 2
 BRIDGE_SMTP_PORT = 1025
 
 
@@ -1426,6 +1435,44 @@ async def _smoke_test_via_tempmail(
         return await tempmail.wait_for_subject(
             client, token, max_attempts=poll_attempts, poll_interval=2.0
         )
+
+
+async def _smoke_test_with_retry(
+    *,
+    email: str,
+    imap_username: str,
+    imap_password: str,
+    tempmail: TempMailbox,
+    on_retry: Callable[[int], Awaitable[None]] | None = None,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    max_attempts: int = SMTP_SMOKE_MAX_ATTEMPTS,
+    retry_delay: float = SMTP_SMOKE_RETRY_DELAY_SECONDS,
+) -> bool:
+    """Run :func:`_smoke_test_via_tempmail` with up to ``max_attempts`` tries.
+
+    Returns ``True`` on the first successful attempt, ``False`` after
+    every attempt has timed out / errored. Between attempts we sleep
+    ``retry_delay`` seconds and call ``on_retry(attempt_number)`` so
+    the caller can post a user-visible "tunggu Xs lalu coba lagi"
+    message — extracted from :func:`_finalize_connect` so the retry
+    behaviour is unit-testable in isolation.
+    """
+    for attempt in range(1, max_attempts + 1):
+        ok = await _smoke_test_via_tempmail(
+            email=email,
+            imap_username=imap_username,
+            imap_password=imap_password,
+            tempmail=tempmail,
+        )
+        if ok:
+            return True
+        if attempt == max_attempts:
+            return False
+        if on_retry is not None:
+            with contextlib.suppress(Exception):
+                await on_retry(attempt)
+        await sleep(retry_delay)
+    return False
 
 
 async def _finalize_connect(
@@ -1579,11 +1626,34 @@ async def _finalize_connect(
             f"(<code>{html.escape(smoke_test_tempmail.address)}</code>)...",
             parse_mode=ParseMode.HTML,
         )
-        smoke_ok = await _smoke_test_via_tempmail(
+        # On timeout, ``_smoke_test_with_retry`` waits
+        # ``SMTP_SMOKE_RETRY_DELAY_SECONDS`` and tries once more before
+        # giving up — Bridge occasionally warms up its outbound SMTP
+        # listener a few seconds after IMAP login starts working, and
+        # rolling the primary back on a one-off timeout is wasteful.
+        async def _on_retry(attempt: int) -> None:
+            LOGGER.info(
+                "smoke test attempt %d/%d failed for %s; retrying in %ds",
+                attempt,
+                SMTP_SMOKE_MAX_ATTEMPTS,
+                email,
+                SMTP_SMOKE_RETRY_DELAY_SECONDS,
+            )
+            await _send_connect_log(
+                update,
+                tracker,
+                "⚠️ Smoke test belum dapat email uji — Bridge mungkin "
+                f"masih warm-up. Tunggu {SMTP_SMOKE_RETRY_DELAY_SECONDS}s "
+                "lalu coba sekali lagi…",
+                parse_mode=ParseMode.HTML,
+            )
+
+        smoke_ok = await _smoke_test_with_retry(
             email=email,
             imap_username=imap_username,
             imap_password=imap_password,
             tempmail=smoke_test_tempmail,
+            on_retry=_on_retry,
         )
         if smoke_ok:
             await _send_connect_log(
@@ -1595,14 +1665,17 @@ async def _finalize_connect(
             )
         else:
             LOGGER.warning(
-                "smoke test failed for %s; rolling back primary %d",
+                "smoke test failed for %s after %d attempts; rolling back primary %d",
                 email,
+                SMTP_SMOKE_MAX_ATTEMPTS,
                 primary_id,
             )
             await update.effective_message.reply_text(  # type: ignore[union-attr]
                 "❌ <b>Smoke test gagal</b> — email uji tidak sampai ke "
-                "temp mail dalam 60 detik. Bridge mungkin belum benar-benar "
-                "siap atau IMAP/SMTP tidak jalan.\n\n"
+                f"temp mail dalam {SMTP_SMOKE_MAX_ATTEMPTS}x percobaan "
+                f"({SMTP_SMOKE_TIMEOUT_SECONDS}s + retry "
+                f"{SMTP_SMOKE_RETRY_DELAY_SECONDS}s). Bridge mungkin "
+                "belum benar-benar siap atau IMAP/SMTP tidak jalan.\n\n"
                 "Sesi ini di-rollback. Silakan <b>/connect</b> lagi.",
                 parse_mode=ParseMode.HTML,
             )
