@@ -19,6 +19,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ParseMode
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -41,6 +42,7 @@ from .bridge_admin import (
 from .config import Settings
 from .crypto import CredentialCipher
 from .db import Database
+from .email_parser import format_body_html
 from .health_check import run_health_check
 from .manager import ListenerManager, Notifier
 from .models import AliasRecord, AliasStatus, PrimaryAccount
@@ -139,6 +141,18 @@ GENADDR_PROGRESS_EVERY = 1
 # "laporan text per 5 alias sudah selesai", so the default is 5; users with
 # big batches still get a steady drip of updates without spamming the chat.
 GENADDR_NOTIFY_EVERY = 5
+# Minimum gap between successive ``editMessageText`` calls on the
+# /genaddr starter message. Telegram's bot rate limit is ~1 edit per
+# second per chat; 2s gives us comfortable headroom even when the
+# browser bursts through several addresses inside the same second.
+# Force-edits on milestones bypass this throttle so the user never
+# misses an "every 5 sukses" tick.
+GENADDR_BODY_EDIT_INTERVAL_S = 2.0
+# Cap how many of the most-recent successful aliases we list in the
+# rolling body update. Five is the sweet spot the user asked for in
+# their handoff: enough to verify progress at a glance, short enough to
+# stay on a single line in the Telegram client.
+GENADDR_BODY_RECENT_COUNT = 5
 
 # Limits applied at the bot layer (the alias generator has its own MAX_BATCH).
 GENADDR_DEFAULT_DOMAIN = "proton.me"
@@ -150,6 +164,11 @@ CB_RESET = "reset"
 CB_DELETE = "delete"
 CB_NOOP = "noop"
 CB_POLL_NOW = "poll_now"
+# Tap-to-copy convenience: posts a fresh single-line ``<code>email</code>``
+# message containing the user's currently locked alias so desktop users
+# can one-click copy without scrolling back through chat history. The
+# alias header itself is also wrapped in ``<code>`` for mobile tap-copy.
+CB_COPY_ACTIVE_EMAIL = "copyactive"
 # Two-level primary/alias UI:
 CB_PICK_PRIMARY = "pickp"
 CB_BACK_TO_PRIMARIES = "backp"
@@ -242,6 +261,8 @@ def _build_primary_keyboard(
     alias_counts: dict[int, int] | None = None,
     active_primary_id: int | None = None,
     healthcheck_stats: dict[int, tuple[int, int]] | None = None,
+    *,
+    with_copy_active_button: bool = False,
 ) -> InlineKeyboardMarkup:
     """Top-level keyboard listing every Proton account a user owns.
 
@@ -251,7 +272,10 @@ def _build_primary_keyboard(
     ``primary.id``) takes priority and renders as ``ok/total`` so the
     user can spot a primary whose aliases have started failing.
     ``active_primary_id`` flags the primary whose alias is currently
-    locked (purely visual).
+    locked (purely visual). ``with_copy_active_button`` adds a "📋 Copy
+    email aktif" row when an alias is locked, so desktop users have a
+    one-click way to grab the address without selecting text out of the
+    rendered HTML message.
     """
     rows: list[list[InlineKeyboardButton]] = []
     if not primaries:
@@ -288,6 +312,14 @@ def _build_primary_keyboard(
                     ),
                 ]
             )
+    if with_copy_active_button:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "📋 Copy email aktif", callback_data=CB_COPY_ACTIVE_EMAIL
+                )
+            ]
+        )
     rows.append(
         [
             InlineKeyboardButton(
@@ -347,11 +379,28 @@ def _build_alias_keyboard_for_primary(
     return InlineKeyboardMarkup(rows)
 
 
-def _build_poll_now_keyboard() -> InlineKeyboardMarkup:
-    """Standalone 'check email now' button used in the lock-confirmation message."""
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("📥 Cek email sekarang", callback_data=CB_POLL_NOW)]]
+def _build_poll_now_keyboard(
+    *, with_copy_active: bool = False
+) -> InlineKeyboardMarkup:
+    """Standalone 'check email now' button used in the lock-confirmation message.
+
+    When ``with_copy_active`` is ``True`` an extra "📋 Copy email aktif"
+    row is added so desktop users can post a single-line ``<code>email</code>``
+    message into the chat for one-click copy.
+    """
+    rows: list[list[InlineKeyboardButton]] = []
+    if with_copy_active:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "📋 Copy email aktif", callback_data=CB_COPY_ACTIVE_EMAIL
+                )
+            ]
+        )
+    rows.append(
+        [InlineKeyboardButton("📥 Cek email sekarang", callback_data=CB_POLL_NOW)]
     )
+    return InlineKeyboardMarkup(rows)
 
 
 async def _alias_count_per_primary(
@@ -443,8 +492,13 @@ async def _show_primary_list(
             "Kirim /connect untuk menambahkan akun Proton + Bridge."
         )
     if active is not None:
+        # Render the active alias inside ``<code>`` so Telegram mobile clients
+        # treat it as tap-to-copy — same UX as the per-message email forward
+        # header. The "📋 Copy email aktif" button below is the desktop
+        # equivalent (since desktop clients don't expose tap-to-copy on
+        # ``<code>`` blocks).
         header += (
-            f"\n🔒 Alias aktif: <b>{html.escape(active.email)}</b>"
+            f"\n🔒 Alias aktif: <code>{html.escape(active.email)}</code>"
             " — kirim /unlock untuk lepas."
         )
     await update.effective_message.reply_text(  # type: ignore[union-attr]
@@ -454,6 +508,7 @@ async def _show_primary_list(
             counts,
             active_primary_id,
             healthcheck_stats=healthcheck_stats,
+            with_copy_active_button=active is not None,
         ),
         parse_mode=ParseMode.HTML,
     )
@@ -2856,6 +2911,54 @@ async def setpw_password(
 # --------------------------------------------------------------- /genaddr
 
 
+def _render_genaddr_body(
+    *,
+    count: int,
+    primary_email: str,
+    proxy_note: str,
+    pattern: str,
+    success_count: int,
+    fail_count: int,
+    recent: list[str],
+) -> str:
+    """Render the rolling body text on the /genaddr starter message.
+
+    The user wanted the starter message itself to keep showing fresh
+    counts so they don't have to scroll through the chat to see how
+    many addresses have landed. Format mirrors the spec from the PR-C
+    handoff:
+
+        🚀 Generate <count> alamat di background — <primary>
+        📊 Sudah berhasil: <ok>/<count> sukses
+        ⚠️ Gagal/duplikat: <fail>
+        🪄 Terbaru: <recent_5>
+        Bot tetap responsif — kirim /list, /cekimap, atau perintah lain.
+
+    Lines are kept compact (max one blank line) so the message doesn't
+    push other chat content off the screen while it's still ticking.
+    """
+    recent_html = ", ".join(
+        html.escape(e) for e in recent[-GENADDR_BODY_RECENT_COUNT:]
+    )
+    if not recent_html:
+        recent_line = "🪄 Terbaru: <i>(belum ada)</i>"
+    else:
+        recent_line = f"🪄 Terbaru: <code>{recent_html}</code>"
+    pattern_line = f"Pola: {pattern}\n" if pattern else ""
+    return (
+        f"🚀 Generate <b>{count}</b> alamat di background — "
+        f"<b>{html.escape(primary_email)}</b>{proxy_note}\n"
+        f"{pattern_line}"
+        f"📊 Sudah berhasil: <b>{success_count}/{count}</b> sukses\n"
+        f"⚠️ Gagal/duplikat: <b>{fail_count}</b>\n"
+        f"{recent_line}\n"
+        f"\n"
+        f"Bot tetap responsif — kirim /list, /cekimap, atau perintah lain "
+        f"sambil generate jalan. Update tiap "
+        f"<b>{GENADDR_NOTIFY_EVERY}</b> alamat sukses."
+    )
+
+
 async def _pick_primary_for_genaddr(
     *,
     db: Database,
@@ -3030,17 +3133,25 @@ async def cmd_genaddr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             f"<code>{html.escape(base)}NNN@{html.escape(domain)}</code>"
         )
     # Background mode: send a single starting message that doubles as
-    # the live-status anchor (button row above ❌ Batalkan narrates the
-    # current phase, mirroring /cekimap). The background task edits
-    # this message's reply_markup via StatusReporter; the body stays
-    # as the contextual header (count, pattern, proxy note).
+    # the live-status anchor. Two layers of feedback ride on this
+    # message:
+    #   1. The status row (StatusReporter editMessageReplyMarkup) above
+    #      ❌ Batalkan narrates the current phase, mirroring /cekimap.
+    #   2. The message body (editMessageText, throttled to 2s) shows a
+    #      rolling "Sudah berhasil: N/T sukses · Gagal/duplikat: M ·
+    #      Terbaru: …" block so the user always has a fresh count
+    #      visible without scrolling the chat.
+    starter_text = _render_genaddr_body(
+        count=count,
+        primary_email=primary.email,
+        proxy_note=proxy_note,
+        pattern=pattern,
+        success_count=0,
+        fail_count=0,
+        recent=[],
+    )
     starter_message = await update.effective_message.reply_text(  # type: ignore[union-attr]
-        f"🚀 Mulai generate <b>{count}</b> alamat di background untuk "
-        f"<b>{html.escape(primary.email)}</b>{proxy_note}.\n"
-        f"Pola: {pattern}\n"
-        f"Bot tetap responsif — kamu bisa kirim /list, /cekimap, atau "
-        f"perintah lain sambil generate jalan. Update tiap "
-        f"<b>{GENADDR_NOTIFY_EVERY}</b> alamat sukses.",
+        starter_text,
         parse_mode=ParseMode.HTML,
         reply_markup=build_status_keyboard(
             "🚀 Mulai…", extra_rows=[cancel_button_row]
@@ -3070,6 +3181,8 @@ async def cmd_genaddr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         random_suffix=random_suffix,
         starter_message=starter_message,
         cancel_button_row=cancel_button_row,
+        proxy_note=proxy_note,
+        pattern=pattern,
     )
 
 
@@ -3087,6 +3200,8 @@ def _launch_genaddr_task(
     random_suffix: bool = False,
     starter_message: Any = None,
     cancel_button_row: list[InlineKeyboardButton] | None = None,
+    proxy_note: str = "",
+    pattern: str = "",
 ) -> None:
     """Spawn ``_run_genaddr_background`` as a tracked asyncio task.
 
@@ -3111,6 +3226,8 @@ def _launch_genaddr_task(
             random_suffix=random_suffix,
             starter_message=starter_message,
             cancel_button_row=cancel_button_row,
+            proxy_note=proxy_note,
+            pattern=pattern,
         ),
         name=f"genaddr-{primary.id}-{count}",
     )
@@ -3131,6 +3248,8 @@ async def _run_genaddr_background(
     random_suffix: bool = False,
     starter_message: Any = None,
     cancel_button_row: list[InlineKeyboardButton] | None = None,
+    proxy_note: str = "",
+    pattern: str = "",
 ) -> None:
     """Run the actual address-creation batch as a background task.
 
@@ -3183,6 +3302,44 @@ async def _run_genaddr_background(
     successes: list[str] = []
     failures: list[tuple[str, str]] = []
     last_notified_count = 0
+    # Throttle live body edits so we never blow past Telegram's
+    # ~1 edit/second-per-chat limit on editMessageText, even when the
+    # browser is bursting through addresses fast. Force-edit on each
+    # GENADDR_NOTIFY_EVERY milestone so the user always sees a fresh
+    # count at those points (which is also when a new progress message
+    # was previously posted).
+    last_body_edit_at = 0.0
+
+    async def _edit_body(*, force: bool = False) -> None:
+        nonlocal last_body_edit_at
+        if starter_msg_id is None:
+            return
+        now = asyncio.get_event_loop().time()
+        if not force and now - last_body_edit_at < GENADDR_BODY_EDIT_INTERVAL_S:
+            return
+        text = _render_genaddr_body(
+            count=count,
+            primary_email=primary.email,
+            proxy_note=proxy_note,
+            pattern=pattern,
+            success_count=len(successes),
+            fail_count=len(failures),
+            recent=successes,
+        )
+        # ``editMessageText`` raises ``BadRequest("message is not modified")``
+        # when the rendered text is byte-identical to the previous edit
+        # (e.g. two consecutive failures without any new success).
+        # Suppressing it keeps the task running without polluting the log
+        # — losing one body refresh is fine, the next progress event will
+        # re-render anyway.
+        with contextlib.suppress(BadRequest):
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=starter_msg_id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+            )
+        last_body_edit_at = now
 
     async def _on_progress(success_count: int, target: int, result) -> None:
         nonlocal last_notified_count
@@ -3205,6 +3362,19 @@ async def _run_genaddr_background(
                 f"{result.email}"
             )
         await _status(label)
+
+        # Body live update — runs on every progress callback but is
+        # internally throttled to the 2-second interval. We force-edit
+        # on milestones (multiples of GENADDR_NOTIFY_EVERY) and on the
+        # final success so the user always sees the milestone counts.
+        force_body = (
+            success_count > 0
+            and (
+                success_count % GENADDR_NOTIFY_EVERY == 0
+                or success_count == target
+            )
+        )
+        await _edit_body(force=force_body)
 
         # Only post a new message when we cross a multiple of NOTIFY_EVERY
         # (or on the very last success), so the chat doesn't get spammed
@@ -3596,7 +3766,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 except Exception:
                     pass
         await query.message.reply_text(  # type: ignore[union-attr]
-            f"🔒 Aktif: <b>{html.escape(alias.email)}</b>\n"
+            # Wrap the alias in ``<code>`` so Telegram mobile users can
+            # tap-to-copy directly from the lock-confirmation header. Desktop
+            # users get the "📋 Copy email aktif" button below for one-click
+            # copy without text selection.
+            f"🔒 Aktif: <code>{html.escape(alias.email)}</code>\n"
             "Bot sekarang <b>terkunci</b> ke alias ini — hanya email yang "
             "dikirim ke alamat di atas yang akan diteruskan ke chat ini. "
             "Alias tetap di /list dan terus terima email sampai kamu pilih "
@@ -3604,7 +3778,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             "Klik tombol di bawah kalau email kamu belum sampai dan kamu "
             "ingin cek manual (tanpa nunggu polling 5 detik).",
             parse_mode=ParseMode.HTML,
-            reply_markup=_build_poll_now_keyboard(),
+            reply_markup=_build_poll_now_keyboard(with_copy_active=True),
         )
         return
     if data == CB_POLL_NOW:
@@ -3616,6 +3790,29 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await query.answer(
                 "Listener belum jalan — kirim /connect dulu.", show_alert=True
             )
+        return
+    if data == CB_COPY_ACTIVE_EMAIL:
+        # Emit a fresh single-line ``<code>email</code>`` message so desktop
+        # Telegram users can one-click copy without selecting text out of a
+        # rendered HTML message. Mobile users already have tap-to-copy on
+        # the ``<code>`` block embedded in the alias-aktif header, but a
+        # dedicated message keeps the address at the bottom of the chat
+        # where they don't have to scroll back to find it.
+        active = await db.get_active_alias(chat_id)
+        if active is None:
+            await context.application.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "ℹ️ Belum ada alias aktif. Kunci alias di /list dulu, "  # noqa: RUF001
+                    "lalu klik 📋 Copy email aktif."
+                ),
+            )
+            return
+        await context.application.bot.send_message(
+            chat_id=chat_id,
+            text=f"<code>{html.escape(active.email)}</code>",
+            parse_mode=ParseMode.HTML,
+        )
         return
     if data.startswith(f"{CB_QUICK_GENADDR}:"):
         # Quick-action button shown after /connect. Format:
@@ -3784,23 +3981,29 @@ _TRUNCATION_MARKER = "\n…(dipotong)"
 def _render_email_message(alias_email: str, summary: dict[str, str]) -> str:
     """Render the email-received Telegram message safely under the 4096-byte limit.
 
-    The body is truncated *before* HTML escaping/assembly so we never split an HTML
-    tag (e.g. ``<pre>``) or an entity (e.g. ``&amp;``) at the byte boundary, which
-    would cause Telegram's HTML parser to reject the message.
+    The body is rendered through :func:`email_parser.format_body_html`, which:
+      * collapses runs of blank lines down to at most one,
+      * wraps detected OTPs (4-8 digit standalone numbers) in
+        ``<code>...</code>`` so Telegram mobile users can tap-to-copy, and
+      * leaves bare URLs intact so Telegram auto-links them.
+
+    The body is truncated *before* the final ``<code>`` injection so we never
+    split an HTML entity (e.g. ``&amp;``) or a ``<code>`` tag at the byte
+    boundary, which would cause Telegram's HTML parser to reject the message.
     """
     body = summary.get("body") or "(tidak ada isi text)"
     header = (
         f"<b>Email masuk untuk</b> <code>{html.escape(alias_email)}</code>\n"
         f"<b>Dari:</b> {html.escape(summary.get('from', '?'))}\n"
         f"<b>Subjek:</b> {html.escape(summary.get('subject', ''))}\n"
-        f"<b>Tanggal:</b> {html.escape(summary.get('date', ''))}\n\n"
+        f"<b>Tanggal:</b> {html.escape(summary.get('date', ''))}\n"
     )
     footer = (
-        "\n\n🔒 Alias masih aktif — email berikutnya ke alamat ini akan "
+        "\n🔒 Alias masih aktif — email berikutnya ke alamat ini akan "
         "diteruskan juga. Kirim /unlock untuk lepas kunci, atau pilih "
         "alias lain di /list."
     )
-    overhead = len(header) + len("<pre></pre>") + len(footer)
+    overhead = len(header) + len(footer) + len("\n")  # newline before body
     available = _TELEGRAM_MESSAGE_LIMIT - overhead
     truncated = False
     if available <= 0:
@@ -3808,21 +4011,20 @@ def _render_email_message(alias_email: str, summary: dict[str, str]) -> str:
         body_rendered = ""
         truncated = True
     else:
-        escaped = html.escape(body)
-        if len(escaped) <= available:
-            body_rendered = escaped
+        rendered = format_body_html(body)
+        if len(rendered) <= available:
+            body_rendered = rendered
         else:
-            # Re-escape only the portion of the raw body that fits, leaving room
-            # for the truncation marker on its own line.
+            # Truncate the *raw* body, then re-render so we never split inside
+            # an HTML entity or a ``<code>`` tag we just injected.
             marker_budget = len(_TRUNCATION_MARKER)
             target = max(available - marker_budget, 0)
             shrunk = body
-            while shrunk and len(html.escape(shrunk)) > target:
-                # Drop characters from the end until the escaped form fits.
+            while shrunk and len(format_body_html(shrunk)) > target:
                 shrunk = shrunk[: max(len(shrunk) - 32, 0)]
-            body_rendered = html.escape(shrunk)
+            body_rendered = format_body_html(shrunk)
             truncated = True
-    text = f"{header}<pre>{body_rendered}</pre>"
+    text = f"{header}\n{body_rendered}"
     if truncated:
         text += _TRUNCATION_MARKER
     text += footer

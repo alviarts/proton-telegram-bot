@@ -50,6 +50,9 @@ class _FakeBot:
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.deleted_message_ids: list[int] = []
         self.markup_edits: list[tuple[int, int, Any]] = []
+        # Each entry: (chat_id, message_id, text, kwargs). Lets tests
+        # assert on the rolling body edits the /genaddr task drives.
+        self.text_edits: list[tuple[int, int, str, dict[str, Any]]] = []
         self._next_id = 1000
 
     def _next_message_id(self) -> int:
@@ -72,6 +75,11 @@ class _FakeBot:
         self, *, chat_id: int, message_id: int, reply_markup: Any = None
     ) -> None:
         self.markup_edits.append((chat_id, message_id, reply_markup))
+
+    async def edit_message_text(
+        self, *, chat_id: int, message_id: int, text: str, **kw: Any
+    ) -> None:
+        self.text_edits.append((chat_id, message_id, text, kw))
 
 
 class _FakeApp:
@@ -682,3 +690,171 @@ async def test_cmd_genaddr_warning_resets_after_task_finishes() -> None:
         m for m in update.effective_message.replies if "Masih ada /genaddr" in m
     ]
     assert len(warnings) == 1
+
+
+# --------------------------------------------------------------------------- #
+# PR-C #10: live body update on the /genaddr starter message.                 #
+# --------------------------------------------------------------------------- #
+
+
+def test_render_genaddr_body_includes_progress_counts() -> None:
+    """Body renderer surfaces success/fail counts and the latest 5 emails."""
+    text = bot_mod._render_genaddr_body(
+        count=20,
+        primary_email="vielz883@proton.me",
+        proxy_note=" via proxy rotasi",
+        pattern="<code>vielzNNN@proton.me</code>",
+        success_count=7,
+        fail_count=2,
+        recent=[f"vielz{i:03d}" for i in range(1, 8)],
+    )
+    assert "<b>20</b>" in text  # target count
+    assert "vielz883@proton.me" in text
+    assert "via proxy rotasi" in text
+    assert "<b>7/20</b>" in text  # success/total
+    assert "<b>2</b>" in text  # fail count
+    # Only the LAST 5 emails should appear in the rolling "Terbaru" list.
+    assert "vielz003" in text and "vielz007" in text
+    assert "vielz001" not in text  # dropped from the 5-element window
+    assert "vielz002" not in text
+
+
+def test_render_genaddr_body_handles_no_progress_yet() -> None:
+    """Initial render (success=0) shows an empty placeholder for Terbaru."""
+    text = bot_mod._render_genaddr_body(
+        count=10,
+        primary_email="vielz@proton.me",
+        proxy_note="",
+        pattern="<code>vielzNNN@proton.me</code>",
+        success_count=0,
+        fail_count=0,
+        recent=[],
+    )
+    assert "Terbaru:" in text
+    assert "(belum ada)" in text
+
+
+def test_render_genaddr_body_caps_at_one_blank_line() -> None:
+    """Body must never have 3+ consecutive newlines — the user explicitly
+    asked for tight spacing on the live status message.
+    """
+    text = bot_mod._render_genaddr_body(
+        count=5,
+        primary_email="x@p.me",
+        proxy_note="",
+        pattern="<code>xN@p.me</code>",
+        success_count=2,
+        fail_count=0,
+        recent=["x01", "x02"],
+    )
+    assert "\n\n\n" not in text
+
+
+@pytest.mark.asyncio
+async def test_background_genaddr_edits_body_on_milestones() -> None:
+    """When a starter_message is provided, the rolling body must be
+    edited via ``edit_message_text`` at every NOTIFY_EVERY milestone
+    (and on the final tick).
+    """
+    context = _FakeContext()
+    primary = _make_primary()
+    starter = _FakeMessage(message_id=42)
+
+    async def _fake_run_batch(**kw: Any) -> BatchSummary:
+        progress = kw["progress"]
+        results = []
+        for i in range(1, 11):
+            r = _success(f"vielz{i:03d}")
+            results.append(r)
+            await progress(i, 10, r)
+        return BatchSummary(
+            primary=primary,
+            base="vielz",
+            requested=10,
+            domain="proton.me",
+            results=results,
+        )
+
+    with patch.object(bot_mod.address_generator, "run_batch", _fake_run_batch):
+        await bot_mod._run_genaddr_background(
+            context,  # type: ignore[arg-type]
+            chat_id=99,
+            primary=primary,
+            base="vielz",
+            count=10,
+            domain="proton.me",
+            cancel_event=__import__("asyncio").Event(),
+            browser_handle={},
+            proxy_provider=None,
+            starter_message=starter,
+            pattern="<code>vielzNNN@proton.me</code>",
+            proxy_note="",
+        )
+
+    edits = context.application.bot.text_edits
+    # Two milestone force-edits at success_count=5 and 10. The 2-second
+    # throttle suppresses other edits in this fast synthetic run.
+    assert len(edits) >= 2, f"expected ≥2 body edits, got {len(edits)}: {edits}"
+    # Each edit targets the starter message id.
+    for chat_id, message_id, _text, _kw in edits:
+        assert chat_id == 99
+        assert message_id == 42
+    # The final edit reflects the final 10/10 success count.
+    final_text = edits[-1][2]
+    assert "<b>10/10</b>" in final_text
+    # The "Terbaru" list shows the last 5 created aliases.
+    assert "vielz010" in final_text
+    assert "vielz006" in final_text
+
+
+@pytest.mark.asyncio
+async def test_background_genaddr_body_edit_suppresses_not_modified() -> None:
+    """If Telegram raises ``BadRequest("message is not modified")`` the
+    background task must keep going — losing a body refresh is fine.
+    """
+    from telegram.error import BadRequest
+
+    context = _FakeContext()
+    primary = _make_primary()
+    starter = _FakeMessage(message_id=42)
+
+    async def _raising_edit(**_kw: Any) -> None:
+        raise BadRequest("message is not modified")
+
+    context.application.bot.edit_message_text = _raising_edit  # type: ignore[assignment]
+
+    async def _fake_run_batch(**kw: Any) -> BatchSummary:
+        progress = kw["progress"]
+        results = []
+        for i in range(1, 6):
+            r = _success(f"vielz{i:03d}")
+            results.append(r)
+            await progress(i, 5, r)
+        return BatchSummary(
+            primary=primary,
+            base="vielz",
+            requested=5,
+            domain="proton.me",
+            results=results,
+        )
+
+    with patch.object(bot_mod.address_generator, "run_batch", _fake_run_batch):
+        # Must not raise — the suppress() inside _edit_body absorbs the error.
+        await bot_mod._run_genaddr_background(
+            context,  # type: ignore[arg-type]
+            chat_id=99,
+            primary=primary,
+            base="vielz",
+            count=5,
+            domain="proton.me",
+            cancel_event=__import__("asyncio").Event(),
+            browser_handle={},
+            proxy_provider=None,
+            starter_message=starter,
+            pattern="<code>x</code>",
+            proxy_note="",
+        )
+
+    # Sanity check: the synthetic batch still emitted the final summary.
+    msgs = context.application.bot.messages
+    assert any("/genaddr selesai" in m for m in msgs)

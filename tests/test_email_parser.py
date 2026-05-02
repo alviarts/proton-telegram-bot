@@ -4,8 +4,10 @@ from __future__ import annotations
 from email.message import EmailMessage
 
 from proton_telegram_bot.email_parser import (
+    collapse_blank_lines,
     extract_recipients,
     find_matching_alias,
+    format_body_html,
     html_to_text,
     parse_message,
     summarize,
@@ -118,6 +120,90 @@ def test_html_to_text_drops_script_and_style() -> None:
     assert "alert" not in text
     assert "color" not in text
     assert "Hai" in text
+
+
+def test_collapse_blank_lines_caps_at_one_blank_line() -> None:
+    """3+ consecutive blank lines collapse to exactly one blank line."""
+    src = "Halo\n\n\n\nDunia\n\n\n\n\nFoo"
+    out = collapse_blank_lines(src)
+    # One blank line == "\n\n" between paragraphs, never "\n\n\n+".
+    assert "\n\n\n" not in out
+    # All paragraphs survive.
+    assert "Halo" in out and "Dunia" in out and "Foo" in out
+
+
+def test_collapse_blank_lines_preserves_single_newlines() -> None:
+    src = "Baris 1\nBaris 2\n\nBaris 3"
+    assert collapse_blank_lines(src) == "Baris 1\nBaris 2\n\nBaris 3"
+
+
+def test_collapse_blank_lines_strips_trailing_whitespace() -> None:
+    src = "Halo   \n   \n\n  Dunia  "
+    out = collapse_blank_lines(src)
+    # No trailing spaces on lines, no leading/trailing whitespace overall.
+    for line in out.splitlines():
+        assert line == line.rstrip()
+    assert out.startswith("Halo")
+    assert out.endswith("Dunia")
+
+
+def test_format_body_html_wraps_standalone_otp_in_code() -> None:
+    """4-8 digit codes with non-word boundaries get tap-to-copy ``<code>``."""
+    body = "Your code is 245657. It expires in 5 minutes."
+    out = format_body_html(body)
+    assert "<code>245657</code>" in out
+
+
+def test_format_body_html_skips_digits_inside_words() -> None:
+    """Digits inside identifiers (vielz88301) should NOT be wrapped — they're not OTPs."""
+    body = "Created vielz88301 at vielz883.proton.me"
+    out = format_body_html(body)
+    # The "88301" is part of the word "vielz88301"; it must stay unwrapped.
+    assert "<code>" not in out
+
+
+def test_format_body_html_does_not_break_urls() -> None:
+    body = "Click https://account.proton.me/verify?token=abc&id=1 to verify."
+    out = format_body_html(body)
+    # Path stays intact; "&" gets escaped to "&amp;" but Telegram still
+    # auto-links the URL.
+    assert "https://account.proton.me/verify?token=abc" in out
+    assert "&amp;" in out
+    # We must NOT inject <code> around digits embedded in the URL query.
+    # The "1" at "&id=1" is too short for the OTP regex anyway, but make
+    # sure the literal characters of the URL are unbroken up to the "&".
+    assert "verify?token=abc</code>" not in out
+
+
+def test_format_body_html_collapses_blank_lines_before_render() -> None:
+    body = "Halo\n\n\n\n\nDunia"
+    out = format_body_html(body)
+    assert "\n\n\n" not in out
+
+
+def test_format_body_html_escapes_html_special_chars() -> None:
+    body = "<script>alert(1)</script>"
+    out = format_body_html(body)
+    # The literal '<' and '>' must be escaped so Telegram doesn't try to
+    # parse the user content as HTML.
+    assert "<script>" not in out
+    assert "&lt;script&gt;" in out
+
+
+def test_format_body_html_handles_multiple_otps() -> None:
+    body = "First code: 1234. Second: 567890."
+    out = format_body_html(body)
+    assert "<code>1234</code>" in out
+    assert "<code>567890</code>" in out
+
+
+def test_format_body_html_does_not_wrap_digits_inside_url() -> None:
+    """A 4-8 digit token inside a URL must NOT be wrapped — would break Telegram auto-linking."""
+    body = "Verify at https://account.proton.me/v?token=123456 now."
+    out = format_body_html(body)
+    # Telegram needs the URL contiguous: "...token=123456" with no inserted tag.
+    assert "token=123456" in out
+    assert "<code>123456</code>" not in out
 
 
 def test_summarize_html_only_returns_clean_text_no_tags() -> None:

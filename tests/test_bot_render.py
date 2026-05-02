@@ -36,9 +36,11 @@ def test_render_short_message_includes_all_sections() -> None:
         },
     )
     assert "<code>vielz50@proton.me</code>" in text
-    assert "<pre>Pesan singkat.</pre>" in text
-    # closing tag must always be present
-    assert text.count("<pre>") == text.count("</pre>")
+    # Body is rendered as plain text (no <pre>) so URL auto-linking and OTP
+    # tap-to-copy work in the Telegram client.
+    assert "Pesan singkat." in text
+    assert "<pre>" not in text and "</pre>" not in text
+    assert text.count("<b>") == text.count("</b>")
     assert "/list" in text
 
 
@@ -56,30 +58,113 @@ def test_render_truncates_huge_body_without_breaking_html() -> None:
     # Stays under Telegram's 4096-character cap, with our defensive 4000 budget.
     assert len(text) <= _TELEGRAM_MESSAGE_LIMIT
     # All HTML tags are well-formed.
-    assert text.count("<pre>") == 1 == text.count("</pre>")
     assert text.count("<b>") == text.count("</b>")
+    assert text.count("<code>") == text.count("</code>")
     # And the truncation marker is present.
     assert "(dipotong)" in text
 
 
 def test_render_does_not_split_html_entity() -> None:
-    # "&" expands to "&amp;" (5 chars) so a body of 5000 ampersands escapes to 25000
-    # chars — far over budget. The truncated output must not contain a partial
-    # entity like "&am" or "&" without a trailing ";".
+    # "&" expands to "&amp;" (5 chars) so a body of 5000 ampersands escapes to
+    # 25000 chars — far over budget. The truncated output must not contain a
+    # partial entity like "&am" or a "&" without a trailing ";".
     body = "&" * 5000
     text = _render_email_message(
         "v@p.me",
         {"from": "f@x.example", "subject": "S", "date": "D", "body": body},
     )
-    inside_pre = re.search(r"<pre>(.*?)</pre>", text, re.DOTALL)
-    assert inside_pre is not None
-    pre_body = inside_pre.group(1)
-    # Every "&" in the rendered <pre> body must start a complete "&amp;" entity.
-    assert all(
-        pre_body[i : i + 5] == "&amp;"
-        for i in range(len(pre_body))
-        if pre_body[i] == "&"
+    # Strip all known well-formed entities and tags; a leftover "&" would
+    # mean the truncator cut an entity in half.
+    stripped = re.sub(r"&amp;", "", text)
+    stripped = re.sub(r"<[^>]+>", "", stripped)
+    assert "&" not in stripped
+
+
+def test_render_collapses_blank_lines() -> None:
+    """Forward email body should never have more than one blank line."""
+    body = "Halo,\n\n\n\nIni baris 2.\n\n\n\n\nBaris 3."
+    text = _render_email_message(
+        "v@p.me",
+        {"from": "f@x.example", "subject": "S", "date": "D", "body": body},
     )
+    # Anywhere in the rendered message we must not see 3+ consecutive newlines.
+    assert "\n\n\n" not in text
+
+
+def test_render_wraps_otp_in_code_tag() -> None:
+    """Standalone 4-8 digit codes get ``<code>`` wrappers for tap-to-copy."""
+    body = "Your code is 245657. It expires in 5 minutes."
+    text = _render_email_message(
+        "v@p.me",
+        {"from": "f@x.example", "subject": "S", "date": "D", "body": body},
+    )
+    assert "<code>245657</code>" in text
+
+
+def test_render_preserves_url_intact() -> None:
+    """URLs must not be split or escaped in a way that breaks Telegram auto-linking."""
+    body = "Click here: https://account.proton.me/verify-email?token=xxx&user=1"
+    text = _render_email_message(
+        "v@p.me",
+        {"from": "f@x.example", "subject": "S", "date": "D", "body": body},
+    )
+    # The URL up to "&" remains intact; "&" is escaped to "&amp;" which
+    # Telegram still treats as a valid URL char during auto-linking.
+    assert "https://account.proton.me/verify-email?token=xxx" in text
+    # No <pre> wrapper that would suppress auto-linking.
+    assert "<pre>" not in text
+
+
+def test_primary_keyboard_includes_copy_active_button_when_locked() -> None:
+    """PR-C #3: when an alias is locked, the /list keyboard surfaces a
+    "📋 Copy email aktif" button so desktop users can grab the address
+    in one click without text selection.
+    """
+    from proton_telegram_bot.bot import CB_COPY_ACTIVE_EMAIL
+
+    primary = _fake_primary()
+    markup = _build_primary_keyboard(
+        [primary], {1: 5}, active_primary_id=1, with_copy_active_button=True
+    )
+    flat = [b for row in markup.inline_keyboard for b in row]
+    copy_buttons = [b for b in flat if b.callback_data == CB_COPY_ACTIVE_EMAIL]
+    assert len(copy_buttons) == 1
+    assert "Copy email aktif" in (copy_buttons[0].text or "")
+
+
+def test_primary_keyboard_omits_copy_active_button_when_unlocked() -> None:
+    """No active alias → no Copy button. Keeps the keyboard compact."""
+    from proton_telegram_bot.bot import CB_COPY_ACTIVE_EMAIL
+
+    primary = _fake_primary()
+    markup = _build_primary_keyboard(
+        [primary], {1: 5}, active_primary_id=None, with_copy_active_button=False
+    )
+    flat = [b for row in markup.inline_keyboard for b in row]
+    assert not any(b.callback_data == CB_COPY_ACTIVE_EMAIL for b in flat)
+
+
+def test_poll_now_keyboard_optionally_adds_copy_active_button() -> None:
+    """The lock-confirmation reply (after CB_PICK_PRIMARY:N pick) hands a
+    keyboard that includes both ``📋 Copy email aktif`` and
+    ``📥 Cek email sekarang`` so users have one-click copy *and* a
+    manual poll without typing.
+    """
+    from proton_telegram_bot.bot import (
+        CB_COPY_ACTIVE_EMAIL,
+        CB_POLL_NOW,
+        _build_poll_now_keyboard,
+    )
+
+    plain = _build_poll_now_keyboard()
+    plain_flat = [b for row in plain.inline_keyboard for b in row]
+    assert any(b.callback_data == CB_POLL_NOW for b in plain_flat)
+    assert not any(b.callback_data == CB_COPY_ACTIVE_EMAIL for b in plain_flat)
+
+    with_copy = _build_poll_now_keyboard(with_copy_active=True)
+    with_copy_flat = [b for row in with_copy.inline_keyboard for b in row]
+    assert any(b.callback_data == CB_POLL_NOW for b in with_copy_flat)
+    assert any(b.callback_data == CB_COPY_ACTIVE_EMAIL for b in with_copy_flat)
 
 
 def test_alias_keyboard_callback_data_is_under_64_bytes() -> None:
