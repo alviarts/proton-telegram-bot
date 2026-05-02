@@ -1076,8 +1076,21 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             await bridge_admin.cancel_captcha()
         except Exception:
             LOGGER.exception("failed to clean up bridge captcha state")
+    # Restore IMAP listeners that may have been disrupted while Bridge was
+    # stopped during the /connect flow.  Without this, a /cancel leaves the
+    # listeners dead because Bridge was killed mid-flight.
+    chat = update.effective_chat
+    if chat is not None:
+        manager = _bot_manager(context)
+        try:
+            db = _bot_db(context)
+            primaries = await db.list_primary_accounts(chat.id)
+            for primary in primaries:
+                await manager.start_for_primary(primary.id)
+        except Exception:
+            LOGGER.exception("failed to restore listeners after /cancel")
     if update.effective_message is not None:
-        await update.effective_message.reply_text("Dibatalkan.")
+        await update.effective_message.reply_text("Dibatalkan. Listener IMAP dipulihkan.")
     return ConversationHandler.END
 
 

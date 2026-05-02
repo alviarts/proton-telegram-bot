@@ -168,10 +168,17 @@ class BridgeAdmin:
                 yield LoginFailed(reason=tail.strip().splitlines()[-1] if tail.strip() else "unknown")
         finally:
             if process.returncode is None:
+                # Send SIGTERM first so the helper script's ``finally``
+                # block can restart the Bridge service before exiting.
                 with contextlib.suppress(ProcessLookupError):
-                    process.kill()
-                with contextlib.suppress(Exception):
-                    await process.wait()
+                    process.terminate()
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=15)
+                except TimeoutError:
+                    with contextlib.suppress(ProcessLookupError):
+                        process.kill()
+                    with contextlib.suppress(Exception):
+                        await process.wait()
 
     async def acknowledge_captcha(self) -> None:
         """Signal the helper script that the user has finished the CAPTCHA."""
@@ -179,13 +186,37 @@ class BridgeAdmin:
         Path(flag).touch()
 
     async def cancel_captcha(self) -> None:
-        """Best-effort cleanup if the user backs out of /connect mid-flight."""
+        """Best-effort cleanup if the user backs out of /connect mid-flight.
+
+        The ``bridge_add_account.py`` helper stops the Bridge systemd
+        service before driving ``bridge --cli``.  If we kill that helper
+        (e.g. because the async-generator is GC'd on /cancel), its
+        ``finally`` block never runs and Bridge stays down.  We
+        explicitly restart Bridge here so IMAP listeners can reconnect.
+        """
         for path in (
             self._settings.bridge_captcha_url_file,
             self._settings.bridge_captcha_done_flag,
         ):
             with contextlib.suppress(FileNotFoundError):
                 Path(path).unlink()
+        await self._ensure_bridge_running()
+
+    async def _ensure_bridge_running(self) -> None:
+        """Restart the Bridge systemd service if it is not active."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "systemctl", "is-active", "--quiet", "protonmail-bridge.service",
+            )
+            await proc.wait()
+            if proc.returncode != 0:
+                LOGGER.info("Bridge service is not running; restarting it")
+                start = await asyncio.create_subprocess_exec(
+                    "systemctl", "start", "protonmail-bridge.service",
+                )
+                await start.wait()
+        except Exception:
+            LOGGER.exception("failed to ensure Bridge service is running")
 
     async def fetch_imap_credentials(self, email: str) -> BridgeImapCredentials | None:
         """Return the Bridge-managed IMAP creds for ``email``, or ``None``.
