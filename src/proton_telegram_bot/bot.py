@@ -1213,7 +1213,9 @@ async def _setup_tempmail_recovery(
                 # then auto-add them as aliases once /connect finishes.
                 # Doing it here (vs. spawning a second browser later)
                 # saves ~30s on the happy path.
-                addresses = await fetch_all_addresses(page)
+                addresses = await fetch_all_addresses(
+                    page, user_index=user_index
+                )
                 if addresses is not None:
                     LOGGER.info(
                         "Proton account %s has %d addresses (will sync after connect)",

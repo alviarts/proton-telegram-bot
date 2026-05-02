@@ -609,61 +609,123 @@ async def solve_email_verification(
 # ---------------------------------------------------------------- list addresses
 
 
-async def fetch_all_addresses(page: Page) -> list[str] | None:
-    """Return every Status==1 address Proton's account API knows for this user.
+_ADDRESSES_API_RE = re.compile(r"/api/core/v4/addresses(?:\?|/?$)")
 
-    Uses the *already-logged-in* Playwright page to call
-    ``/api/core/v4/addresses`` from inside the browser context. Doing
-    the request via ``page.evaluate(fetch(...))`` reuses the session
-    cookies + ``x-pm-uid`` headers Proton sets on the dashboard, so
-    we don't have to re-do SRP auth (which can trip CAPTCHA on
-    headless requests). Returns a sorted, lower-cased list of email
-    strings or ``None`` on any error.
 
-    The Proton "Pengguna dan alamat" page paginates the address list
-    to a few rows by default ("18 alamat lainnya" expandable). The
-    underlying API call has no such pagination — it returns the full
-    set in one response — so we hit it directly instead of scraping
-    the rendered DOM.
+async def fetch_all_addresses(
+    page: Page,
+    *,
+    user_index: int | None = None,
+) -> list[str] | None:
+    """Return every address Proton's account API knows for this user.
+
+    Drives the *already-logged-in* Playwright page to navigate to
+    ``account.proton.me/u/{N}/mail/users-addresses`` ("Pengguna dan
+    alamat") and captures the ``/api/core/v4/addresses`` response(s)
+    that Proton's React app fires off on mount. We can't just call
+    ``fetch('/api/core/v4/addresses')`` from ``page.evaluate``: Proton
+    rejects API requests that lack the ``x-pm-uid`` /
+    ``x-pm-appversion`` headers (returns ``400 Bad Request``), and a
+    bare ``fetch`` from page context can't include them. Letting the
+    React app issue the request gives us the headers for free, and
+    cross-origin nav (e.g. from ``mail.proton.me``) into
+    ``account.proton.me`` is handled transparently by Playwright.
+
+    ``user_index`` defaults to whatever ``/u/<N>/`` is in the page's
+    current URL (falling back to ``0`` when unrecognised). Pass it
+    explicitly if the caller has it (e.g. directly after
+    :func:`_login_proton`).
+
+    The Proton "Pengguna dan alamat" page renders only a few rows by
+    default ("18 alamat lainnya" expandable), but the underlying API
+    call returns the full set in one or more paginated responses.
+    We listen on every response during navigation so multi-page
+    accounts are handled correctly.
+
+    Returns a sorted, lower-cased list of email strings, or ``None``
+    on any error.
     """
+    if user_index is None:
+        m = re.search(r"/u/(\d+)/", page.url or "")
+        user_index = int(m.group(1)) if m else 0
+
+    target_url = f"https://account.proton.me/u/{user_index}/mail/users-addresses"
+    captured: list = []
+
+    def _on_response(resp) -> None:
+        try:
+            if (
+                _ADDRESSES_API_RE.search(resp.url)
+                and resp.request.method == "GET"
+            ):
+                captured.append(resp)
+        except Exception:  # pragma: no cover - listener must never raise
+            pass
+
+    page.on("response", _on_response)
     try:
-        result = await page.evaluate(
-            """async () => {
-                const resp = await fetch('/api/core/v4/addresses', {
-                    method: 'GET',
-                    credentials: 'include',
-                    headers: { 'Accept': 'application/json' },
-                });
-                if (!resp.ok) {
-                    return { ok: false, status: resp.status };
-                }
-                const data = await resp.json();
-                return { ok: true, data: data };
-            }"""
-        )
-    except Exception as exc:  # pragma: no cover - network/eval flake
-        logger.warning("fetch_all_addresses page.evaluate failed: %s", exc)
-        return None
-
-    if not isinstance(result, dict) or not result.get("ok"):
+        await page.goto(target_url, wait_until="domcontentloaded", timeout=20000)
+        # React fires the /addresses fetch after mount; give it a
+        # moment so we don't tear down the listener before the
+        # request has even left the page.
+        try:
+            await page.wait_for_load_state("networkidle", timeout=10000)
+        except Exception:  # pragma: no cover - networkidle is best-effort
+            pass
+    except Exception as exc:  # pragma: no cover - nav flake / timeout
         logger.warning(
-            "fetch_all_addresses got non-OK response: %s", result
+            "fetch_all_addresses: navigation to %s failed: %s", target_url, exc
+        )
+    finally:
+        try:
+            page.remove_listener("response", _on_response)
+        except Exception:  # pragma: no cover
+            pass
+
+    if not captured:
+        logger.warning(
+            "fetch_all_addresses: no /api/core/v4/addresses responses "
+            "captured after navigating to %s",
+            target_url,
         )
         return None
 
-    data = result.get("data") or {}
-    raw = data.get("Addresses") or []
-    addresses: list[str] = []
-    for entry in raw:
-        if not isinstance(entry, dict):
+    addresses_set: set[str] = set()
+    saw_ok = False
+    for resp in captured:
+        try:
+            if not resp.ok:
+                logger.warning(
+                    "fetch_all_addresses: /api/core/v4/addresses returned "
+                    "status=%d",
+                    resp.status,
+                )
+                continue
+            data = await resp.json()
+        except Exception as exc:  # pragma: no cover - body read flake
+            logger.warning(
+                "fetch_all_addresses: failed to read response body: %s", exc
+            )
             continue
-        # Status: 1 = enabled (the /api endpoint also returns disabled
-        # ones with Status=2; the UI hides them but they still receive
-        # mail until explicitly deleted, so we keep them).
-        email = entry.get("Email")
-        if isinstance(email, str) and "@" in email:
-            addresses.append(email.lower())
-    return sorted(set(addresses))
+
+        saw_ok = True
+        raw = data.get("Addresses") if isinstance(data, dict) else None
+        if not isinstance(raw, list):
+            continue
+        for entry in raw:
+            if not isinstance(entry, dict):
+                continue
+            # Status: 1 = enabled (the /api endpoint also returns
+            # disabled ones with Status=2; the UI hides them but
+            # they still receive mail until explicitly deleted, so
+            # we keep them).
+            email = entry.get("Email")
+            if isinstance(email, str) and "@" in email:
+                addresses_set.add(email.lower())
+
+    if not saw_ok:
+        return None
+    return sorted(addresses_set)
 
 
 async def fetch_all_addresses_via_browser(
@@ -704,7 +766,7 @@ async def fetch_all_addresses_via_browser(
                 failure.get("url"),
             )
             return None
-        return await fetch_all_addresses(page)
+        return await fetch_all_addresses(page, user_index=user_index)
     except Exception:
         logger.exception("fetch_all_addresses_via_browser unexpected failure")
         return None
