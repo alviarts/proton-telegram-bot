@@ -128,19 +128,6 @@ RECOVERY_SELECTORS = {
         "button:has-text('Verify via email'), "
         "[role='dialog'] button:has-text('Verifikasi')"
     ),
-    # Verification code input (after email is sent)
-    "verification_code_input": (
-        "input[id='verification-code'], "
-        "input[name='code'], "
-        "input[type='text'][inputmode='numeric'], "
-        "input[placeholder*='code' i], "
-        "input[placeholder*='kode' i]"
-    ),
-    "verification_submit_button": (
-        "button:has-text('Verify'), "
-        "button:has-text('Verifikasi'), "
-        "button[type='submit']"
-    ),
 }
 
 RECOVERY_URL_TEMPLATE = "https://account.proton.me/u/{user_index}/mail/recovery"
@@ -230,35 +217,19 @@ async def change_recovery_email(
 
     await asyncio.sleep(2)
 
-    # Step 6: Poll temp mail for verification code
-    logger.info("polling temp mail %s for recovery verification code...", tempmail.address)
-    code = await tempmail.wait_for_code(client, max_attempts=60)
-    if code is None:
-        logger.error("timed out waiting for recovery verification code")
+    # Step 6: Poll temp mail for the verification LINK (not a code).
+    # Proton sends a link like https://account.proton.me/...verify...
+    logger.info("polling temp mail %s for verification link...", tempmail.address)
+    verify_link_url = await tempmail.wait_for_verify_link(client, max_attempts=60)
+    if verify_link_url is None:
+        logger.error("timed out waiting for recovery verification link")
         return False
 
-    # Step 7: Enter the verification code
-    code_input = page.locator(RECOVERY_SELECTORS["verification_code_input"]).first
-    try:
-        await code_input.wait_for(state="visible", timeout=10_000)
-        await code_input.fill(code)
-        logger.info("filled verification code: %s", code)
-    except Exception:
-        # The code input might not appear on the same page — Proton
-        # may handle it differently. Log but still return True since
-        # the email was saved (just not verified yet).
-        logger.warning("no verification code input found on page")
-        return True
-
-    # Step 8: Submit the code
-    submit_btn = page.locator(RECOVERY_SELECTORS["verification_submit_button"]).first
-    try:
-        await submit_btn.click()
-        logger.info("submitted verification code")
-    except Exception:
-        logger.warning("could not submit verification code")
-
+    # Step 7: Open the verification link in the browser to confirm
+    logger.info("opening verification link: %s", verify_link_url)
+    await page.goto(verify_link_url, wait_until="networkidle", timeout=30_000)
     await asyncio.sleep(3)
+
     logger.info("recovery email changed and verified: %s", new_email)
     return True
 
