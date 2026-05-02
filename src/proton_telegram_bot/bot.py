@@ -2563,14 +2563,32 @@ async def _run_genaddr_background(
         )
         final_lines.append(f"Contoh: <code>{html.escape(sample)}</code>{more}")
     final_lines.append(
-        "\nKlik /list buat lihat semuanya, atau /cekimap untuk validasi "
-        "alias yang baru dibuat sudah bisa terima email."
+        "\nKlik /list buat lihat semuanya, atau klik tombol di bawah "
+        "untuk validasi alias yang baru dibuat sudah bisa terima email."
     )
+    # Surface a one-tap "Cek IMAP listener" entry to /cekimap (same
+    # callback the after-connect onboarding uses). Only show it when at
+    # least one alias was actually created — there's nothing to verify
+    # otherwise. Reuses CB_QUICK_HEALTHCHECK so we don't introduce a
+    # second router branch.
+    reply_markup: InlineKeyboardMarkup | None = None
+    if summary.created:
+        reply_markup = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        f"🩺 Cek hasil sekarang ({len(summary.created)} alias)",
+                        callback_data=f"{CB_QUICK_HEALTHCHECK}:{primary.id}",
+                    )
+                ]
+            ]
+        )
     try:
         await bot.send_message(
             chat_id=chat_id,
             text="\n".join(final_lines),
             parse_mode=ParseMode.HTML,
+            reply_markup=reply_markup,
         )
     except Exception:
         LOGGER.exception("genaddr final summary send failed")
