@@ -1674,39 +1674,47 @@ async def _setup_tempmail_recovery(
     proton_password: str,
     *,
     tracker: TaskMessageTracker | None = None,
-) -> tuple[TempMailbox | None, bool, list[str] | None]:
+) -> tuple[TempMailbox | None, bool, list[str] | None, bool]:
     """Create a temp mail and set it as recovery email in Proton settings.
 
     Logs into the Proton web UI, navigates to recovery settings, and
     replaces the current recovery email with a fresh Mail.tm address.
-    Sends the recovery-email verification link to the Telegram user
-    for manual click.
+    After Proton emails the verification link to the temp inbox we try
+    to auto-verify it in a fresh tab of the same browser context. On
+    success the user never sees the link — they get a single ``✅
+    Recovery email otomatis diverifikasi`` line and the conversation
+    skips the manual ``ok`` wait state. On failure we fall back to the
+    pre-PR-E behaviour and DM the link.
 
-    Returns ``(tempmail, ok, addresses)`` where:
+    Returns ``(tempmail, ok, addresses, auto_verified)`` where:
       * ``tempmail`` is the disposable mailbox (or ``None`` on early failure).
       * ``ok`` is ``True`` only if the verification link was sent to the
-        chat. When ``ok`` is ``False`` the caller MUST NOT proceed to
-        Bridge add-account: Proton login or recovery email change failed
-        and the user needs to retry ``/connect``.
+        chat (or auto-verified). When ``ok`` is ``False`` the caller
+        MUST NOT proceed to Bridge add-account: Proton login or recovery
+        email change failed and the user needs to retry ``/connect``.
       * ``addresses`` is the full list of email addresses Proton's
         ``/api/core/v4/addresses`` endpoint returned for this user
         (extracted from the still-logged-in browser session before
         teardown), so the caller can persist them as aliases. ``None``
         when the API call failed; an empty list is also possible
         (very rare, single-address account).
+      * ``auto_verified`` is ``True`` when ``auto_verify_recovery_link``
+        confirmed Proton accepted the verification — the caller can
+        skip the ``CONNECT_RECOVERY_VERIFY`` wait state and dive
+        straight into Bridge add-account.
     """
     try:
         from playwright.async_api import async_playwright
     except ImportError:
         LOGGER.warning("playwright not installed; skipping recovery email setup")
-        return None, False, None
+        return None, False, None, False
 
     async with httpx.AsyncClient() as client:
         try:
             tempmail = await TempMailbox.create(client)
         except TempMailError as exc:
             LOGGER.warning("failed to create temp mailbox: %s", exc)
-            return None, False, None
+            return None, False, None, False
 
         await _send_connect_log(
             update,
@@ -1779,7 +1787,7 @@ async def _setup_tempmail_recovery(
                             )
                     except Exception as exc:
                         LOGGER.debug("could not send login-failure screenshot: %s", exc)
-                return tempmail, False, None
+                return tempmail, False, None, False
 
             # Change recovery email and get verification link
             verify_link = await change_recovery_email(
@@ -1801,15 +1809,52 @@ async def _setup_tempmail_recovery(
                         email,
                         len(addresses),
                     )
+
+                # PR-E: try to auto-verify the recovery link in a fresh
+                # tab of the same browser context. The new tab keeps
+                # ``page`` (and its Proton session cookies) untouched
+                # so the surrounding flow can continue without surprise
+                # navigations. On success we never DM the link to the
+                # user and the caller can skip the ``ok`` wait state.
+                from .proton_verify import auto_verify_recovery_link
+
+                auto_verified = False
+                verify_page = None
+                try:
+                    verify_page = await ctx.new_page()
+                    auto_verified = await auto_verify_recovery_link(
+                        verify_page, verify_link
+                    )
+                except Exception:
+                    LOGGER.exception("auto_verify_recovery_link unexpected failure")
+                finally:
+                    if verify_page is not None:
+                        with contextlib.suppress(Exception):
+                            await verify_page.close()
+
+                if auto_verified:
+                    await _send_connect_log(
+                        update,
+                        tracker,
+                        f"✅ Recovery email <code>{html.escape(tempmail.address)}</code> "
+                        "otomatis diverifikasi — lanjut Bridge add-account.",
+                        parse_mode=ParseMode.HTML,
+                    )
+                    return tempmail, True, addresses, True
+
+                # Auto-verify failed: fall back to the pre-PR-E manual
+                # flow. DM the link, the conversation continues to wait
+                # for the user's "ok".
                 await _send_connect_log(
                     update,
                     tracker,
                     f"📧 Recovery email diubah ke <code>{html.escape(tempmail.address)}</code>\n\n"
-                    "Klik link berikut untuk verifikasi recovery email:\n"
+                    "Auto-verify tidak bisa konfirmasi otomatis — klik link "
+                    "berikut untuk verifikasi manual:\n"
                     f"{html.escape(verify_link)}",
                     parse_mode=ParseMode.HTML,
                 )
-                return tempmail, True, addresses
+                return tempmail, True, addresses, False
 
             failure = getattr(change_recovery_email, "last_failure", {}) or {}
             step = failure.get("step", "unknown")
@@ -1832,10 +1877,10 @@ async def _setup_tempmail_recovery(
                         )
                 except Exception as exc:
                     LOGGER.debug("could not send recovery-failure screenshot: %s", exc)
-            return tempmail, False, None
+            return tempmail, False, None, False
         except Exception:
             LOGGER.exception("recovery email setup failed")
-            return tempmail, False, None
+            return tempmail, False, None, False
         finally:
             if browser:
                 with contextlib.suppress(Exception):
@@ -1942,7 +1987,12 @@ async def _drive_bridge_login(
     # Step 0: set up temp mail + change recovery email BEFORE Bridge login.
     # This must happen before Bridge login because the Bridge CLI stops
     # the service (and thus the Proton web session is separate).
-    tempmail, recovery_ok, proton_addresses = await _setup_tempmail_recovery(
+    (
+        tempmail,
+        recovery_ok,
+        proton_addresses,
+        auto_verified,
+    ) = await _setup_tempmail_recovery(
         update, email, proton_password, tracker=tracker
     )
     if not recovery_ok:
@@ -1954,16 +2004,44 @@ async def _drive_bridge_login(
         # confusing TimeoutError after a broken recovery flow.
         return ConversationHandler.END
 
-    # Hand off to the recovery-verify wait state. The verification link
-    # has already been DM'd from inside ``_setup_tempmail_recovery``;
-    # we just need the user to click it and reply "ok" before we
-    # proceed to bridge add-account.
+    # Persist context for either the auto-verified fast path OR the
+    # manual ``ok`` wait state, so both paths can hand off the same
+    # bookkeeping to ``_perform_bridge_add_account`` and ``_finalize_connect``.
     user_data["bridge_recovery_email"] = email
     user_data["bridge_recovery_proton_password"] = proton_password
     user_data["bridge_recovery_tempmail"] = tempmail
     # Stash the list pulled from /api/core/v4/addresses so _finalize_connect
     # can persist them as aliases once IMAP comes up.
     user_data["proton_account_addresses"] = proton_addresses
+
+    if auto_verified:
+        # PR-E fast path: auto_verify_recovery_link already confirmed
+        # Proton accepted the link, so we skip the
+        # ``CONNECT_RECOVERY_VERIFY`` wait state entirely and dive
+        # straight into Bridge add-account.
+        bridge_admin = _bot_bridge_admin(context)
+        if bridge_admin is None:
+            # ``_bot_bridge_admin`` only returns ``None`` when bot wiring
+            # was set up without a Bridge admin (test harness, etc.). In
+            # production this branch is unreachable; degrade gracefully.
+            await update.effective_message.reply_text(  # type: ignore[union-attr]
+                "Sesi /connect kedaluwarsa. Mulai lagi dengan /connect."
+            )
+            return ConversationHandler.END
+        return await _perform_bridge_add_account(
+            update,
+            context,
+            bridge_admin=bridge_admin,
+            email=email,
+            proton_password=proton_password,
+            tempmail=tempmail,
+            tracker=tracker,
+        )
+
+    # Auto-verify failed (or wasn't attempted): fall back to the manual
+    # wait state. The verification link has already been DM'd from
+    # inside ``_setup_tempmail_recovery`` — we just need the user to
+    # click it and reply "ok" before we proceed to bridge add-account.
     # Track the "👆 Klik link" prompt: cleanup only fires AFTER the
     # user has confirmed (sent "ok") and _finalize_connect ran, so
     # at that point the prompt has served its purpose and is safe
