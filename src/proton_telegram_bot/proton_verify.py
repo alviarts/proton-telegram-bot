@@ -19,8 +19,11 @@ Bridge login verification (verify.proton.me):
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import re
+import time
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import httpx
@@ -31,6 +34,28 @@ if TYPE_CHECKING:
     from playwright.async_api import Page
 
 logger = logging.getLogger(__name__)
+
+DEBUG_DIR = Path("/tmp/proton_login_debug")
+
+
+async def _dump_page(page: Page, prefix: str) -> Path | None:
+    """Save a screenshot + HTML of the current page for post-mortem.
+
+    Returns the screenshot path on success, ``None`` on any failure
+    (we never want diagnostics to mask the real error).
+    """
+    try:
+        DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+        ts = int(time.time())
+        png = DEBUG_DIR / f"{prefix}_{ts}.png"
+        html = DEBUG_DIR / f"{prefix}_{ts}.html"
+        with contextlib.suppress(Exception):
+            await page.screenshot(path=str(png), full_page=True)
+        with contextlib.suppress(Exception):
+            html.write_text(await page.content(), encoding="utf-8")
+        return png if png.exists() else None
+    except Exception:
+        return None
 
 VERIFY_URL_RE = re.compile(
     r"https://verify\.proton\.me/\?.*methods=ownership-email",
@@ -74,6 +99,38 @@ VERIFY_SELECTORS = {
 }
 
 
+async def _diagnose_login_blocker(page: Page) -> str:
+    """Best-effort detection of *why* a Proton login is stuck.
+
+    Returns a short tag describing the most likely blocker:
+    ``"2fa"``, ``"captcha"``, ``"bad_credentials"``, ``"unlock"``,
+    ``"unknown"``. Used purely for logging — do not use for control flow.
+    """
+    try:
+        url = page.url
+        if "/login/2fa" in url or "/2fa" in url:
+            return "2fa"
+        # CAPTCHA iframe (HCaptcha is the one Proton ships).
+        if await page.locator("iframe[src*='hcaptcha'], iframe[title*='captcha' i]").count() > 0:
+            return "captcha"
+        # Visible 2FA prompt
+        if await page.locator(
+            "input[name='twoFactorCode'], "
+            "input[placeholder*='2FA' i], "
+            "input[placeholder*='kode' i][maxlength='6']"
+        ).count() > 0:
+            return "2fa"
+        # Inline credentials error toast
+        body = (await page.locator("body").inner_text()).lower()
+        if "incorrect" in body or "salah" in body or "tidak benar" in body:
+            return "bad_credentials"
+        if "unlock" in url or "humanverification" in url.lower():
+            return "unlock"
+    except Exception:
+        pass
+    return "unknown"
+
+
 async def _login_proton(
     page: Page,
     email: str,
@@ -81,7 +138,10 @@ async def _login_proton(
 ) -> int | None:
     """Log into Proton web and return the user_index from the redirect URL.
 
-    Returns None if login failed.
+    Returns None if login failed. Detailed diagnostics
+    (screenshot + HTML + blocker tag) are written to ``DEBUG_DIR`` and
+    are also exposed on this function via ``last_failure`` for the
+    caller to surface to the user.
     """
     logger.info("logging into Proton web as %s", email)
     await page.goto(
@@ -110,7 +170,19 @@ async def _login_proton(
             timeout=60_000,
         )
     except Exception:
-        logger.error("Proton login did not redirect to account page")
+        blocker = await _diagnose_login_blocker(page)
+        dump = await _dump_page(page, f"login_failed_{blocker}")
+        _login_proton.last_failure = {  # type: ignore[attr-defined]
+            "blocker": blocker,
+            "url": page.url,
+            "screenshot": dump,
+        }
+        logger.error(
+            "Proton login did not redirect to /u/<n>: blocker=%s url=%s dump=%s",
+            blocker,
+            page.url,
+            dump,
+        )
         return None
 
     # Extract user_index from URL like /u/19/...
