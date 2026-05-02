@@ -1138,20 +1138,36 @@ async def connect_password(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
 
     # Auto-add path: text is the Proton account password. If the account
-    # is already in Bridge, skip the cli login and go straight to vault
-    # extraction. Otherwise drive the cli login.
+    # is already in Bridge AND the cached IMAP creds actually work, skip
+    # the cli login and go straight to vault extraction. Otherwise (no
+    # vault entry, OR vault entry is stale because Bridge forgot the
+    # user but we never rewrote the vault), drive the full flow:
+    # proton-login + recovery-email setup + ``bridge --cli login``.
     try:
         existing = await bridge_admin.fetch_imap_credentials(email)
     except BridgeAdminError as exc:
         LOGGER.warning("vault probe failed: %s", exc)
         existing = None
     if existing is not None:
-        return await _finalize_connect(
-            update,
-            context,
-            email=existing.email,
-            imap_username=existing.imap_username,
-            imap_password=existing.imap_password,
+        ok, detail = await _verify_bridge_login(
+            host=CONNECT_DEFAULT_HOST,
+            port=CONNECT_DEFAULT_PORT,
+            username=existing.imap_username,
+            password=existing.imap_password,
+            use_ssl=CONNECT_DEFAULT_SSL,
+        )
+        if ok:
+            return await _finalize_connect(
+                update,
+                context,
+                email=existing.email,
+                imap_username=existing.imap_username,
+                imap_password=existing.imap_password,
+            )
+        LOGGER.info(
+            "vault has %s but Bridge IMAP rejected (%s); running full re-add",
+            email,
+            detail,
         )
 
     return await _drive_bridge_login(
@@ -2125,6 +2141,9 @@ async def cmd_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 def build_handlers() -> list:
+    # ``allow_reentry=True``: typing /connect mid-conversation should
+    # restart the flow from scratch instead of falling through to the
+    # global "unknown command" handler. Same for /sync.
     connect_conv = ConversationHandler(
         entry_points=[CommandHandler("connect", cmd_connect)],
         states={
@@ -2143,6 +2162,7 @@ def build_handlers() -> list:
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
         name="connect",
         persistent=False,
+        allow_reentry=True,
     )
 
     sync_conv = ConversationHandler(
@@ -2155,6 +2175,7 @@ def build_handlers() -> list:
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
         name="sync",
         persistent=False,
+        allow_reentry=True,
     )
 
     setpw_conv = ConversationHandler(
@@ -2177,6 +2198,7 @@ def build_handlers() -> list:
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
         name="setprotonpw",
         persistent=False,
+        allow_reentry=True,
     )
 
     return [
