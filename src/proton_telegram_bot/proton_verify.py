@@ -1,31 +1,20 @@
-"""Automated Proton human-verification solver.
+"""Automated Proton recovery-email changer and Bridge verification solver.
 
-When Bridge's CLI login triggers a "Human Verification requested" page at
-``https://verify.proton.me/?methods=ownership-email&token=...``, this
-module can:
+Recovery-email change flow (from user screenshots):
+  1. Login to account.proton.me
+  2. Detect user_index from redirect URL (e.g. /u/19/...)
+  3. Navigate to ``account.proton.me/u/{N}/mail/recovery``
+  4. Fill "Alamat email pemulihan" input with temp mail → click **Simpan**
+  5. Password re-auth: "Masukkan kata sandi Anda" → fill → **Autentikasi**
+  6. Enable toggle "Izinkan pemulihan akun melalui email" if off
+  7. Click **Verifikasi** link → dialog → **Verifikasi melalui email**
+  8. Poll temp mail for verification **link** → return it to caller
+     (caller sends it to Telegram user for manual click)
 
-1. Create a throwaway Mail.tm inbox.
-2. Log into the Proton web UI and set the recovery email to the temp
-   address (with password re-authentication and email verification).
-3. Open the Bridge verification URL, choose "Email" verification, and
-   trigger a code send.
-4. Poll the Mail.tm inbox for the 6-digit code.
-5. Enter and submit the code on the verification page.
-
-The recovery-email change flow (observed from user screenshots):
-  1. Navigate to ``account.proton.me/u/{N}/mail/recovery``
-  2. Section "Alamat email pemulihan" has an ``<input>`` with the current
-     recovery email.
-  3. Clear → fill with temp mail → click **Simpan** (save) button next
-     to the input.
-  4. Password re-auth dialog: "Masukkan kata sandi Anda" → fill password
-     → click **Autentikasi**.
-  5. Toast: "Email diperbarui".  The field now shows "Alamat email belum
-     diverifikasi" with a **Verifikasi** link.
-  6. Click **Verifikasi** → dialog "Verifikasi email pemulihan?" →
-     click **Verifikasi melalui email**.
-  7. Toast: "Email verifikasi dikirim ke <addr>".
-  8. Poll temp mail for verification code → enter code → done.
+Bridge login verification (verify.proton.me):
+  - After recovery email is verified, Bridge login verification sends
+    a 6-digit **code** to the recovery email.
+  - Bot polls temp mail for the code and submits it.
 """
 from __future__ import annotations
 
@@ -84,53 +73,52 @@ VERIFY_SELECTORS = {
     ),
 }
 
-# ---------------------------------------------------------------------------
-# Selectors for Proton account recovery settings page
-# (account.proton.me/u/{N}/mail/recovery)
-# ---------------------------------------------------------------------------
-RECOVERY_SELECTORS = {
-    # The "Alamat email pemulihan" input — it's an <input> inside
-    # the "Pemulihan akun" section.  Proton renders it as a regular
-    # text/email input next to a "Simpan" button.
-    "recovery_email_input": (
-        "input[type='email'], "
-        "input[id*='recovery' i], "
-        "input[name*='recovery' i], "
-        # Fallback: the text input near the label "Alamat email pemulihan"
-        "label:has-text('Alamat email pemulihan') + input, "
-        "label:has-text('Recovery email') + input"
-    ),
-    # The "Simpan" (Save) button right next to the recovery email input
-    "save_button": (
-        "button:has-text('Simpan'), "
-        "button:has-text('Save')"
-    ),
-    # Password re-authentication modal
-    "reauth_password_input": (
-        "[role='dialog'] input[type='password'], "
-        "input[type='password']"
-    ),
-    "reauth_submit_button": (
-        "button:has-text('Autentikasi'), "
-        "button:has-text('Authenticate'), "
-        "[role='dialog'] button[type='submit']"
-    ),
-    # After save, the "Verifikasi" link appears next to the email
-    "verify_link": (
-        "a:has-text('Verifikasi'), "
-        "a:has-text('Verify'), "
-        "button:has-text('Verifikasi'), "
-        "button:has-text('Verify')"
-    ),
-    # Confirmation dialog: "Verifikasi email pemulihan?"
-    "verify_via_email_button": (
-        "button:has-text('Verifikasi melalui email'), "
-        "button:has-text('Verify via email'), "
-        "[role='dialog'] button:has-text('Verifikasi')"
-    ),
-}
 
-RECOVERY_URL_TEMPLATE = "https://account.proton.me/u/{user_index}/mail/recovery"
+async def _login_proton(
+    page: Page,
+    email: str,
+    password: str,
+) -> int | None:
+    """Log into Proton web and return the user_index from the redirect URL.
+
+    Returns None if login failed.
+    """
+    logger.info("logging into Proton web as %s", email)
+    await page.goto(
+        "https://account.proton.me/login",
+        wait_until="domcontentloaded",
+        timeout=60_000,
+    )
+    await asyncio.sleep(3)
+
+    # Fill credentials
+    username_input = page.locator("input[id='username'], input[name='username']").first
+    await username_input.wait_for(state="visible", timeout=15_000)
+    await username_input.fill(email)
+
+    password_input = page.locator("input[id='password'], input[name='password']").first
+    await password_input.fill(password)
+
+    submit_btn = page.locator("button[type='submit']").first
+    await submit_btn.click()
+    logger.info("submitted login form")
+
+    # Wait for redirect after login
+    try:
+        await page.wait_for_url(
+            re.compile(r"account\.proton\.me/u/\d+"),
+            timeout=60_000,
+        )
+    except Exception:
+        logger.error("Proton login did not redirect to account page")
+        return None
+
+    # Extract user_index from URL like /u/19/...
+    current_url = page.url
+    m = re.search(r"/u/(\d+)", current_url)
+    user_index = int(m.group(1)) if m else 0
+    logger.info("login successful, user_index=%d (url=%s)", user_index, current_url)
+    return user_index
 
 
 async def change_recovery_email(
@@ -141,51 +129,58 @@ async def change_recovery_email(
     client: httpx.AsyncClient,
     *,
     user_index: int = 0,
-) -> bool:
+) -> str | None:
     """Navigate to Proton recovery settings and change the recovery email.
 
     Assumes the page is already logged in (session cookies present).
-    Returns True on success (email changed and verified).
+
+    Returns the verification link URL (to be sent to the user via
+    Telegram for manual click), or None on failure.
     """
-    url = RECOVERY_URL_TEMPLATE.format(user_index=user_index)
+    url = f"https://account.proton.me/u/{user_index}/mail/recovery"
     logger.info("navigating to recovery settings: %s", url)
-    await page.goto(url, wait_until="networkidle", timeout=30_000)
-    await asyncio.sleep(3)
+    await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+    await asyncio.sleep(5)
 
     # Step 1: Find and fill the recovery email input
-    email_input = page.locator(RECOVERY_SELECTORS["recovery_email_input"]).first
+    email_input = page.locator("input[type='email']").first
     try:
         await email_input.wait_for(state="visible", timeout=15_000)
         await email_input.click(click_count=3)  # select all existing text
+        await asyncio.sleep(0.5)
         await email_input.fill(new_email)
         logger.info("filled recovery email input with %s", new_email)
     except Exception:
         logger.error("could not find or fill recovery email input")
-        return False
+        return None
 
     await asyncio.sleep(1)
 
-    # Step 2: Click "Simpan" (Save) — the button next to the input
-    # We need the Simpan that's near the email section, not the phone section
-    save_buttons = page.locator(RECOVERY_SELECTORS["save_button"])
+    # Step 2: Click "Simpan" (Save) — the first one (recovery email section)
+    save_buttons = page.locator("button:has-text('Simpan'), button:has-text('Save')")
     try:
-        # Click the first Simpan button (recovery email section comes first)
         await save_buttons.first.click()
         logger.info("clicked Simpan button")
     except Exception:
         logger.error("could not click Simpan button")
-        return False
+        return None
 
     await asyncio.sleep(2)
 
     # Step 3: Password re-authentication dialog
-    pw_input = page.locator(RECOVERY_SELECTORS["reauth_password_input"]).first
+    pw_input = page.locator(
+        "[role='dialog'] input[type='password'], input[type='password']"
+    ).first
     try:
         await pw_input.wait_for(state="visible", timeout=10_000)
         await pw_input.fill(proton_password)
         logger.info("filled re-auth password")
 
-        auth_btn = page.locator(RECOVERY_SELECTORS["reauth_submit_button"]).first
+        auth_btn = page.locator(
+            "button:has-text('Autentikasi'), "
+            "button:has-text('Authenticate'), "
+            "[role='dialog'] button[type='submit']"
+        ).first
         await auth_btn.click()
         logger.info("clicked Autentikasi")
     except Exception:
@@ -193,45 +188,59 @@ async def change_recovery_email(
 
     await asyncio.sleep(3)
 
-    # Step 4: Click "Verifikasi" link that appears after save
-    verify_link = page.locator(RECOVERY_SELECTORS["verify_link"]).first
+    # Step 4: Enable "Izinkan pemulihan akun melalui email" toggle if off
+    try:
+        toggle = page.locator(
+            "label:has-text('Izinkan pemulihan akun melalui email'), "
+            "label:has-text('Allow recovery by email')"
+        ).first
+        toggle_parent = toggle.locator("..").locator("input[type='checkbox'], [role='switch']").first
+        is_checked = await toggle_parent.is_checked()
+        if not is_checked:
+            await toggle.click()
+            logger.info("enabled 'Izinkan pemulihan akun melalui email' toggle")
+            await asyncio.sleep(1)
+    except Exception:
+        logger.debug("could not find/toggle recovery email switch; may already be on")
+
+    # Step 5: Click "Verifikasi" link
+    verify_link = page.locator(
+        "a:has-text('Verifikasi'), a:has-text('Verify')"
+    ).first
     try:
         await verify_link.wait_for(state="visible", timeout=10_000)
         await verify_link.click()
         logger.info("clicked Verifikasi link")
     except Exception:
         logger.warning("could not find Verifikasi link; email may already be verified")
-        return True  # optimistic — email was saved even if not verified
+        return None
 
     await asyncio.sleep(2)
 
-    # Step 5: "Verifikasi email pemulihan?" dialog → "Verifikasi melalui email"
-    verify_email_btn = page.locator(RECOVERY_SELECTORS["verify_via_email_button"]).first
+    # Step 6: "Verifikasi email pemulihan?" dialog → "Verifikasi melalui email"
+    verify_email_btn = page.locator(
+        "button:has-text('Verifikasi melalui email'), "
+        "button:has-text('Verify via email')"
+    ).first
     try:
         await verify_email_btn.wait_for(state="visible", timeout=10_000)
         await verify_email_btn.click()
         logger.info("clicked 'Verifikasi melalui email'")
     except Exception:
         logger.error("could not find 'Verifikasi melalui email' button")
-        return False
+        return None
 
     await asyncio.sleep(2)
 
-    # Step 6: Poll temp mail for the verification LINK (not a code).
-    # Proton sends a link like https://account.proton.me/...verify...
+    # Step 7: Poll temp mail for the verification LINK
     logger.info("polling temp mail %s for verification link...", tempmail.address)
     verify_link_url = await tempmail.wait_for_verify_link(client, max_attempts=60)
     if verify_link_url is None:
         logger.error("timed out waiting for recovery verification link")
-        return False
+        return None
 
-    # Step 7: Open the verification link in the browser to confirm
-    logger.info("opening verification link: %s", verify_link_url)
-    await page.goto(verify_link_url, wait_until="networkidle", timeout=30_000)
-    await asyncio.sleep(3)
-
-    logger.info("recovery email changed and verified: %s", new_email)
-    return True
+    logger.info("got verification link: %s", verify_link_url)
+    return verify_link_url
 
 
 async def solve_email_verification(
@@ -248,12 +257,12 @@ async def solve_email_verification(
       - "Resend code" link
 
     The code is sent to the recovery email (which should already be set
-    to our temp mail address).
+    to our temp mail address and verified).
 
     Returns True if verification succeeded.
     """
     logger.info("opening verification URL: %s", verify_url)
-    await page.goto(verify_url, wait_until="networkidle", timeout=30_000)
+    await page.goto(verify_url, wait_until="domcontentloaded", timeout=60_000)
     await asyncio.sleep(3)
 
     # Select email verification method if multiple are offered

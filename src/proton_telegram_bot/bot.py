@@ -5,7 +5,6 @@ import asyncio
 import contextlib
 import html
 import logging
-import re
 from typing import Any, cast
 
 import aioimaplib
@@ -864,6 +863,8 @@ async def _setup_tempmail_recovery(
 
     Logs into the Proton web UI, navigates to recovery settings, and
     replaces the current recovery email with a fresh Mail.tm address.
+    Sends the recovery-email verification link to the Telegram user
+    for manual click.
     Returns the TempMailbox if successful, None otherwise.
     """
     try:
@@ -888,46 +889,43 @@ async def _setup_tempmail_recovery(
         pw = None
         browser = None
         try:
-            from .proton_verify import change_recovery_email
+            from .proton_verify import _login_proton, change_recovery_email
 
             pw = await async_playwright().start()
             browser = await pw.chromium.launch(headless=True)
             ctx = await browser.new_context()
             page = await ctx.new_page()
 
-            # Log into Proton web
-            await page.goto("https://account.proton.me/login", wait_until="networkidle")
-            await page.fill("input[name='username'], input#username", email)
-            await page.fill("input[name='password'], input#password", proton_password)
-            await page.click("button[type='submit']")
-
-            # Wait for login to complete
-            try:
-                await page.wait_for_url(
-                    re.compile(r"account\.proton\.me/(?:u/\d+/|apps|dashboard)"),
-                    timeout=60_000,
-                )
-            except Exception:
-                LOGGER.warning("Proton web login did not complete; skipping recovery email change")
-                return tempmail  # Still return the tempmail for manual use
-
-            ok = await change_recovery_email(
-                page, tempmail.address, proton_password, tempmail, client
-            )
-            if ok:
+            # Log into Proton web and detect user_index
+            user_index = await _login_proton(page, email, proton_password)
+            if user_index is None:
+                LOGGER.warning("Proton web login failed; skipping recovery email change")
                 await update.effective_message.reply_text(  # type: ignore[union-attr]
-                    f"✅ Recovery email diubah ke <code>{html.escape(tempmail.address)}</code>",
+                    "⚠️ Login Proton web gagal. Lanjut tanpa ganti recovery email.",
+                )
+                return tempmail
+
+            # Change recovery email and get verification link
+            verify_link = await change_recovery_email(
+                page, tempmail.address, proton_password, tempmail, client,
+                user_index=user_index,
+            )
+            if verify_link:
+                await update.effective_message.reply_text(  # type: ignore[union-attr]
+                    f"📧 Recovery email diubah ke <code>{html.escape(tempmail.address)}</code>\n\n"
+                    "Klik link berikut untuk verifikasi recovery email:\n"
+                    f"{html.escape(verify_link)}",
                     parse_mode=ParseMode.HTML,
                 )
             else:
                 await update.effective_message.reply_text(  # type: ignore[union-attr]
-                    "⚠️ Gagal mengubah recovery email. "
+                    "⚠️ Gagal mengubah/verifikasi recovery email. "
                     "Verifikasi otomatis mungkin tidak akan berfungsi.",
                 )
             return tempmail
         except Exception:
             LOGGER.exception("recovery email setup failed")
-            return tempmail  # Return tempmail anyway for potential manual use
+            return tempmail
         finally:
             if browser:
                 with contextlib.suppress(Exception):
