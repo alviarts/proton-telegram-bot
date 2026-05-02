@@ -39,6 +39,10 @@ class Settings(BaseSettings):
         default=Path("scripts/bridge_add_account.py"),
         alias="BRIDGE_ADD_ACCOUNT_SCRIPT",
     )
+    bridge_remove_account_script: Path = Field(
+        default=Path("scripts/bridge_remove_account.py"),
+        alias="BRIDGE_REMOVE_ACCOUNT_SCRIPT",
+    )
     bridge_decrypt_vault_script: Path = Field(
         default=Path("scripts/bridge_decrypt_vault.py"),
         alias="BRIDGE_DECRYPT_VAULT_SCRIPT",

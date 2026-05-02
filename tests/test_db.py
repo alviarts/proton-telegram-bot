@@ -192,6 +192,64 @@ async def test_multiple_primary_accounts_per_chat(db: Database) -> None:
     assert [p.id for p in await db.list_primary_accounts(chat_id)] == [p2]
 
 
+async def test_delete_primary_account_clean_slate(db: Database) -> None:
+    """``delete_primary_account`` purges every dependent row so that a future
+    /connect for the same email starts from scratch — no stale aliases, no
+    stale generator cursor, no stale active-alias / active-primary pointer,
+    no leftover legacy IMAP creds.
+    """
+    from proton_telegram_bot.alias_gen import GenState
+
+    chat_id = 555
+    await db.upsert_user(chat_id)
+    # Pre-fill legacy per-user IMAP creds (older deploys persisted them on
+    # the ``users`` row before the multi-primary migration). They must be
+    # wiped when the last primary is removed.
+    await db.set_credentials(
+        chat_id,
+        host="127.0.0.1",
+        port=1143,
+        username="legacy@proton.me",
+        encrypted_password="legacy-token",
+        use_ssl=False,
+    )
+
+    pid = await db.add_primary_account(
+        chat_id=chat_id,
+        email="vielz45@proton.me",
+        host="127.0.0.1",
+        port=1143,
+        username="vielz45@proton.me",
+        encrypted_password="enc",
+        use_ssl=False,
+    )
+    await db.add_aliases(
+        chat_id,
+        ["alpha@proton.me", "beta@proton.me"],
+        primary_id=pid,
+    )
+    alias = await db.find_alias(chat_id, "alpha@proton.me")
+    assert alias is not None
+    await db.set_active_alias(chat_id, alias.id)
+    await db.set_active_primary(chat_id, pid)
+    await db.save_generator_state(chat_id, pid, "vielz", GenState("", 42))
+
+    assert await db.delete_primary_account(chat_id, pid) is True
+
+    # Aliases for this primary gone.
+    assert await db.list_aliases(chat_id, primary_id=pid) == []
+    assert await db.list_aliases(chat_id) == []
+    # Active pointers cleared so a stale id can't win later.
+    assert await db.get_active_alias(chat_id) is None
+    assert await db.get_active_primary_id(chat_id) is None
+    # Generator state for this (chat, primary) gone — next /genaddr starts
+    # from the default cursor.
+    assert await db.get_generator_state(chat_id, pid, "vielz") == GenState("", 1)
+    # Legacy per-user IMAP creds wiped because no primaries are left.
+    user = await db.get_user(chat_id)
+    assert user is not None and user.has_credentials is False
+
+
 # ---------------------------------------------------------------- proton master password
 
 

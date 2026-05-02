@@ -180,6 +180,55 @@ class BridgeAdmin:
                     with contextlib.suppress(Exception):
                         await process.wait()
 
+    async def remove_account(self, email: str) -> bool:
+        """Remove a Proton account from the host Bridge install.
+
+        Wraps ``scripts/bridge_remove_account.py`` which drives
+        ``bridge --cli`` to issue ``delete <email>`` (logout + key purge).
+        A subsequent /connect for the same email will start from scratch.
+
+        Returns ``True`` if the script exited cleanly (account removed or
+        was not present); ``False`` on failure. The bot's caller logs the
+        failure but continues with the DB-side cleanup so the user is not
+        blocked by a Bridge-side hiccup. Raises ``BridgeAdminError`` when
+        Bridge admin mode is disabled in settings.
+        """
+        if not self._settings.bridge_admin_enabled:
+            raise BridgeAdminError(
+                "BRIDGE_ADMIN_ENABLED=false; remove_account disabled."
+            )
+        s = self._settings
+        argv = [
+            *(["sudo", "-n"] if s.bridge_sudo else []),
+            s.bridge_python,
+            str(s.bridge_remove_account_script),
+            email,
+        ]
+        async with self._lock:
+            LOGGER.info("removing %s from Proton Bridge", email)
+            process = await asyncio.create_subprocess_exec(
+                *argv,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await process.communicate()
+            rc = process.returncode
+            if rc != 0:
+                LOGGER.warning(
+                    "bridge_remove_account.py rc=%s for %s; stderr=%r",
+                    rc,
+                    email,
+                    stderr.decode("utf-8", errors="replace"),
+                )
+                return False
+            if stdout:
+                LOGGER.debug(
+                    "bridge_remove_account.py stdout=%r",
+                    stdout.decode("utf-8", errors="replace"),
+                )
+            return True
+
     async def acknowledge_captcha(self) -> None:
         """Signal the helper script that the user has finished the CAPTCHA."""
         flag = self._settings.bridge_captcha_done_flag
