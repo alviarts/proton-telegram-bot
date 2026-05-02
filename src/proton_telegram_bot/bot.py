@@ -620,14 +620,16 @@ async def _verify_bridge_login(
     A freshly added account often needs a few seconds before its IMAP
     listener accepts logins, so callers running this immediately after
     ``bridge add_account`` should pass ``attempts > 1``. We retry on
-    connection-level errors (TimeoutError, ConnectionRefused, ...) and
-    on the Bridge ``"too many login attempts"`` response (which Bridge
-    emits when too many failed LOGINs hit the same account in quick
-    succession — this clears in ~60s on its own); auth-level "Invalid
-    credentials" / "Authentication failed" responses are final and
-    don't trigger a retry.
+    connection-level errors (TimeoutError, ConnectionRefused, ...),
+    on Bridge's ``"too many login attempts"`` response (clears in
+    ~60-75s on its own), and on Bridge's ``"no such user"`` response
+    (which it emits while still loading the freshly-added user from
+    vault into its in-memory IMAP user list — this can take a minute
+    or so after the bridge service restart). Auth-level "Incorrect
+    login credentials" responses are final and don't trigger a retry.
     """
     last_detail = ""
+    transient_markers = ("too many login attempts", "no such user")
     for attempt in range(1, max(1, attempts) + 1):
         try:
             if use_ssl:
@@ -645,13 +647,15 @@ async def _verify_bridge_login(
                         for line in (resp.lines or [])
                     ) or resp.result
                     last_detail = detail
-                    if (
-                        "too many login attempts" in detail.lower()
-                        and attempt < attempts
-                    ):
+                    detail_lc = detail.lower()
+                    is_transient = any(
+                        marker in detail_lc for marker in transient_markers
+                    )
+                    if is_transient and attempt < attempts:
                         LOGGER.info(
-                            "bridge IMAP login attempt %d/%d hit rate "
-                            "limit (%s); sleeping %ss before retry",
+                            "bridge IMAP login attempt %d/%d hit "
+                            "transient error (%s); sleeping %ss before "
+                            "retry",
                             attempt,
                             attempts,
                             detail,
@@ -1413,7 +1417,7 @@ async def _perform_bridge_add_account(
         imap_username=creds.imap_username,
         imap_password=creds.imap_password,
         smoke_test_tempmail=tempmail,
-        pre_probe_settle_seconds=15.0,
+        pre_probe_settle_seconds=30.0,
     )
 
 
@@ -1604,7 +1608,7 @@ async def connect_bridge_captcha(
                 imap_username=creds.imap_username,
                 imap_password=creds.imap_password,
                 smoke_test_tempmail=user_data.get("bridge_smoke_tempmail"),
-                pre_probe_settle_seconds=15.0,
+                pre_probe_settle_seconds=30.0,
             )
 
 
