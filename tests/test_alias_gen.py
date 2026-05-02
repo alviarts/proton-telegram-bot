@@ -1,6 +1,8 @@
 """Unit tests for the sequential alias generator."""
 from __future__ import annotations
 
+import random
+
 import pytest
 
 from proton_telegram_bot.alias_gen import (
@@ -12,6 +14,7 @@ from proton_telegram_bot.alias_gen import (
     generate_batch,
     increment_suffix,
     name_at,
+    random_suffix_names,
 )
 
 # ---------------------------------------------------------------- increment_suffix
@@ -159,3 +162,59 @@ def test_uppercase_base_normalized_to_lower() -> None:
     """Uppercase is OK as input but normalized so generated names stay lowercase."""
     names, _ = generate_batch("VIELZ", GenState("", 1), count=1)
     assert names == ["vielz001"]
+
+
+# -------------------------------------------------------------- random_suffix_names
+
+
+def test_random_suffix_names_default_2_digits_for_small_count() -> None:
+    """Per user request: small batches use 2-digit suffixes (vielz88311)."""
+    names = random_suffix_names("vielz883", 20, rng=random.Random(0))
+    assert len(names) == 20
+    assert len({name for name in names}) == 20  # all distinct
+    for name in names:
+        assert name.startswith("vielz883")
+        suffix = name[len("vielz883") :]
+        assert len(suffix) == 2 and suffix.isdigit()
+
+
+def test_random_suffix_names_distinct_after_shuffle() -> None:
+    """Sampling without replacement: every suffix is unique inside one call."""
+    names = random_suffix_names("v", 100, rng=random.Random(42))
+    assert len(set(names)) == 100
+
+
+def test_random_suffix_names_widens_to_3_digits_for_count_above_100() -> None:
+    """Width auto-scales when 2 digits can't cover the requested count."""
+    names = random_suffix_names("v", 150, rng=random.Random(1))
+    for name in names:
+        suffix = name[len("v") :]
+        assert len(suffix) == 3 and suffix.isdigit()
+
+
+def test_random_suffix_names_normalises_uppercase_base() -> None:
+    """Same base validation as the sequential generator."""
+    names = random_suffix_names("VIELZ", 5, rng=random.Random(2))
+    for name in names:
+        assert name.startswith("vielz")
+
+
+def test_random_suffix_names_rejects_zero_count() -> None:
+    with pytest.raises(AliasGenError):
+        random_suffix_names("v", 0)
+
+
+def test_random_suffix_names_rejects_count_above_max_batch() -> None:
+    with pytest.raises(AliasGenError):
+        random_suffix_names("v", MAX_BATCH + 1)
+
+
+def test_random_suffix_names_seeded_rng_is_deterministic() -> None:
+    """Two calls with the same seed produce the same shuffle order — useful
+    for replayable behaviour in case we ever need to debug an outage.
+    """
+    rng_a = random.Random(123)
+    rng_b = random.Random(123)
+    assert random_suffix_names("v", 30, rng=rng_a) == random_suffix_names(
+        "v", 30, rng=rng_b
+    )

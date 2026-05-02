@@ -639,3 +639,45 @@ async def test_browser_handle_cleared_on_normal_completion(
     )
 
     assert "browser" not in handle
+
+
+# ---------------------------------------------------------------- random suffix
+
+
+async def test_run_batch_random_suffix_uses_2_digit_pool(
+    db_and_primary, cipher: CredentialCipher
+) -> None:
+    """``random_suffix=True`` produces ``<base><NN>`` names from the
+    randomized pool described in :func:`alias_gen.random_suffix_names`,
+    skips the cursor-state machinery, and persists nothing into
+    ``generator_state`` (no monotonic cursor exists for random mode).
+    """
+    db, chat_id, primary = db_and_primary
+    browser, factory = _factory([CreationStatus.SUCCESS] * 20)
+
+    summary = await run_batch(
+        db=db,
+        cipher=cipher,
+        chat_id=chat_id,
+        primary=primary,
+        base="vielz883",
+        count=20,
+        domain="proton.me",
+        browser_factory=factory,
+        random_suffix=True,
+    )
+
+    assert len(summary.created) == 20
+    # Every requested name has the form vielz883NN where NN is 2 digits.
+    for local in browser.calls:
+        assert local.startswith("vielz883")
+        suffix = local[len("vielz883") :]
+        assert len(suffix) == 2 and suffix.isdigit(), (
+            f"unexpected name shape: {local!r}"
+        )
+    # All distinct within one batch.
+    assert len(set(browser.calls)) == len(browser.calls)
+    # No cursor was persisted because random mode bypasses generator_state.
+    state = await db.get_generator_state(chat_id, primary.id, "vielz883")
+    # Default state is GenState("", 1) — i.e. unchanged from the empty DB.
+    assert state == GenState("", 1)
