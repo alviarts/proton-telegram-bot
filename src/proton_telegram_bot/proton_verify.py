@@ -288,6 +288,11 @@ async def change_recovery_email(
         await email_input.fill(new_email)
         logger.info("filled recovery email input with %s", new_email)
     except Exception:
+        change_recovery_email.last_failure = {  # type: ignore[attr-defined]
+            "step": "fill_email",
+            "url": page.url,
+            "screenshot": await _dump_page(page, "recovery_failed_fill_email"),
+        }
         logger.error("could not find or fill recovery email input")
         return None
 
@@ -299,6 +304,11 @@ async def change_recovery_email(
         await save_buttons.first.click()
         logger.info("clicked Simpan button")
     except Exception:
+        change_recovery_email.last_failure = {  # type: ignore[attr-defined]
+            "step": "click_simpan",
+            "url": page.url,
+            "screenshot": await _dump_page(page, "recovery_failed_simpan"),
+        }
         logger.error("could not click Simpan button")
         return None
 
@@ -349,6 +359,11 @@ async def change_recovery_email(
         await verify_link.click()
         logger.info("clicked Verifikasi link")
     except Exception:
+        change_recovery_email.last_failure = {  # type: ignore[attr-defined]
+            "step": "click_verifikasi",
+            "url": page.url,
+            "screenshot": await _dump_page(page, "recovery_failed_verifikasi_link"),
+        }
         logger.warning("could not find Verifikasi link; email may already be verified")
         return None
 
@@ -364,6 +379,11 @@ async def change_recovery_email(
         await verify_email_btn.click()
         logger.info("clicked 'Verifikasi melalui email'")
     except Exception:
+        change_recovery_email.last_failure = {  # type: ignore[attr-defined]
+            "step": "click_verify_via_email",
+            "url": page.url,
+            "screenshot": await _dump_page(page, "recovery_failed_verify_via_email"),
+        }
         logger.error("could not find 'Verifikasi melalui email' button")
         return None
 
@@ -373,6 +393,11 @@ async def change_recovery_email(
     logger.info("polling temp mail %s for verification link...", tempmail.address)
     verify_link_url = await tempmail.wait_for_verify_link(client, max_attempts=60)
     if verify_link_url is None:
+        change_recovery_email.last_failure = {  # type: ignore[attr-defined]
+            "step": "poll_verify_link",
+            "url": page.url,
+            "screenshot": await _dump_page(page, "recovery_failed_poll_link"),
+        }
         logger.error("timed out waiting for recovery verification link")
         return None
 
