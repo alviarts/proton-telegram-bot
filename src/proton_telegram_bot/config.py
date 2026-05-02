@@ -47,6 +47,10 @@ class Settings(BaseSettings):
         default=Path("scripts/bridge_decrypt_vault.py"),
         alias="BRIDGE_DECRYPT_VAULT_SCRIPT",
     )
+    bridge_vault_remove_user_script: Path = Field(
+        default=Path("scripts/bridge_vault_remove_user.py"),
+        alias="BRIDGE_VAULT_REMOVE_USER_SCRIPT",
+    )
     bridge_vault_path: Path = Field(
         default=Path("/root/.config/protonmail/bridge-v3/vault.enc"),
         alias="BRIDGE_VAULT_PATH",
