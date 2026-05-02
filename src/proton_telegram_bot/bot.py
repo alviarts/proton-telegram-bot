@@ -607,6 +607,7 @@ async def _verify_bridge_login(
     use_ssl: bool,
     attempts: int = 1,
     backoff_seconds: float = 5.0,
+    rate_limit_backoff_seconds: float = 75.0,
 ) -> tuple[bool, str]:
     """Try LOGIN against the user-supplied IMAP creds, with optional retries.
 
@@ -618,9 +619,13 @@ async def _verify_bridge_login(
 
     A freshly added account often needs a few seconds before its IMAP
     listener accepts logins, so callers running this immediately after
-    ``bridge add_account`` should pass ``attempts > 1``. We only retry
-    on connection-level errors (TimeoutError, ConnectionRefused, ...);
-    a "BAD" / "NO" auth response is final.
+    ``bridge add_account`` should pass ``attempts > 1``. We retry on
+    connection-level errors (TimeoutError, ConnectionRefused, ...) and
+    on the Bridge ``"too many login attempts"`` response (which Bridge
+    emits when too many failed LOGINs hit the same account in quick
+    succession — this clears in ~60s on its own); auth-level "Invalid
+    credentials" / "Authentication failed" responses are final and
+    don't trigger a retry.
     """
     last_detail = ""
     for attempt in range(1, max(1, attempts) + 1):
@@ -639,6 +644,21 @@ async def _verify_bridge_login(
                         else str(line)
                         for line in (resp.lines or [])
                     ) or resp.result
+                    last_detail = detail
+                    if (
+                        "too many login attempts" in detail.lower()
+                        and attempt < attempts
+                    ):
+                        LOGGER.info(
+                            "bridge IMAP login attempt %d/%d hit rate "
+                            "limit (%s); sleeping %ss before retry",
+                            attempt,
+                            attempts,
+                            detail,
+                            rate_limit_backoff_seconds,
+                        )
+                        await asyncio.sleep(rate_limit_backoff_seconds)
+                        continue
                     return False, detail
                 try:
                     await client.logout()
@@ -856,6 +876,7 @@ async def _finalize_connect(
     imap_username: str,
     imap_password: str,
     smoke_test_tempmail: TempMailbox | None = None,
+    pre_probe_settle_seconds: float = 0.0,
 ) -> int:
     """Common tail of /connect: verify, save, start listener, friendly reply.
 
@@ -867,6 +888,13 @@ async def _finalize_connect(
     smoke test (send email -> tempmail) after the listener starts. On
     failure the freshly-added primary is rolled back so the user can
     cleanly ``/connect`` again instead of being stuck with broken creds.
+
+    ``pre_probe_settle_seconds`` introduces a wait *before* the IMAP
+    probe so a freshly-added Bridge account has time to finish its
+    initial sync — Bridge accepts IMAP TCP connects immediately on
+    service restart but rejects LOGINs (with ``"too many login
+    attempts"`` after a few tries) until the per-user goroutine is
+    fully up.
     """
     chat = update.effective_chat
     if chat is None:
@@ -876,11 +904,20 @@ async def _finalize_connect(
     port = CONNECT_DEFAULT_PORT
     use_ssl = CONNECT_DEFAULT_SSL
 
+    if pre_probe_settle_seconds > 0:
+        await update.effective_message.reply_text(  # type: ignore[union-attr]
+            f"⏳ Menunggu Bridge selesai inisialisasi "
+            f"<b>{html.escape(email)}</b> "
+            f"({int(pre_probe_settle_seconds)}s)...",
+            parse_mode=ParseMode.HTML,
+        )
+        await asyncio.sleep(pre_probe_settle_seconds)
+
     await update.effective_message.reply_text(  # type: ignore[union-attr]
         f"🔌 Cek login ke Bridge sebagai <b>{html.escape(email)}</b>...",
         parse_mode=ParseMode.HTML,
     )
-    # Retry: a freshly added Bridge account often takes 5–15s before its
+    # Retry: a freshly added Bridge account often takes 5-15s before its
     # IMAP listener fully comes up. The previous one-shot probe failed
     # immediately with TimeoutError on a perfectly valid account.
     ok, detail = await _verify_bridge_login(
@@ -1376,6 +1413,7 @@ async def _perform_bridge_add_account(
         imap_username=creds.imap_username,
         imap_password=creds.imap_password,
         smoke_test_tempmail=tempmail,
+        pre_probe_settle_seconds=15.0,
     )
 
 
@@ -1418,12 +1456,20 @@ async def connect_password(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         LOGGER.warning("vault probe failed: %s", exc)
         existing = None
     if existing is not None:
+        # When existing vault creds are present, the Bridge IMAP server
+        # may still be in a temporary "too many login attempts" lockout
+        # from a previous failed run. Pass attempts=2 so we retry once
+        # after the rate-limit backoff before deciding to re-add the
+        # whole account (which would needlessly redo the recovery-email
+        # flow).
         ok, detail = await _verify_bridge_login(
             host=CONNECT_DEFAULT_HOST,
             port=CONNECT_DEFAULT_PORT,
             username=existing.imap_username,
             password=existing.imap_password,
             use_ssl=CONNECT_DEFAULT_SSL,
+            attempts=2,
+            backoff_seconds=5.0,
         )
         if ok:
             return await _finalize_connect(
@@ -1558,6 +1604,7 @@ async def connect_bridge_captcha(
                 imap_username=creds.imap_username,
                 imap_password=creds.imap_password,
                 smoke_test_tempmail=user_data.get("bridge_smoke_tempmail"),
+                pre_probe_settle_seconds=15.0,
             )
 
 
