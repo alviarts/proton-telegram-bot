@@ -14,6 +14,8 @@ from .crypto import CredentialCipher
 from .db import Database
 from .manager import ListenerManager
 from .proxy_provider import ProxyProvider
+from .watchdog import heartbeat_loop
+from .watchdog import notify as systemd_notify
 
 LOGGER = logging.getLogger(__name__)
 
@@ -49,9 +51,25 @@ async def _post_init(application: Application) -> None:
         )
     except Exception:
         LOGGER.exception("failed to publish bot command menu")
+    # Tell systemd we're up so ``systemctl start`` unblocks, then start
+    # the heartbeat task so a deadlocked event loop trips the unit's
+    # ``WatchdogSec=`` and gets restarted automatically.
+    systemd_notify("READY=1")
+    systemd_notify("STATUS=polling Telegram updates")
+    application.bot_data["watchdog_task"] = asyncio.create_task(
+        heartbeat_loop(), name="systemd-watchdog-heartbeat"
+    )
 
 
 async def _post_shutdown(application: Application) -> None:
+    systemd_notify("STOPPING=1")
+    watchdog_task: asyncio.Task | None = application.bot_data.get("watchdog_task")
+    if watchdog_task is not None and not watchdog_task.done():
+        watchdog_task.cancel()
+        try:
+            await watchdog_task
+        except (asyncio.CancelledError, Exception):
+            pass
     manager: ListenerManager = application.bot_data.get("manager")  # type: ignore[assignment]
     if manager is not None:
         await manager.stop_all()

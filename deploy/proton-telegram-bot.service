@@ -1,23 +1,28 @@
 [Unit]
 Description=Proton Telegram Bot
-After=network.target
+After=network.target protonmail-bridge.service
+Wants=protonmail-bridge.service
 
 [Service]
-Type=simple
-User=botuser
-Group=botuser
+# ``Type=notify`` lets the bot tell systemd it's READY=1 once startup
+# finishes, and lets WatchdogSec=15s detect a hung event loop. The bot
+# spawns an asyncio task that sends WATCHDOG=1 every ~5s — when that
+# stops (deadlock, blocked sync I/O, etc.) systemd kills the unit and
+# Restart=always brings it back up.
+Type=notify
+WatchdogSec=15s
+NotifyAccess=main
+
+User=root
 WorkingDirectory=/opt/proton-telegram-bot
 EnvironmentFile=/opt/proton-telegram-bot/.env
 ExecStart=/opt/proton-telegram-bot/.venv/bin/python -m proton_telegram_bot
-Restart=on-failure
-RestartSec=10
 
-# Hardening
-NoNewPrivileges=yes
-ProtectSystem=strict
-ProtectHome=yes
-ReadWritePaths=/opt/proton-telegram-bot/data
-PrivateTmp=yes
+Restart=always
+RestartSec=5
+
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
