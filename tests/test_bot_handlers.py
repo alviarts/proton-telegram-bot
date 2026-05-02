@@ -42,6 +42,8 @@ def test_build_handlers_registers_new_commands() -> None:
     assert "accounts" in commands
     assert "setprotonpw" in commands
     assert "genaddr" in commands
+    # Health check wiring
+    assert "cekimap" in commands
 
 
 def test_build_handlers_has_setprotonpw_conversation() -> None:
