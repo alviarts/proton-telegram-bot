@@ -33,7 +33,12 @@ from proton_telegram_bot.models import PrimaryAccount
 
 
 def test_post_connect_keyboard_has_all_three_onboarding_buttons() -> None:
-    """Fresh-account keyboard exposes setprotonpw, genaddr, healthcheck."""
+    """Fresh-account keyboard exposes setprotonpw, genaddr, healthcheck.
+
+    With ``alias_count=0`` (the default) the generate button drives a
+    full top-up to :data:`ALIAS_TARGET_PER_PRIMARY` (20), matching the
+    onboarding copy.
+    """
     kb = _build_post_connect_keyboard(primary_id=42)
     rows = kb.inline_keyboard
     callbacks = [btn.callback_data for row in rows for btn in row]
@@ -43,35 +48,61 @@ def test_post_connect_keyboard_has_all_three_onboarding_buttons() -> None:
 
 
 def test_post_connect_keyboard_with_aliases_offers_health_check() -> None:
-    """Existing-aliases keyboard prioritises the Cek listener button."""
-    kb = _build_post_connect_keyboard_with_aliases(primary_id=7, alias_count=20)
+    """Existing-aliases keyboard prioritises the Cek listener button.
+
+    Uses ``alias_count=11`` so the row count includes both the
+    generate top-up button (20-11=9) and the health-check button.
+    """
+    kb = _build_post_connect_keyboard_with_aliases(primary_id=7, alias_count=11)
     rows = kb.inline_keyboard
     callbacks = [btn.callback_data for row in rows for btn in row]
     labels = [btn.text for row in rows for btn in row]
     assert f"{CB_QUICK_HEALTHCHECK}:7" in callbacks
-    # The label must surface the alias count so the user knows what
-    # they're about to validate.
-    assert any("20" in label for label in labels)
+    # The health-check label must surface the alias count so the user
+    # knows what they're about to validate.
+    assert any("11" in label and "alias" in label for label in labels)
 
 
-def test_post_connect_keyboard_with_aliases_offers_genaddr_too() -> None:
-    """User wants to be able to extend an existing-aliases account
-    without retyping the email — the keyboard must include the same
-    "Generate 20 alamat sekarang" button the fresh-account onboarding
-    uses, with ``CB_QUICK_GENADDR:<primary_id>:20`` so the existing
-    callback router runs the random-suffix /genaddr batch.
+def test_post_connect_keyboard_with_aliases_recommends_topup_count() -> None:
+    """User feedback: button should recommend exact missing count, not
+    a hardcoded "20". With 11 aliases out of a 20-target, the button
+    must read "✨ Generate 9 alamat lagi" and route to
+    ``CB_QUICK_GENADDR:<primary_id>:9`` (not :20).
 
     /genaddr and /cekimap use independent ``chat_data`` locks so
     clicking this button while a background health check is running
     is safe.
     """
+    kb = _build_post_connect_keyboard_with_aliases(primary_id=7, alias_count=11)
+    rows = kb.inline_keyboard
+    pairs = [(btn.text, btn.callback_data) for row in rows for btn in row]
+    callbacks = [cb for _, cb in pairs]
+    labels = [text for text, _ in pairs]
+    # Top-up button uses the *missing* count (20-11=9), not the static
+    # ALIAS_TARGET_PER_PRIMARY constant.
+    assert f"{CB_QUICK_GENADDR}:7:9" in callbacks
+    assert any("9" in label and "Generate" in label for label in labels)
+    # /list passthrough is still wired to the picker callback.
+    assert any(
+        cb is not None and cb.startswith("pickp:7") for cb in callbacks
+    )
+
+
+def test_post_connect_keyboard_hides_generate_when_at_target() -> None:
+    """When the primary already has ≥20 aliases, the generate button
+    must be hidden so the user doesn't get a no-op tap. Health check
+    + /list passthrough rows stay because they're still meaningful.
+    """
     kb = _build_post_connect_keyboard_with_aliases(primary_id=7, alias_count=20)
     rows = kb.inline_keyboard
     callbacks = [btn.callback_data for row in rows for btn in row]
-    # All three one-tap actions are reachable.
-    assert f"{CB_QUICK_GENADDR}:7:20" in callbacks
+    # No CB_QUICK_GENADDR row at all — not even a 0-count placeholder.
+    assert not any(
+        cb is not None and cb.startswith(f"{CB_QUICK_GENADDR}:")
+        for cb in callbacks
+    )
+    # The remaining two rows are still reachable.
     assert f"{CB_QUICK_HEALTHCHECK}:7" in callbacks
-    # /list passthrough is still wired to the picker callback.
     assert any(
         cb is not None and cb.startswith("pickp:7") for cb in callbacks
     )

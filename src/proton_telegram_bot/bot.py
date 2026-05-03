@@ -284,9 +284,12 @@ CB_SYNC_PRIMARY = "syncp"
 # the per-primary "🔄 Sync" button finishes, if the alias count for
 # that primary is below this number the bot offers a one-tap "✨
 # Tambah N alamat lagi" button that drives /genaddr in random-suffix
-# mode to top the account up. 21 matches the typical "20 alias + 1
-# primary" shape we've been seeing across the test accounts.
-ALIAS_TARGET_PER_PRIMARY = 21
+# mode to top the account up. 20 = the alias-only target the user
+# specified ("button generate pointnya 20") — primary itself is not
+# counted because the user can't /genaddr a primary, only aliases.
+# Top-up math is therefore a clean ``missing = TARGET - alias_count``
+# that matches what the user sees in /list.
+ALIAS_TARGET_PER_PRIMARY = 20
 
 
 def _is_allowed(settings: Settings, user_id: int | None) -> bool:
@@ -1047,21 +1050,56 @@ async def cmd_sync(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         )
         return ConversationHandler.END
     username, password = args[0], " ".join(args[1:])
-    await update.effective_message.reply_text("Menghubungi Proton API...")  # type: ignore[union-attr]
+    # Anchor a live status button: legacy /sync hits Proton SRP +
+    # CAPTCHA + address fetch and routinely takes 5-30s, so a static
+    # "Menghubungi Proton API..." line leaves the user wondering
+    # whether the bot is still working. We stash the reporter on
+    # ``user_data`` so the CAPTCHA continuation handler
+    # (sync_captcha_done) and the shared finaliser (_sync_complete)
+    # can keep editing the same anchor instead of spawning duplicates.
+    user_data = cast(dict, context.user_data)
+    sync_status: StatusReporter | None = None
+    try:
+        anchor = await update.effective_message.reply_text(  # type: ignore[union-attr]
+            "🔄 <b>Sync alamat Proton</b>\n"
+            "<i>Tombol di bawah memperlihatkan tahap yang sedang "
+            "dikerjakan bot.</i>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=build_status_keyboard("⏳ Mempersiapkan…"),
+        )
+    except Exception:
+        anchor = None
+    if anchor is not None:
+        sync_status = StatusReporter(
+            context.application.bot, chat.id, anchor.message_id
+        )
+        user_data["legacy_sync_status_reporter"] = sync_status
+
+    if sync_status is not None:
+        with contextlib.suppress(Exception):
+            await sync_status.update("🌐 Login Proton API (SRP)…")
     try:
         from .proton_api import CaptchaChallenge, start_auth
 
         result = await asyncio.to_thread(start_auth, username, password)
     except Exception as exc:
         LOGGER.exception("proton API sync failed")
+        if sync_status is not None:
+            with contextlib.suppress(Exception):
+                await sync_status.done("❌ Login Proton gagal")
+            user_data.pop("legacy_sync_status_reporter", None)
         await update.effective_message.reply_text(  # type: ignore[union-attr]
             f"Gagal mengambil alamat dari Proton: {exc}"
         )
         return ConversationHandler.END
 
     if isinstance(result, CaptchaChallenge):
-        user_data = cast(dict, context.user_data)
         user_data["sync_challenge"] = result
+        if sync_status is not None:
+            with contextlib.suppress(Exception):
+                await sync_status.update(
+                    "⏳ Tunggu user selesaikan CAPTCHA Proton…"
+                )
         await update.effective_message.reply_text(  # type: ignore[union-attr]
             "Proton memerlukan verifikasi CAPTCHA.\n\n"
             f"1. Buka link ini di browser:\n{result.web_url}\n\n"
@@ -1078,13 +1116,32 @@ async def sync_captcha_done(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     """Handle user confirming CAPTCHA is solved."""
     user_data = cast(dict, context.user_data)
     challenge = user_data.pop("sync_challenge", None)
+    sync_status: StatusReporter | None = user_data.get(
+        "legacy_sync_status_reporter"
+    )
+
+    async def _status(label: str) -> None:
+        if sync_status is None:
+            return
+        with contextlib.suppress(Exception):
+            await sync_status.update(label)
+
+    async def _status_done(label: str) -> None:
+        if sync_status is None:
+            return
+        with contextlib.suppress(Exception):
+            await sync_status.done(label)
+        user_data.pop("legacy_sync_status_reporter", None)
+
     if challenge is None:
+        await _status_done("❌ Sesi /sync kedaluwarsa")
         await update.effective_message.reply_text("Sesi sync sudah kedaluwarsa. Coba /sync lagi.")  # type: ignore[union-attr]
         return ConversationHandler.END
 
     text = (update.effective_message.text or "").strip().lower()  # type: ignore[union-attr]
     if text == "done":
         # User solved CAPTCHA on the web page; retry with the original token
+        await _status("🔁 Retry autentikasi setelah CAPTCHA…")
         await update.effective_message.reply_text("Mencoba ulang autentikasi...")  # type: ignore[union-attr]
         try:
             from .proton_api import complete_auth_with_captcha
@@ -1094,6 +1151,7 @@ async def sync_captcha_done(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             )
         except Exception as exc:
             LOGGER.exception("CAPTCHA auth retry failed")
+            await _status_done("❌ Auth setelah CAPTCHA gagal")
             await update.effective_message.reply_text(  # type: ignore[union-attr]
                 f"Gagal setelah CAPTCHA: {exc}\nCoba /sync lagi."
             )
@@ -1101,6 +1159,7 @@ async def sync_captcha_done(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return await _sync_complete(update, context, session)
 
     # User sent a captcha response token directly
+    await _status("🔁 Verifikasi token CAPTCHA…")
     await update.effective_message.reply_text("Memverifikasi token CAPTCHA...")  # type: ignore[union-attr]
     try:
         from .proton_api import complete_auth_with_captcha
@@ -1108,6 +1167,7 @@ async def sync_captcha_done(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         session = await asyncio.to_thread(complete_auth_with_captcha, challenge, text)
     except Exception as exc:
         LOGGER.exception("CAPTCHA token auth failed")
+        await _status_done("❌ Token CAPTCHA invalid")
         await update.effective_message.reply_text(  # type: ignore[union-attr]
             f"Token CAPTCHA tidak valid: {exc}\nCoba /sync lagi."
         )
@@ -1478,8 +1538,35 @@ def _build_post_disconnect_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def _topup_label_and_count(alias_count: int) -> tuple[str, int]:
+    """Compute the recommended top-up size for the "✨ Generate …" button.
+
+    User feedback: the old hardcoded "✨ Generate 20 alamat sekarang"
+    button kept showing 20 even when the primary already had 11/20
+    aliases — confusing because the user expected the button to
+    recommend exactly *how many* more they still need ("kan kurang 9").
+
+    Returns ``(label, missing)`` where ``missing`` is the number of
+    aliases to generate to reach :data:`ALIAS_TARGET_PER_PRIMARY`.
+    Caller decides whether to render a row at all — when ``missing``
+    is 0 the button is hidden so the user doesn't get a no-op tap.
+    """
+    missing = max(0, ALIAS_TARGET_PER_PRIMARY - alias_count)
+    if missing == 0:
+        return ("", 0)
+    if alias_count == 0:
+        # Fresh account — keep the original "Generate N alamat
+        # sekarang" wording so the empty-onboarding copy still reads
+        # naturally for first-time users.
+        return (f"✨ Generate {missing} alamat sekarang", missing)
+    return (f"✨ Generate {missing} alamat lagi", missing)
+
+
 def _build_post_connect_keyboard(
-    primary_id: int, *, master_password_saved: bool = False
+    primary_id: int,
+    *,
+    master_password_saved: bool = False,
+    alias_count: int = 0,
 ) -> InlineKeyboardMarkup:
     """Quick-action buttons for an empty newly-connected primary.
 
@@ -1491,6 +1578,11 @@ def _build_post_connect_keyboard(
     :func:`_finalize_connect` succeeded — request #9), the
     "🔐 Simpan password Proton" row is omitted because there's
     nothing left to save.
+
+    ``alias_count`` parameterises the generate-button label so a
+    "fresh" primary that already happened to import some aliases
+    via auto-sync still gets the right top-up recommendation
+    (matches the /list view).
     """
     rows: list[list[InlineKeyboardButton]] = []
     if not master_password_saved:
@@ -1502,14 +1594,16 @@ def _build_post_connect_keyboard(
                 )
             ]
         )
-    rows.append(
-        [
-            InlineKeyboardButton(
-                "✨ Generate 20 alamat sekarang",
-                callback_data=f"{CB_QUICK_GENADDR}:{primary_id}:20",
-            )
-        ]
-    )
+    label, missing = _topup_label_and_count(alias_count)
+    if missing > 0:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    label,
+                    callback_data=f"{CB_QUICK_GENADDR}:{primary_id}:{missing}",
+                )
+            ]
+        )
     rows.append(
         [
             InlineKeyboardButton(
@@ -1530,36 +1624,42 @@ def _build_post_connect_keyboard_with_aliases(
     (auto-sync just imported them, or they were already in the DB from
     an earlier session). Surfaces three one-tap actions:
 
-    1. Generate 20 more random-suffix aliases — same callback the
-       fresh-account onboarding uses, so the user can extend the pool
-       without re-typing the email address. ``/genaddr`` and
-       ``/cekimap`` use independent ``chat_data`` locks
-       (``genaddr_running`` vs ``health_check_running``) so this is
-       safe to click while a background health check is running.
+    1. Generate however-many random-suffix aliases are needed to top
+       the account up to :data:`ALIAS_TARGET_PER_PRIMARY` (20).
+       Examples: 11 aliases → "✨ Generate 9 alamat lagi"; 4 aliases
+       → "✨ Generate 16 alamat lagi"; ≥20 aliases → row hidden so
+       the user doesn't get a no-op tap. Same callback the
+       fresh-account onboarding uses.
     2. Run the end-to-end IMAP listener health check.
     3. Open ``/list`` for this primary.
     """
-    return InlineKeyboardMarkup(
+    rows: list[list[InlineKeyboardButton]] = []
+    label, missing = _topup_label_and_count(alias_count)
+    if missing > 0:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    label,
+                    callback_data=f"{CB_QUICK_GENADDR}:{primary_id}:{missing}",
+                )
+            ]
+        )
+    rows.append(
         [
-            [
-                InlineKeyboardButton(
-                    "✨ Generate 20 alamat sekarang",
-                    callback_data=f"{CB_QUICK_GENADDR}:{primary_id}:20",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    f"🩺 Cek IMAP listener semua {alias_count} alias",
-                    callback_data=f"{CB_QUICK_HEALTHCHECK}:{primary_id}",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "📋 Buka /list", callback_data=f"{CB_PICK_PRIMARY}:{primary_id}"
-                )
-            ],
+            InlineKeyboardButton(
+                f"🩺 Cek IMAP listener semua {alias_count} alias",
+                callback_data=f"{CB_QUICK_HEALTHCHECK}:{primary_id}",
+            )
         ]
     )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "📋 Buka /list", callback_data=f"{CB_PICK_PRIMARY}:{primary_id}"
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
 
 
 SMTP_SMOKE_TIMEOUT_SECONDS = 60
@@ -2082,7 +2182,9 @@ async def _finalize_connect(
             onboarding_text,
             parse_mode=ParseMode.HTML,
             reply_markup=_build_post_connect_keyboard(
-                primary_id, master_password_saved=master_password_saved
+                primary_id,
+                master_password_saved=master_password_saved,
+                alias_count=len(real_aliases),
             ),
         )
     else:
@@ -4415,7 +4517,31 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if primary is None:
             await query.answer("Email utama tidak ditemukan.", show_alert=True)
             return
+        # Disconnect can take 10-30s end-to-end (stop_for_primary →
+        # bridge --cli delete account → bridge restart → DB delete).
+        # Without a live anchor the user just stares at the unchanged
+        # picker message wondering if the bot died — exactly the
+        # complaint that drove the /connect progress indicator. Anchor
+        # the same StatusReporter pattern here so every >3s phase is
+        # narrated. Best-effort: if the anchor send fails (rare) we
+        # silently fall back to the original code path.
+        disconnect_status: StatusReporter | None = None
+        try:
+            anchor = await query.message.reply_text(  # type: ignore[union-attr]
+                f"🗑️ Hapus akun <b>{html.escape(primary.email)}</b>…",
+                parse_mode=ParseMode.HTML,
+                reply_markup=build_status_keyboard("⏳ Mempersiapkan…"),
+            )
+        except Exception:
+            anchor = None
+        if anchor is not None:
+            disconnect_status = StatusReporter(
+                context.application.bot, chat_id, anchor.message_id
+            )
         manager = _bot_manager(context)
+        if disconnect_status is not None:
+            with contextlib.suppress(Exception):
+                await disconnect_status.update("🛑 Stop IMAP listener…")
         await manager.stop_for_primary(primary_id)
         # Best-effort logout from the host Proton Bridge so a future
         # /connect for the same email is a clean slate (no cached
@@ -4424,6 +4550,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         bridge_admin = _bot_bridge_admin(context)
         bridge_removed = False
         if bridge_admin is not None:
+            if disconnect_status is not None:
+                with contextlib.suppress(Exception):
+                    await disconnect_status.update(
+                        "🗑️ Hapus akun dari Proton Bridge vault…"
+                    )
             try:
                 bridge_removed = await bridge_admin.remove_account(primary.email)
             except Exception:
@@ -4431,7 +4562,18 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     "bridge_admin.remove_account failed for %s",
                     primary.email,
                 )
+        if disconnect_status is not None:
+            with contextlib.suppress(Exception):
+                await disconnect_status.update(
+                    "🗄️ Hapus alias + kredensial dari DB…"
+                )
         await db.delete_primary_account(chat_id, primary_id)
+        if disconnect_status is not None:
+            with contextlib.suppress(Exception):
+                await disconnect_status.done(
+                    "✅ Akun dihapus" if bridge_removed or bridge_admin is None
+                    else "⚠️ DB dihapus, Bridge perlu cek manual"
+                )
         if bridge_admin is None:
             suffix = ""
         elif bridge_removed:
