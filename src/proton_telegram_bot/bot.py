@@ -1129,6 +1129,14 @@ async def _maybe_send_lock_reminder(
     msg_id = getattr(msg, "message_id", None)
     if isinstance(msg_id, int):
         chat_data["lock_reminder_msg_id"] = msg_id
+        # Also park the message id in the per-chat transient table so a
+        # future /list pick or /unlock wipes the reminder bubble too,
+        # not just the "🔒 Aktif: …" / "🔓 Kunci dilepas …" notes.
+        db = context.application.bot_data.get("db")
+        if db is not None:
+            await _record_transient_status_message(
+                db, chat.id, msg, "lock_reminder"
+            )
 
 
 async def _show_primary_list(
@@ -3763,11 +3771,13 @@ async def cmd_unlock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await _purge_alias_email_messages(
         context.application.bot, db, chat.id, active.id
     )
-    # Also wipe any previous "🔒 Aktif: …" / "🔓 Kunci dilepas …" notes so the
-    # user only ever sees the single freshest one in the chat.
+    # Also wipe any previous "🔒 Aktif: …" / "🔓 Kunci dilepas …" notes
+    # AND the lock-reminder bubble (kind='lock_reminder') so the user
+    # only ever sees the single freshest confirmation in the chat.
     await _purge_transient_status_messages(
         context.application.bot, db, chat.id
     )
+    cast(dict, context.chat_data).pop("lock_reminder_msg_id", None)
     sent = await update.effective_message.reply_text(  # type: ignore[union-attr]
         f"🔓 Kunci dilepas dari <b>{html.escape(active.email)}</b>. "
         "Pilih alias di /list saat siap menerima email lagi.",
@@ -5577,11 +5587,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 context.application.bot, db, chat_id, current.id
             )
         # Wipe any previous "🔒 Aktif: …" / "🔓 Kunci dilepas …" notes
-        # from earlier picks so the user only ever sees the freshest
-        # confirmation in their chat (they piled up otherwise).
+        # AND any lingering lock-reminder bubble from earlier picks so
+        # the user only ever sees the freshest confirmation in their
+        # chat (they piled up otherwise).
         await _purge_transient_status_messages(
             context.application.bot, db, chat_id
         )
+        cast(dict, context.chat_data).pop("lock_reminder_msg_id", None)
         await db.set_active_alias(chat_id, alias.id)
         # Refresh the inline keyboard so the 🔒 marker moves to the new alias
         # in-place (no second list message clutter).
@@ -5643,10 +5655,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await _purge_alias_email_messages(
             context.application.bot, db, chat_id, active.id
         )
-        # Wipe any older "🔒 Aktif: …" / "🔓 Kunci dilepas …" confirmations
-        # from prior picks so only this in-place bubble remains.
+        # Wipe older 'lock' / 'unlock' confirmations only — NOT the
+        # lock_reminder bubble itself, since we're about to edit-in-place.
+        # If we wiped 'lock_reminder' we'd delete the very message we're
+        # editing and the user would see an empty chat.
         await _purge_transient_status_messages(
-            context.application.bot, db, chat_id
+            context.application.bot, db, chat_id, kinds=("lock", "unlock")
         )
         edited_ok = False
         with contextlib.suppress(BadRequest, Exception):
@@ -5656,8 +5670,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 parse_mode=ParseMode.HTML,
             )
             edited_ok = True
-        # Track the edited bubble itself so a follow-up alias pick can
-        # also wipe it.
+        # The bubble that USED to be a 'lock_reminder' is now an
+        # 'unlock' confirmation. Drop the old row and re-record under
+        # the new kind so the next /list pick wipes it correctly.
+        await db.pop_transient_status_message_ids(
+            chat_id, kinds=("lock_reminder",)
+        )
         if edited_ok and query.message is not None:
             await _record_transient_status_message(
                 db, chat_id, query.message, "unlock"
@@ -5669,6 +5687,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         # itself so the chat doesn't accumulate stale prompts.
         chat_data = cast(dict, context.chat_data)
         chat_data.pop("lock_reminder_msg_id", None)
+        # Drop the row in transient_status_messages too so a follow-up
+        # /list pick doesn't try (and silently fail) to re-delete the
+        # already-gone bubble.
+        await db.pop_transient_status_message_ids(
+            chat_id, kinds=("lock_reminder",)
+        )
         with contextlib.suppress(BadRequest, Exception):
             await query.delete_message()
         await _show_primary_list(update, db, chat_id)
