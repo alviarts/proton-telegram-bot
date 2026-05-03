@@ -168,6 +168,22 @@ CREATE TABLE IF NOT EXISTS forwarded_emails (
     FOREIGN KEY(alias_id) REFERENCES aliases(id) ON DELETE CASCADE
 );
 
+-- Telegram message ids of bot-sent "transient" status messages — the
+-- "🔒 Aktif: …" and "🔓 Kunci dilepas …" confirmations the bot posts
+-- on every alias switch / unlock. We pop & delete them on the NEXT
+-- switch so the user only ever sees ONE such confirmation in the chat,
+-- never a wall of old lock/unlock notes from previous picks.
+-- ``kind`` is a small free-form tag ('lock', 'unlock', …) so future
+-- transient categories can reuse the same table without a schema bump.
+CREATE TABLE IF NOT EXISTS transient_status_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'lock',
+    sent_at TEXT NOT NULL,
+    FOREIGN KEY(chat_id) REFERENCES users(chat_id) ON DELETE CASCADE
+);
+
 CREATE INDEX IF NOT EXISTS idx_aliases_chat_status ON aliases(chat_id, status);
 CREATE INDEX IF NOT EXISTS idx_primary_chat ON primary_accounts(chat_id);
 CREATE INDEX IF NOT EXISTS idx_alias_senders_alias ON alias_senders(alias_id);
@@ -1093,6 +1109,56 @@ class Database:
                 "WHERE chat_id = ? AND alias_id = ?",
                 (chat_id, alias_id),
             )
+            await self.conn.commit()
+        return message_ids
+
+    # ---------------------------------------------- transient_status_messages
+
+    async def record_transient_status_message(
+        self, chat_id: int, message_id: int, kind: str = "lock"
+    ) -> None:
+        """Track a bot-sent status confirmation (``🔒 Aktif: …`` / ``🔓 Kunci dilepas …``)
+        so the *next* alias-switch can wipe it from the chat. ``kind`` is a free-form
+        tag — current callers pass ``'lock'`` or ``'unlock'`` but the column accepts
+        any string for forward compatibility."""
+        await self.conn.execute(
+            "INSERT INTO transient_status_messages "
+            "(chat_id, message_id, kind, sent_at) VALUES (?, ?, ?, ?)",
+            (chat_id, message_id, kind, _utcnow()),
+        )
+        await self.conn.commit()
+
+    async def pop_transient_status_message_ids(
+        self, chat_id: int, *, kinds: tuple[str, ...] | None = None
+    ) -> list[int]:
+        """Return every recorded ``message_id`` for ``chat_id`` and delete the
+        rows. If ``kinds`` is given, only rows whose ``kind`` is in that tuple
+        are popped (others are left alone). With ``kinds=None`` ALL transient
+        rows for the chat are popped."""
+        if kinds:
+            placeholders = ",".join("?" * len(kinds))
+            select_sql = (
+                "SELECT message_id FROM transient_status_messages "
+                f"WHERE chat_id = ? AND kind IN ({placeholders})"
+            )
+            delete_sql = (
+                "DELETE FROM transient_status_messages "
+                f"WHERE chat_id = ? AND kind IN ({placeholders})"
+            )
+            params: tuple = (chat_id, *kinds)
+        else:
+            select_sql = (
+                "SELECT message_id FROM transient_status_messages WHERE chat_id = ?"
+            )
+            delete_sql = (
+                "DELETE FROM transient_status_messages WHERE chat_id = ?"
+            )
+            params = (chat_id,)
+        async with self.conn.execute(select_sql, params) as cursor:
+            rows = await cursor.fetchall()
+        message_ids = [row["message_id"] for row in rows]
+        if message_ids:
+            await self.conn.execute(delete_sql, params)
             await self.conn.commit()
         return message_ids
 

@@ -387,6 +387,59 @@ async def _purge_alias_email_messages(
     return deleted
 
 
+async def _purge_transient_status_messages(
+    bot, db: Database, chat_id: int, *, kinds: tuple[str, ...] | None = None
+) -> int:
+    """Delete every previously-recorded ``🔒 Aktif: …`` / ``🔓 Kunci dilepas …``
+    confirmation message in the chat. Called right BEFORE the bot posts a fresh
+    confirmation on alias-switch / unlock so the user only ever sees ONE such
+    message at a time, never a stack of stale ones from previous picks.
+
+    Returns the number of messages actually deleted from Telegram. Rows are
+    popped regardless so >48h-old messages don't keep being retried forever.
+    """
+    message_ids = await db.pop_transient_status_message_ids(chat_id, kinds=kinds)
+    if not message_ids:
+        return 0
+    deleted = 0
+    for mid in message_ids:
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=mid)
+            deleted += 1
+        except Exception:
+            LOGGER.debug(
+                "delete_message (transient) failed chat=%s mid=%s",
+                chat_id,
+                mid,
+                exc_info=True,
+            )
+    return deleted
+
+
+async def _record_transient_status_message(
+    db: Database, chat_id: int, message: object | None, kind: str
+) -> None:
+    """Best-effort: write the just-sent confirmation's ``message_id`` into
+    ``transient_status_messages`` so the next alias-switch can wipe it.
+    Failures (network blip, DB locked) are swallowed — they only mean the
+    next switch leaves an extra leftover message, never a crash."""
+    if message is None:
+        return
+    mid = getattr(message, "message_id", None)
+    if mid is None:
+        return
+    try:
+        await db.record_transient_status_message(chat_id, mid, kind)
+    except Exception:
+        LOGGER.debug(
+            "record_transient_status_message failed chat=%s mid=%s kind=%s",
+            chat_id,
+            mid,
+            kind,
+            exc_info=True,
+        )
+
+
 def _bot_bridge_admin(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> BridgeAdmin | None:
@@ -3710,11 +3763,17 @@ async def cmd_unlock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await _purge_alias_email_messages(
         context.application.bot, db, chat.id, active.id
     )
-    await update.effective_message.reply_text(  # type: ignore[union-attr]
+    # Also wipe any previous "🔒 Aktif: …" / "🔓 Kunci dilepas …" notes so the
+    # user only ever sees the single freshest one in the chat.
+    await _purge_transient_status_messages(
+        context.application.bot, db, chat.id
+    )
+    sent = await update.effective_message.reply_text(  # type: ignore[union-attr]
         f"🔓 Kunci dilepas dari <b>{html.escape(active.email)}</b>. "
         "Pilih alias di /list saat siap menerima email lagi.",
         parse_mode=ParseMode.HTML,
     )
+    await _record_transient_status_message(db, chat.id, sent, "unlock")
 
 
 @_gate
@@ -5517,6 +5576,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await _purge_alias_email_messages(
                 context.application.bot, db, chat_id, current.id
             )
+        # Wipe any previous "🔒 Aktif: …" / "🔓 Kunci dilepas …" notes
+        # from earlier picks so the user only ever sees the freshest
+        # confirmation in their chat (they piled up otherwise).
+        await _purge_transient_status_messages(
+            context.application.bot, db, chat_id
+        )
         await db.set_active_alias(chat_id, alias.id)
         # Refresh the inline keyboard so the 🔒 marker moves to the new alias
         # in-place (no second list message clutter).
@@ -5532,7 +5597,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     )
                 except Exception:
                     pass
-        await query.message.reply_text(  # type: ignore[union-attr]
+        sent_lock = await query.message.reply_text(  # type: ignore[union-attr]
             # Wrap the alias in ``<code>`` so Telegram mobile users can
             # tap-to-copy directly from the lock-confirmation header. Desktop
             # users get the "📋 Copy email aktif" button below for one-click
@@ -5547,6 +5612,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             parse_mode=ParseMode.HTML,
             reply_markup=_build_poll_now_keyboard(with_copy_active=True),
         )
+        await _record_transient_status_message(db, chat_id, sent_lock, "lock")
         return
     if data == CB_POLL_NOW:
         manager = _bot_manager(context)
@@ -5577,11 +5643,24 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await _purge_alias_email_messages(
             context.application.bot, db, chat_id, active.id
         )
+        # Wipe any older "🔒 Aktif: …" / "🔓 Kunci dilepas …" confirmations
+        # from prior picks so only this in-place bubble remains.
+        await _purge_transient_status_messages(
+            context.application.bot, db, chat_id
+        )
+        edited_ok = False
         with contextlib.suppress(BadRequest, Exception):
             await query.edit_message_text(
                 f"🔓 Kunci dilepas dari <b>{html.escape(active.email)}</b>. "
                 "Pilih alias di /list saat siap menerima email lagi.",
                 parse_mode=ParseMode.HTML,
+            )
+            edited_ok = True
+        # Track the edited bubble itself so a follow-up alias pick can
+        # also wipe it.
+        if edited_ok and query.message is not None:
+            await _record_transient_status_message(
+                db, chat_id, query.message, "unlock"
             )
         return
     if data == CB_LOCK_REMINDER_PICK_NEW:

@@ -530,3 +530,29 @@ async def test_forwarded_emails_record_and_pop(db: Database) -> None:
     assert await db.pop_forwarded_email_message_ids(1, alias_a.id) == []
     # Other alias' rows are untouched.
     assert await db.pop_forwarded_email_message_ids(1, alias_b.id) == [200]
+
+
+async def test_transient_status_messages_record_and_pop(db: Database) -> None:
+    """``record_transient_status_message`` + ``pop_transient_status_message_ids``
+    underpin the wipe-old-confirmations behavior on alias-switch.
+    """
+    await db.upsert_user(1)
+    await db.upsert_user(2)
+
+    await db.record_transient_status_message(1, 10, "lock")
+    await db.record_transient_status_message(1, 11, "lock")
+    await db.record_transient_status_message(1, 12, "unlock")
+    await db.record_transient_status_message(2, 99, "lock")
+
+    # Pop just 'lock' kind for chat 1 — leaves the unlock row alone.
+    popped_lock = await db.pop_transient_status_message_ids(1, kinds=("lock",))
+    assert sorted(popped_lock) == [10, 11]
+    assert await db.pop_transient_status_message_ids(1, kinds=("lock",)) == []
+
+    # The unlock row is still there for chat 1.
+    popped_all_chat1 = await db.pop_transient_status_message_ids(1)
+    assert popped_all_chat1 == [12]
+
+    # Other chats untouched.
+    assert await db.pop_transient_status_message_ids(2) == [99]
+    assert await db.pop_transient_status_message_ids(2) == []
