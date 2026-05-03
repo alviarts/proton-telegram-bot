@@ -216,6 +216,81 @@ class StatusReporter:
                 exc_info=True,
             )
 
+    async def relocate(self, new_message_id: int) -> None:
+        """Move the status keyboard to ``new_message_id``.
+
+        Why this exists:
+
+        The user complained that during /connect the status anchor
+        stays at the *top* of the chat (where it was first sent by
+        ``_ensure_connect_progress``) while subsequent log messages
+        — "Tambah akun Proton baru…", "Step 1/2", "Auto-isi…",
+        "Step 2/2", "Bridge add-account…" — pile up *underneath* it.
+        That forced the user to scroll up to see the live progress
+        button, defeating the whole point of the live indicator
+        ("lho ko disitu selalu berada di paling baru tombol bridge
+        account"). Re-anchoring after every new log keeps the
+        button at the chat tail, right above the input field, where
+        the user is already looking.
+
+        Implementation:
+
+        * Attach the keyboard to the new message *first*. If
+          Telegram rejects that edit (rare — message gone, network
+          hiccup), the old anchor stays intact so we don't lose
+          progress visibility.
+        * Then strip the keyboard from the old anchor so we never
+          have two "🔧 Bridge add-account…" buttons in the chat at
+          the same time.
+        * Finally update ``self._message_id`` so future ``update()``
+          / ``done()`` calls edit the *new* anchor.
+
+        Caller is responsible for ``new_message_id`` referring to a
+        message that was sent to the same ``chat_id`` and is still
+        live (Telegram rejects edits on messages older than 48h,
+        but for typical /connect flows that's never an issue).
+        """
+        if self._closed:
+            return
+        async with self._lock:
+            old_message_id = self._message_id
+            if old_message_id == new_message_id:
+                return
+            label = self._last_label or self._idle_label
+            try:
+                await self._bot.edit_message_reply_markup(
+                    chat_id=self._chat_id,
+                    message_id=new_message_id,
+                    reply_markup=build_status_keyboard(
+                        label, extra_rows=self._extra_rows or None
+                    ),
+                )
+            except Exception:
+                LOGGER.debug(
+                    "status reporter relocate-attach failed for "
+                    "chat=%s msg=%s",
+                    self._chat_id,
+                    new_message_id,
+                    exc_info=True,
+                )
+                return  # leave old anchor intact
+            try:
+                await self._bot.edit_message_reply_markup(
+                    chat_id=self._chat_id,
+                    message_id=old_message_id,
+                    reply_markup=None,
+                )
+            except Exception:
+                LOGGER.debug(
+                    "status reporter relocate-detach failed for "
+                    "chat=%s msg=%s",
+                    self._chat_id,
+                    old_message_id,
+                    exc_info=True,
+                )
+            self._message_id = new_message_id
+            self._last_edit_at = time.monotonic()
+
 
 async def on_status_button_noop(
     update: Any, _context: ContextTypes.DEFAULT_TYPE

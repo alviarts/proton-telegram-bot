@@ -208,6 +208,100 @@ async def test_async_context_manager_finalises_on_exit() -> None:
 
 
 @pytest.mark.asyncio
+async def test_relocate_moves_keyboard_to_new_message() -> None:
+    """``relocate()`` must (1) attach the keyboard to the new message
+    with the *current* label, (2) strip the keyboard from the old
+    message, and (3) update ``message_id`` so subsequent ``update()``
+    calls hit the new anchor.
+
+    Locks in the user-visible behavior — the live progress button
+    "follows" each new log line down to the chat tail instead of
+    staying stuck at the top of the chat.
+    """
+    bot = _FakeBot()
+    reporter = StatusReporter(
+        bot,  # type: ignore[arg-type]
+        chat_id=1,
+        message_id=100,
+        update_interval_s=0.0,
+    )
+    await reporter.update("🔌 phase A")  # first label, on msg 100
+    await reporter.relocate(200)
+    # The relocate path emits exactly two edits in order: attach to
+    # the new message, then strip from the old.
+    last_two = bot.edits[-2:]
+    assert last_two[0].message_id == 200
+    assert _button_label(last_two[0].reply_markup) == "🔌 phase A"
+    assert last_two[1].message_id == 100
+    assert last_two[1].reply_markup is None
+    # And future updates should hit the new anchor.
+    await reporter.update("🔌 phase B", force=True)
+    assert bot.edits[-1].message_id == 200
+    assert _button_label(bot.edits[-1].reply_markup) == "🔌 phase B"
+
+
+@pytest.mark.asyncio
+async def test_relocate_to_same_message_is_noop() -> None:
+    """Re-anchoring to the same message id must NOT churn edits — that
+    would constantly delete and re-attach the keyboard on every
+    duplicate-suppressed log line, causing visible flicker.
+    """
+    bot = _FakeBot()
+    reporter = StatusReporter(
+        bot,  # type: ignore[arg-type]
+        chat_id=1,
+        message_id=100,
+        update_interval_s=0.0,
+    )
+    await reporter.update("🔌 phase A")
+    edits_before = len(bot.edits)
+    await reporter.relocate(100)
+    assert len(bot.edits) == edits_before
+
+
+@pytest.mark.asyncio
+async def test_relocate_keeps_old_anchor_if_new_attach_fails() -> None:
+    """If Telegram rejects the attach to the new message (network,
+    deleted, …) the old anchor must stay intact — losing the live
+    button mid-flow is worse than a duplicate."""
+
+    @dataclass
+    class _FlakyBot(_FakeBot):
+        attached_msg_id: int | None = None
+
+        async def edit_message_reply_markup(  # type: ignore[override]
+            self,
+            *,
+            chat_id: int,
+            message_id: int,
+            reply_markup: Any = None,
+        ) -> None:
+            # Reject attaches to the *new* message id only; allow the
+            # detach on the old anchor (which we never reach if the
+            # attach failed first).
+            if message_id == 999:
+                raise RuntimeError("attach rejected")
+            self.edits.append(
+                _Edit(chat_id=chat_id, message_id=message_id, reply_markup=reply_markup)
+            )
+
+    bot = _FlakyBot()
+    reporter = StatusReporter(
+        bot,  # type: ignore[arg-type]
+        chat_id=1,
+        message_id=100,
+        update_interval_s=0.0,
+    )
+    await reporter.update("🔌 phase A")
+    await reporter.relocate(999)
+    # Internal pointer must NOT have moved.
+    assert reporter.message_id == 100
+    # And future updates must still target the original anchor.
+    await reporter.update("🔌 phase B", force=True)
+    assert bot.edits[-1].message_id == 100
+
+
+@pytest.mark.asyncio
 async def test_on_status_button_noop_acks_silently() -> None:
     answered: list[bool] = []
 
