@@ -112,6 +112,7 @@ class StatusReporter:
         message_id: int,
         *,
         idle_label: str = DEFAULT_IDLE_LABEL,
+        initial_label: str | None = None,
         update_interval_s: float = STATUS_UPDATE_INTERVAL_S,
         extra_rows: list[list[InlineKeyboardButton]] | None = None,
     ) -> None:
@@ -125,7 +126,20 @@ class StatusReporter:
         self._extra_rows: list[list[InlineKeyboardButton]] = (
             [list(row) for row in extra_rows] if extra_rows else []
         )
-        self._last_label: str | None = None
+        # ``_last_label`` seeds from ``initial_label`` when the caller
+        # already rendered a meaningful label on the anchor message
+        # (e.g. ``build_status_keyboard("⏳ Mempersiapkan…")`` was used
+        # in the ``send_message`` that birthed the anchor). Without
+        # this seed the first :meth:`relocate` — which can fire before
+        # any :meth:`update` if the very first thing the handler does
+        # is send a log line — would fall back to ``idle_label`` and
+        # show ``"✅ Selesai"`` on a button that's actually still
+        # mid-flow. The user reported exactly this: a freshly-started
+        # ``/connect`` showed ``✅ Selesai`` on the keyboard while the
+        # bot was waiting for the user to type their email.
+        self._last_label: str | None = (
+            _truncate_label(initial_label) if initial_label else None
+        )
         self._last_edit_at = 0.0
         self._lock = asyncio.Lock()
         self._closed = False
@@ -289,7 +303,18 @@ class StatusReporter:
                     exc_info=True,
                 )
             self._message_id = new_message_id
-            self._last_edit_at = time.monotonic()
+            # Reset the throttle window so the *very next* :meth:`update`
+            # call goes through immediately. Without this reset the
+            # caller pattern "send a new log line → relocate → set new
+            # phase label" silently dropped the phase label whenever
+            # the relocate's two ``editMessageReplyMarkup`` calls were
+            # less than ``update_interval_s`` apart, leaving the
+            # keyboard showing the previous phase (or worse,
+            # ``✅ Selesai`` from the seed when ``_last_label`` had
+            # never been set). The reset is safe — relocate already
+            # paid the rate-limit cost for this chat, and the next
+            # update is the user-visible label they actually expect.
+            self._last_edit_at = 0.0
 
 
 async def on_status_button_noop(

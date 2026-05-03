@@ -302,6 +302,74 @@ async def test_relocate_keeps_old_anchor_if_new_attach_fails() -> None:
 
 
 @pytest.mark.asyncio
+async def test_initial_label_seeds_first_relocate_label() -> None:
+    """Regression for the user screenshot showing ``"✅ Selesai"`` on a
+    button that was actually waiting for the user's email input.
+
+    The old StatusReporter started with ``_last_label = None``. If the
+    very first thing the handler did was ``relocate()`` (i.e. send a
+    log line *before* any explicit ``update()`` call) the relocate
+    fell back to ``_idle_label`` which defaults to ``"✅ Selesai"`` —
+    making the button claim the task was done while the bot was still
+    waiting on the user. Seeding ``_last_label`` from
+    ``initial_label`` (the same string used in the
+    ``build_status_keyboard`` call that created the anchor) keeps the
+    button consistent across the relocate.
+    """
+    bot = _FakeBot()
+    reporter = StatusReporter(
+        bot,  # type: ignore[arg-type]
+        chat_id=1,
+        message_id=100,
+        initial_label="⏳ Mempersiapkan flow /connect…",
+        update_interval_s=0.0,
+    )
+    # No update() yet — straight to relocate, exactly like the
+    # /connect path that triggered the bug in production.
+    await reporter.relocate(200)
+    last_two = bot.edits[-2:]
+    assert last_two[0].message_id == 200
+    assert _button_label(last_two[0].reply_markup) == "⏳ Mempersiapkan flow /connect…"
+    # Crucially NOT the idle label.
+    assert "Selesai" not in _button_label(last_two[0].reply_markup)
+
+
+@pytest.mark.asyncio
+async def test_relocate_resets_throttle_for_next_update() -> None:
+    """After a relocate the *next* :meth:`update` call must go through
+    immediately even if the throttle interval hasn't elapsed —
+    otherwise the caller pattern "send log → relocate → set new
+    phase label" silently drops the phase label.
+
+    Concretely: ``cmd_connect`` sends Step 1/2 (relocate), then
+    immediately calls ``_set_connect_status('⏳ Tunggu input email
+    Proton…')``. Without the reset, that update was throttled and
+    the keyboard stayed on the previous label (or the seeded
+    "Mempersiapkan…").
+    """
+    bot = _FakeBot()
+    reporter = StatusReporter(
+        bot,  # type: ignore[arg-type]
+        chat_id=1,
+        message_id=100,
+        # Pick a throttle larger than any realistic test wall-clock
+        # so a *failed* implementation (no reset) would clearly skip
+        # the second update.
+        update_interval_s=10.0,
+        initial_label="⏳ Mempersiapkan flow /connect…",
+    )
+    await reporter.relocate(200)
+    edits_after_relocate = len(bot.edits)
+    # Non-forced update — would be throttled if the relocate didn't
+    # reset the throttle timer.
+    await reporter.update("⏳ Tunggu input email Proton…")
+    assert len(bot.edits) == edits_after_relocate + 1
+    final = bot.edits[-1]
+    assert final.message_id == 200
+    assert _button_label(final.reply_markup) == "⏳ Tunggu input email Proton…"
+
+
+@pytest.mark.asyncio
 async def test_on_status_button_noop_acks_silently() -> None:
     answered: list[bool] = []
 

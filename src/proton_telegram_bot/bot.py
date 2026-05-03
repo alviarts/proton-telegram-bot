@@ -758,20 +758,32 @@ async def _ensure_connect_progress(
         user_data["connect_log_tracker"] = tracker
 
     if status is None:
+        initial_label = "⏳ Mempersiapkan flow /connect…"
         try:
             anchor = await update.effective_message.reply_text(  # type: ignore[union-attr]
                 "🔌 <b>Proses /connect berjalan</b>\n"
                 "<i>Tombol di bawah memperlihatkan tahap yang sedang "
-                "dikerjakan bot. Selama tombol berputar, jangan kira bot "
-                "mati — tunggu sampai berubah jadi ✅ Selesai.</i>",
+                "dikerjakan bot. Selama tombol berputar (label berubah-"
+                "ubah), jangan kira bot mati — tunggu sampai akhir flow "
+                "(setelah smoke test sukses) baru tombol berubah jadi "
+                "✅ Selesai.</i>",
                 parse_mode=ParseMode.HTML,
-                reply_markup=build_status_keyboard("⏳ Mempersiapkan…"),
+                reply_markup=build_status_keyboard(initial_label),
             )
         except Exception:
             LOGGER.debug("connect: failed to send status anchor", exc_info=True)
             return tracker, status
         tracker.track(anchor)
-        status = StatusReporter(bot, chat.id, anchor.message_id)
+        # ``initial_label`` seeds StatusReporter._last_label so the very
+        # first :meth:`relocate` (fired by ``_send_connect_log`` when
+        # the next message lands in the chat) doesn't fall back to the
+        # idle "✅ Selesai" label and confuse the user mid-flow.
+        status = StatusReporter(
+            bot,
+            chat.id,
+            anchor.message_id,
+            initial_label=initial_label,
+        )
         user_data["connect_status_reporter"] = status
 
     return tracker, status
@@ -1127,19 +1139,23 @@ async def cmd_sync(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     # can keep editing the same anchor instead of spawning duplicates.
     user_data = cast(dict, context.user_data)
     sync_status: StatusReporter | None = None
+    sync_initial_label = "⏳ Mempersiapkan sync Proton…"
     try:
         anchor = await update.effective_message.reply_text(  # type: ignore[union-attr]
             "🔄 <b>Sync alamat Proton</b>\n"
             "<i>Tombol di bawah memperlihatkan tahap yang sedang "
             "dikerjakan bot.</i>",
             parse_mode=ParseMode.HTML,
-            reply_markup=build_status_keyboard("⏳ Mempersiapkan…"),
+            reply_markup=build_status_keyboard(sync_initial_label),
         )
     except Exception:
         anchor = None
     if anchor is not None:
         sync_status = StatusReporter(
-            context.application.bot, chat.id, anchor.message_id
+            context.application.bot,
+            chat.id,
+            anchor.message_id,
+            initial_label=sync_initial_label,
         )
         user_data["legacy_sync_status_reporter"] = sync_status
 
@@ -4637,17 +4653,21 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         # narrated. Best-effort: if the anchor send fails (rare) we
         # silently fall back to the original code path.
         disconnect_status: StatusReporter | None = None
+        disconnect_initial_label = "⏳ Mempersiapkan hapus akun…"
         try:
             anchor = await query.message.reply_text(  # type: ignore[union-attr]
                 f"🗑️ Hapus akun <b>{html.escape(primary.email)}</b>…",
                 parse_mode=ParseMode.HTML,
-                reply_markup=build_status_keyboard("⏳ Mempersiapkan…"),
+                reply_markup=build_status_keyboard(disconnect_initial_label),
             )
         except Exception:
             anchor = None
         if anchor is not None:
             disconnect_status = StatusReporter(
-                context.application.bot, chat_id, anchor.message_id
+                context.application.bot,
+                chat_id,
+                anchor.message_id,
+                initial_label=disconnect_initial_label,
             )
         manager = _bot_manager(context)
         if disconnect_status is not None:
