@@ -494,6 +494,7 @@ def _build_alias_keyboard_for_primary(
     *,
     page: int = 0,
     page_size: int = LIST_PAGE_SIZE,
+    alias_count: int | None = None,
 ) -> InlineKeyboardMarkup:
     """Drill-down keyboard showing aliases owned by a single primary.
 
@@ -547,6 +548,27 @@ def _build_alias_keyboard_for_primary(
             )
         ]
     )
+    # Smart top-up shortcut: render only when the primary is below
+    # :data:`ALIAS_TARGET_PER_PRIMARY` so a fully-loaded account never
+    # sees a stale top-up button. ``alias_count`` defaults to
+    # ``len(aliases)`` (which is exactly the "(N alias)" header
+    # rendered above this keyboard, e.g. "12 alias"). Wording mirrors
+    # the post-healthcheck prompt — "Tambah N alamat lagi" — so the
+    # user sees a consistent vocabulary across the bot.
+    if alias_count is None:
+        alias_count = len(aliases)
+    topup_missing = max(0, ALIAS_TARGET_PER_PRIMARY - alias_count)
+    if topup_missing > 0:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"✨ Tambah {topup_missing} alamat lagi",
+                    callback_data=(
+                        f"{CB_QUICK_GENADDR}:{primary.id}:{topup_missing}"
+                    ),
+                )
+            ]
+        )
     return InlineKeyboardMarkup(rows)
 
 

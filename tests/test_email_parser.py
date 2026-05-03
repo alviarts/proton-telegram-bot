@@ -206,6 +206,81 @@ def test_format_body_html_does_not_wrap_digits_inside_url() -> None:
     assert "<code>123456</code>" not in out
 
 
+def test_summarize_drops_marketing_footer_from_html_body() -> None:
+    """Regression for the user's screenshot: a Stripe-style HTML body
+    with "Unsubscribe / Unsubscribe Preferences / © Co." footer must
+    have those lines stripped before the body lands in the Telegram
+    summary. Otherwise the actual content gets pushed off-screen.
+    """
+    html_body = (
+        "<p>$104.03 payment to Cognition AI Inc. was unsuccessful again</p>"
+        "<p>We weren't able to charge the credit card you provided.</p>"
+        "<hr>"
+        "<p>Cognition AI Inc.</p>"
+        "<p><a href='https://example.com/u'>Unsubscribe</a></p>"
+        "<p>-</p>"
+        "<p><a href='https://example.com/u/prefs'>Unsubscribe Preferences</a></p>"
+        "<p>© 2026 Cognition AI Inc.</p>"
+    )
+    msg = EmailMessage()
+    msg["From"] = "Cognition AI Inc. <noreply@stripe.com>"
+    msg["To"] = "vielz46@proton.me"
+    msg["Subject"] = "$104.03 payment to Cognition AI Inc. was unsuccessful again"
+    # set_content() handles charset (utf-8) so the © character round-trips.
+    msg.set_content(html_body, subtype="html")
+    parsed = parse_message(msg.as_bytes())
+    summary = summarize(parsed)
+    body = summary["body"]
+    # The actual content survives.
+    assert "$104.03" in body
+    assert "We weren't able to charge" in body
+    # The boilerplate footer is gone.
+    assert "Unsubscribe" not in body
+    assert "Unsubscribe Preferences" not in body
+    assert "© 2026" not in body
+    assert "All rights reserved" not in body
+
+
+def test_summarize_drops_marketing_footer_from_plain_body() -> None:
+    """Same regression but for an email that arrives as text/plain —
+    the footer-stripper must run on plain bodies too. Otherwise a
+    plain-text marketing email shows the boilerplate while the HTML
+    sibling does not, which would be inconsistent.
+    """
+    body = (
+        "Hi audy,\n\n"
+        "Your invoice INV-1234 is now paid.\n\n"
+        "--\n"
+        "Unsubscribe\n"
+        "Unsubscribe Preferences\n"
+        "Cognition AI Inc.\n"
+        "© 2026 Cognition AI Inc.\n"
+    )
+    msg = EmailMessage()
+    msg["From"] = "billing@stripe.com"
+    msg["To"] = "vielz46@proton.me"
+    msg["Subject"] = "Invoice paid"
+    msg.set_content(body)
+    parsed = parse_message(msg.as_bytes())
+    summary = summarize(parsed)
+    rendered = summary["body"]
+    assert "Your invoice INV-1234" in rendered
+    assert "Unsubscribe" not in rendered
+    assert "© 2026" not in rendered
+
+
+def test_collapse_blank_lines_drops_decorator_only_lines() -> None:
+    """Lines that contain only punctuation / decorators (e.g. ``"---"``,
+    ``"  -  "``, ``"==="``) eat valuable space in Telegram for zero
+    information. They get replaced by a blank line so paragraph
+    boundaries survive without the decorator itself."""
+    src = "Halo\n---\nDunia\n  -  \nFoo\n===\nBar"
+    out = collapse_blank_lines(src)
+    assert "---" not in out
+    assert "===" not in out
+    assert "Halo" in out and "Dunia" in out and "Foo" in out and "Bar" in out
+
+
 def test_summarize_html_only_returns_clean_text_no_tags() -> None:
     """Regression: an HTML-only body must NOT leak raw <div>/<p> markup to Telegram."""
     msg = EmailMessage()
