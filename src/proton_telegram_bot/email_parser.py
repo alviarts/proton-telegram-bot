@@ -54,35 +54,86 @@ _OTP_RE = re.compile(r"(?<![\w\d])(\d{4,8})(?![\w\d])")
 # Match URLs (http/https). We use this to *skip* OTP wrapping inside URLs:
 # if a 6-digit token shows up in a query string we must NOT inject ``<code>``
 # around it because Telegram won't auto-link a URL that's been interrupted
-# by HTML tags.
-_URL_RE = re.compile(r"https?://[^\s<>\"']+")
+# by HTML tags. Trailing ``)``/``,``/``;`` are excluded from the match so a
+# URL embedded as ``(https://x)`` doesn't end up auto-linking the closing
+# paren too. Trailing ``.`` is allowed (some legit URLs end with ``.``); we
+# strip it as a post-processing step in ``format_body_html`` instead.
+_URL_RE = re.compile(r"https?://[^\s<>\"'\)\]\,;]+")
 
 
 class _HTMLToText(HTMLParser):
-    """Tiny HTML-to-text extractor that preserves line breaks for common tags."""
+    """Tiny HTML-to-text extractor that preserves line breaks for common tags.
+
+    Anchor tags (``<a href="…">visible</a>``) are unwrapped so the URL
+    survives the HTML→text pass — otherwise users would see e.g. just
+    "Verifikasi" with no clickable target. The unwrap rule is:
+
+    * If the visible text is empty → emit just the URL.
+    * If the visible text already contains the URL (or *is* the URL) →
+      emit just the visible text (don't duplicate).
+    * Otherwise → emit ``<visible> (<url>)`` so Telegram's URL
+      auto-linker picks up the bare URL on the next pass.
+
+    Only ``http(s)://`` and ``mailto:`` / ``tel:`` schemes are
+    preserved; everything else (anchors, ``javascript:``, …) is
+    stripped to keep the output trustworthy.
+    """
 
     _BLOCK_TAGS: ClassVar[frozenset[str]] = frozenset({
         "p", "div", "br", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6",
         "blockquote", "pre", "section", "article", "header", "footer",
     })
     _SKIP_TAGS: ClassVar[frozenset[str]] = frozenset({"script", "style", "head", "title"})
+    _ALLOWED_LINK_SCHEMES: ClassVar[tuple[str, ...]] = (
+        "http://",
+        "https://",
+        "mailto:",
+        "tel:",
+    )
 
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self._chunks: list[str] = []
         self._skip_depth = 0
+        # Stack of (href, start_idx_in_chunks). ``start_idx`` is -1 for
+        # anchors we've decided to drop (no useful href).
+        self._link_stack: list[tuple[str, int]] = []
 
-    def handle_starttag(self, tag: str, _attrs: list[tuple[str, str | None]]) -> None:
+    def handle_starttag(
+        self, tag: str, attrs: list[tuple[str, str | None]]
+    ) -> None:
         if tag in self._SKIP_TAGS:
             self._skip_depth += 1
         elif tag == "br":
             self._chunks.append("\n")
+        elif tag == "a":
+            href = ""
+            for k, v in attrs:
+                if k == "href" and v:
+                    href = v.strip()
+                    break
+            if href.startswith(self._ALLOWED_LINK_SCHEMES):
+                self._link_stack.append((href, len(self._chunks)))
+            else:
+                self._link_stack.append(("", -1))
         elif tag in self._BLOCK_TAGS:
             self._chunks.append("\n")
 
     def handle_endtag(self, tag: str) -> None:
         if tag in self._SKIP_TAGS and self._skip_depth > 0:
             self._skip_depth -= 1
+        elif tag == "a" and self._link_stack:
+            href, start_idx = self._link_stack.pop()
+            if href and start_idx >= 0:
+                visible = "".join(self._chunks[start_idx:]).strip()
+                if not visible:
+                    # Empty link → just emit the URL.
+                    self._chunks.append(href)
+                elif href in visible:
+                    # Visible text already contains the URL — leave as-is.
+                    pass
+                else:
+                    self._chunks.append(f" ({href})")
         elif tag in self._BLOCK_TAGS:
             self._chunks.append("\n")
 
@@ -198,6 +249,13 @@ def _strip_email_footer(text: str) -> str:
         normalized = line.strip().lower()
         if not normalized:
             continue
+        # Anchor unwrap (``<a href=…>Unsubscribe</a>`` →
+        # ``Unsubscribe (https://…)``) means a marker line can now
+        # carry a trailing ``(<url>)``. Strip it before comparing so
+        # the footer detector still sees the bare marker word.
+        url_paren = re.match(r"^(.*?)\s*\((?:https?://|mailto:|tel:)[^)]+\)$", normalized)
+        if url_paren:
+            normalized = url_paren.group(1).strip()
         for marker in _FOOTER_MARKERS:
             # Whole-line marker: the line is essentially just the
             # marker (possibly with trailing punctuation/colon).
