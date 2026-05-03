@@ -38,6 +38,79 @@ class BridgeAdminError(Exception):
     """Raised for unrecoverable failures while driving Bridge."""
 
 
+# Hard wall-clock caps for the privileged subprocesses we spawn.
+# Without these, a hung systemd transaction or stuck pexpect helper
+# would block the calling coroutine indefinitely — even
+# ``contextlib.suppress(Exception)`` at the call site doesn't help
+# because we'd be waiting on the kernel, not catching exceptions.
+# The user explicitly asked for "antisipasi error mati": every
+# subprocess that talks to the host must time out cleanly so the
+# error path can run.
+_SYSTEMCTL_TIMEOUT_SECONDS: float = 30.0
+_VAULT_KEY_READ_TIMEOUT_SECONDS: float = 15.0
+_VAULT_REWRITE_TIMEOUT_SECONDS: float = 30.0
+
+
+async def _wait_for_proc(
+    proc: asyncio.subprocess.Process,
+    timeout: float,
+    *,
+    description: str,
+) -> bool:
+    """Wait up to ``timeout`` seconds for ``proc`` to exit, killing it
+    on timeout. Returns ``True`` on clean exit, ``False`` on kill.
+
+    Logs a warning identifying ``description`` so journal readers can
+    tell which subprocess timed out.
+    """
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=timeout)
+        return True
+    except TimeoutError:
+        LOGGER.warning(
+            "%s timed out after %.1fs; killing pid=%s",
+            description,
+            timeout,
+            proc.pid,
+        )
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(proc.wait(), timeout=5.0)
+        return False
+
+
+async def _communicate_with_timeout(
+    proc: asyncio.subprocess.Process,
+    *,
+    timeout: float,
+    description: str,
+    input_bytes: bytes | None = None,
+) -> tuple[bytes, bytes, int | None]:
+    """Wrap ``proc.communicate`` in ``asyncio.wait_for`` with a kill on
+    timeout. Returns ``(stdout, stderr, returncode)``; on timeout
+    ``returncode`` is ``None`` and the streams contain whatever was
+    buffered before we gave up.
+    """
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(input=input_bytes), timeout=timeout
+        )
+        return stdout, stderr, proc.returncode
+    except TimeoutError:
+        LOGGER.warning(
+            "%s timed out after %.1fs; killing pid=%s",
+            description,
+            timeout,
+            proc.pid,
+        )
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(proc.wait(), timeout=5.0)
+        return b"", b"<timed out>", None
+
+
 @dataclasses.dataclass(frozen=True)
 class CaptchaRequired:
     url: str
@@ -218,7 +291,17 @@ class BridgeAdmin:
                 "stop",
                 "protonmail-bridge.service",
             )
-            await stop.wait()
+            stop_clean = await _wait_for_proc(
+                stop,
+                _SYSTEMCTL_TIMEOUT_SECONDS,
+                description="systemctl stop protonmail-bridge.service",
+            )
+            if not stop_clean:
+                # Couldn't stop Bridge in time — the vault may be
+                # locked. Bail out before even trying the rewrite so
+                # we don't corrupt the file. The caller's contextlib
+                # .suppress wrapper turns this into a no-op rollback.
+                return False
             if stop.returncode not in (0, None):
                 LOGGER.warning(
                     "systemctl stop protonmail-bridge.service rc=%s",
@@ -232,11 +315,15 @@ class BridgeAdmin:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
-                raw_key, key_err = await key_proc.communicate()
-                if key_proc.returncode != 0 or not raw_key.strip():
+                raw_key, key_err, key_rc = await _communicate_with_timeout(
+                    key_proc,
+                    timeout=_VAULT_KEY_READ_TIMEOUT_SECONDS,
+                    description="bridge vault key read",
+                )
+                if key_rc != 0 or not raw_key.strip():
                     LOGGER.warning(
                         "vault key read failed (rc=%s): %r",
-                        key_proc.returncode,
+                        key_rc,
                         key_err.decode("utf-8", errors="replace"),
                     )
                     return False
@@ -254,8 +341,12 @@ class BridgeAdmin:
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.PIPE,
                 )
-                _, stderr = await process.communicate(input=raw_key)
-                rc = process.returncode
+                _, stderr, rc = await _communicate_with_timeout(
+                    process,
+                    timeout=_VAULT_REWRITE_TIMEOUT_SECONDS,
+                    description="bridge_vault_remove_user.py",
+                    input_bytes=raw_key,
+                )
                 if rc != 0:
                     LOGGER.warning(
                         "bridge_vault_remove_user.py rc=%s for %s; stderr=%r",
@@ -278,7 +369,11 @@ class BridgeAdmin:
                     "start",
                     "protonmail-bridge.service",
                 )
-                await start.wait()
+                await _wait_for_proc(
+                    start,
+                    _SYSTEMCTL_TIMEOUT_SECONDS,
+                    description="systemctl start protonmail-bridge.service",
+                )
                 if start.returncode not in (0, None):
                     LOGGER.warning(
                         "systemctl start protonmail-bridge.service rc=%s",

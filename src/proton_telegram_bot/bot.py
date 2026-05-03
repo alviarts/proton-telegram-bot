@@ -60,6 +60,69 @@ from .tempmail import TempMailbox, TempMailError
 
 LOGGER = logging.getLogger(__name__)
 
+
+async def on_error(
+    update: object,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Global error handler registered with ``Application.add_error_handler``.
+
+    Without this, an exception raised inside any handler bubbles up to
+    PTB's dispatcher which logs it at ERROR level and moves on — but
+    the user who triggered the broken handler gets *no reply at all*.
+    From their side the bot looks dead. The user explicitly asked for
+    "antisipasi error mati" / "lebih baik mengulang flow daripada bot
+    tidak merespon": this handler is the catch-all that guarantees a
+    user-visible reply for every uncaught exception, plus a structured
+    log line for debugging.
+
+    Three behaviours:
+
+    1. Always log the exception at ERROR with full traceback so
+       journalctl/log aggregators can surface it.
+    2. Best-effort reply to the user with a generic "ada error, coba
+       lagi" message anchored to the chat the update came from. We
+       wrap the reply in ``contextlib.suppress`` because the original
+       failure may have been *caused* by Telegram being unreachable —
+       no point bubbling another exception out of the error handler.
+    3. Best-effort end any conversation that was active for the user
+       so they're not stuck mid-flow with stale ``user_data`` waiting
+       for a state-machine transition that will never come. PTB
+       doesn't expose a clean "abort conversation for this user" API,
+       so we just clear the per-user data dict — subsequent /connect
+       /sync /setprotonpw entries restart cleanly thanks to
+       ``allow_reentry=True``.
+    """
+    err = context.error
+    LOGGER.exception("uncaught exception in handler", exc_info=err)
+
+    # Best-effort: clear stale ``user_data`` so the next command starts
+    # from a clean slate instead of inheriting half-set keys
+    # (``imap_password``, ``bridge_captcha_iterator``, etc.) from the
+    # broken flow. We never re-raise from inside an error handler.
+    with contextlib.suppress(Exception):
+        if isinstance(context.user_data, dict):
+            context.user_data.clear()
+
+    # Try to reply to whoever triggered this. The update may not be a
+    # ``telegram.Update`` (e.g. ``JobQueue`` errors get a string), so
+    # we duck-type to find ``effective_message`` / ``effective_chat``.
+    chat_id: int | None = None
+    if isinstance(update, Update):
+        if update.effective_chat is not None:
+            chat_id = update.effective_chat.id
+    if chat_id is None:
+        return
+
+    text = (
+        "⚠️ Maaf, ada error tidak terduga saat memproses perintah barusan. "
+        "Bot tetap jalan — coba ulangi perintah, atau /start untuk lihat "
+        "menu utama."
+    )
+    with contextlib.suppress(Exception):
+        await context.bot.send_message(chat_id=chat_id, text=text)
+
+
 # Conversation states for /connect.
 #
 # We deliberately keep this short: the older flow asked for host/port/SSL/
@@ -221,9 +284,12 @@ CB_SYNC_PRIMARY = "syncp"
 # the per-primary "🔄 Sync" button finishes, if the alias count for
 # that primary is below this number the bot offers a one-tap "✨
 # Tambah N alamat lagi" button that drives /genaddr in random-suffix
-# mode to top the account up. 21 matches the typical "20 alias + 1
-# primary" shape we've been seeing across the test accounts.
-ALIAS_TARGET_PER_PRIMARY = 21
+# mode to top the account up. 20 = the alias-only target the user
+# specified ("button generate pointnya 20") — primary itself is not
+# counted because the user can't /genaddr a primary, only aliases.
+# Top-up math is therefore a clean ``missing = TARGET - alias_count``
+# that matches what the user sees in /list.
+ALIAS_TARGET_PER_PRIMARY = 20
 
 
 def _is_allowed(settings: Settings, user_id: int | None) -> bool:
@@ -428,6 +494,7 @@ def _build_alias_keyboard_for_primary(
     *,
     page: int = 0,
     page_size: int = LIST_PAGE_SIZE,
+    alias_count: int | None = None,
 ) -> InlineKeyboardMarkup:
     """Drill-down keyboard showing aliases owned by a single primary.
 
@@ -481,6 +548,27 @@ def _build_alias_keyboard_for_primary(
             )
         ]
     )
+    # Smart top-up shortcut: render only when the primary is below
+    # :data:`ALIAS_TARGET_PER_PRIMARY` so a fully-loaded account never
+    # sees a stale top-up button. ``alias_count`` defaults to
+    # ``len(aliases)`` (which is exactly the "(N alias)" header
+    # rendered above this keyboard, e.g. "12 alias"). Wording mirrors
+    # the post-healthcheck prompt — "Tambah N alamat lagi" — so the
+    # user sees a consistent vocabulary across the bot.
+    if alias_count is None:
+        alias_count = len(aliases)
+    topup_missing = max(0, ALIAS_TARGET_PER_PRIMARY - alias_count)
+    if topup_missing > 0:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"✨ Tambah {topup_missing} alamat lagi",
+                    callback_data=(
+                        f"{CB_QUICK_GENADDR}:{primary.id}:{topup_missing}"
+                    ),
+                )
+            ]
+        )
     return InlineKeyboardMarkup(rows)
 
 
@@ -555,29 +643,193 @@ async def _render_primary_alias_list(
 
 async def _send_connect_log(
     update: Update,
-    tracker: TaskMessageTracker | None,
+    tracker_or_context: TaskMessageTracker | ContextTypes.DEFAULT_TYPE | None,
     text: str,
     **kwargs: Any,
 ) -> Any:
     """Send a /connect status line and (optionally) register it for cleanup.
 
-    The whole /connect success-path emits ~6-10 progress messages
-    (Bridge probe, smoke test, auto-sync, …) that the user explicitly
-    asked to vanish 3 seconds after success: "saya kedepan nya tidak
-    ada mau chat log seperti ini lagi otomatis hilang bila sudah
-    berhasil". Wrapping every transient ``reply_text`` through this
-    helper keeps the call sites short while making the tracking
-    intent obvious. When ``tracker`` is ``None`` (legacy /connect
-    path or error-only branches) the helper degrades to a plain
-    ``reply_text`` so persistent error messages don't accidentally
-    get scheduled for deletion.
+    The second positional argument accepts either a
+    :class:`TaskMessageTracker` (legacy) *or* the handler's
+    ``ContextTypes.DEFAULT_TYPE`` (preferred). With the context we
+    can also:
+
+    * **Dedupe duplicate log lines** — some state-machine paths
+      (e.g. user mistypes the email, gets re-prompted, then types
+      it correctly) previously caused identical "Auto-isi: …" /
+      "Step 1/2 …" messages to land in the chat twice. We compare
+      against the *previous* message's text on a per-flow basis; an
+      immediate retransmission with the same body is suppressed and
+      the already-posted message is returned instead.
+    * **Re-anchor the status keyboard** — the ``StatusReporter`` was
+      originally attached to the dedicated anchor message that
+      ``_ensure_connect_progress`` sends first. As more log messages
+      piled up below it the user had to scroll up to see the live
+      button ("lho ko disitu selalu berada di paling baru tombol
+      bridge account"). After every new log line we now
+      ``relocate()`` the keyboard to the freshly-sent message so the
+      live button always sits right above the input field.
+
+    When called with ``None`` or a tracker-only argument (legacy
+    error-only branches or test helpers without a context) the
+    helper degrades to a plain ``reply_text`` so persistent error
+    messages don't accidentally get scheduled for deletion.
     """
+    tracker: TaskMessageTracker | None = None
+    user_data: dict[str, Any] | None = None
+    if isinstance(tracker_or_context, TaskMessageTracker):
+        tracker = tracker_or_context
+    elif tracker_or_context is not None:
+        ud = getattr(tracker_or_context, "user_data", None)
+        if isinstance(ud, dict):
+            user_data = ud
+            maybe_tracker = ud.get("connect_log_tracker")
+            if isinstance(maybe_tracker, TaskMessageTracker):
+                tracker = maybe_tracker
+
+    if user_data is not None:
+        last_text: str | None = user_data.get("connect_last_log_text")
+        last_msg = user_data.get("connect_last_log_msg")
+        if last_text == text and last_msg is not None:
+            # Identical body just sent — return the existing message
+            # so the caller's tracker/relocate logic is a no-op.
+            return last_msg
+
     msg = await update.effective_message.reply_text(  # type: ignore[union-attr]
         text, **kwargs
     )
     if tracker is not None:
         tracker.track(msg)
+
+    if user_data is not None:
+        user_data["connect_last_log_text"] = text
+        user_data["connect_last_log_msg"] = msg
+        status: StatusReporter | None = user_data.get("connect_status_reporter")
+        if status is not None and msg is not None:
+            new_id = getattr(msg, "message_id", None)
+            if new_id is not None:
+                with contextlib.suppress(Exception):
+                    await status.relocate(new_id)
+
     return msg
+
+
+async def _ensure_connect_progress(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> tuple[TaskMessageTracker | None, StatusReporter | None]:
+    """Get or create the /connect-flow tracker + live status reporter.
+
+    The /connect flow spans 4-6 handlers (``cmd_connect`` → ``connect_email``
+    → ``connect_password`` → maybe ``connect_recovery_verify`` /
+    ``connect_bridge_captcha`` → ``_finalize_connect``) and can take 60-180s
+    end-to-end. The user complained that all the prompt messages
+    ("Tambah akun Proton baru…", "Step 1/2…", "Auto-isi…", "Step 2/2…")
+    pile up in the chat after success ("hapus yang saya pilih ketika
+    sudah berhasil"), and that without a live indicator they cannot
+    tell whether the bot is still working or has silently died ("berikan
+    progress bar dibawah sedang melakukan apa bot nya jadi user tidak
+    mengira bot sudah selesai").
+
+    Both problems share the same lifecycle: a single tracker eagerly
+    created at the top of ``cmd_connect`` collects every transient
+    prompt for cleanup at the end of ``_finalize_connect``, while a
+    status anchor message — sent right after the tracker — exposes a
+    no-op inline button whose label rotates through the current
+    phase ("⏳ Tunggu input email", "🔐 Login Bridge…", "🧪 Smoke
+    test 1/3…", "✅ Selesai"). The status anchor itself is registered
+    with the tracker so it disappears with the rest of the log.
+
+    Idempotent: calling this from a later handler in the same flow
+    returns the same pair stored in ``user_data`` so progress updates
+    in ``connect_email`` / ``_finalize_connect`` edit the same anchor
+    instead of starting a fresh series.
+    """
+    user_data = cast(dict, context.user_data)
+    tracker = user_data.get("connect_log_tracker")
+    status = user_data.get("connect_status_reporter")
+    chat = update.effective_chat
+    bot = getattr(context, "bot", None)
+    if chat is None or bot is None:
+        return tracker, status
+
+    if tracker is None:
+        tracker = TaskMessageTracker(bot, chat.id)
+        user_data["connect_log_tracker"] = tracker
+
+    if status is None:
+        initial_label = "⏳ Mempersiapkan flow /connect…"
+        try:
+            anchor = await update.effective_message.reply_text(  # type: ignore[union-attr]
+                "🔌 <b>Proses /connect berjalan</b>\n"
+                "<i>Tombol di bawah memperlihatkan tahap yang sedang "
+                "dikerjakan bot. Selama tombol berputar (label berubah-"
+                "ubah), jangan kira bot mati — tunggu sampai akhir flow "
+                "(setelah smoke test sukses) baru tombol berubah jadi "
+                "✅ Selesai.</i>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=build_status_keyboard(initial_label),
+            )
+        except Exception:
+            LOGGER.debug("connect: failed to send status anchor", exc_info=True)
+            return tracker, status
+        tracker.track(anchor)
+        # ``initial_label`` seeds StatusReporter._last_label so the very
+        # first :meth:`relocate` (fired by ``_send_connect_log`` when
+        # the next message lands in the chat) doesn't fall back to the
+        # idle "✅ Selesai" label and confuse the user mid-flow.
+        status = StatusReporter(
+            bot,
+            chat.id,
+            anchor.message_id,
+            initial_label=initial_label,
+        )
+        user_data["connect_status_reporter"] = status
+
+    return tracker, status
+
+
+async def _set_connect_status(
+    context: ContextTypes.DEFAULT_TYPE,
+    label: str,
+    *,
+    force: bool = False,
+) -> None:
+    """Update the /connect status button if a reporter is active.
+
+    Best-effort: missing reporter (legacy path, test harness without a
+    live ``Bot``) is silently ignored. Telegram rate-limits and
+    "message not modified" errors are already swallowed inside
+    :class:`StatusReporter`.
+    """
+    user_data = cast(dict, getattr(context, "user_data", None) or {})
+    status: StatusReporter | None = user_data.get("connect_status_reporter")
+    if status is None:
+        return
+    with contextlib.suppress(Exception):
+        await status.update(label, force=force)
+
+
+async def _close_connect_status(
+    context: ContextTypes.DEFAULT_TYPE,
+    label: str | None = None,
+) -> None:
+    """Mark the /connect status reporter done and drop it from user_data.
+
+    Called from the cleanup paths in ``_finalize_connect`` and the
+    error branches that return ``ConversationHandler.END`` early. The
+    reporter's anchor message is also tracked by the cleanup tracker,
+    so it gets deleted by ``tracker.cleanup`` shortly after — but
+    transitioning the button to a terminal label first means the user
+    sees "✅ Selesai" / "⚠️ Soft-fail" briefly before the message
+    vanishes, instead of a stale "🔌 Login…" label.
+    """
+    user_data = cast(dict, getattr(context, "user_data", None) or {})
+    status: StatusReporter | None = user_data.pop("connect_status_reporter", None)
+    if status is None:
+        return
+    with contextlib.suppress(Exception):
+        await status.done(label)
 
 
 async def _maybe_send_lock_reminder(
@@ -878,21 +1130,60 @@ async def cmd_sync(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         )
         return ConversationHandler.END
     username, password = args[0], " ".join(args[1:])
-    await update.effective_message.reply_text("Menghubungi Proton API...")  # type: ignore[union-attr]
+    # Anchor a live status button: legacy /sync hits Proton SRP +
+    # CAPTCHA + address fetch and routinely takes 5-30s, so a static
+    # "Menghubungi Proton API..." line leaves the user wondering
+    # whether the bot is still working. We stash the reporter on
+    # ``user_data`` so the CAPTCHA continuation handler
+    # (sync_captcha_done) and the shared finaliser (_sync_complete)
+    # can keep editing the same anchor instead of spawning duplicates.
+    user_data = cast(dict, context.user_data)
+    sync_status: StatusReporter | None = None
+    sync_initial_label = "⏳ Mempersiapkan sync Proton…"
+    try:
+        anchor = await update.effective_message.reply_text(  # type: ignore[union-attr]
+            "🔄 <b>Sync alamat Proton</b>\n"
+            "<i>Tombol di bawah memperlihatkan tahap yang sedang "
+            "dikerjakan bot.</i>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=build_status_keyboard(sync_initial_label),
+        )
+    except Exception:
+        anchor = None
+    if anchor is not None:
+        sync_status = StatusReporter(
+            context.application.bot,
+            chat.id,
+            anchor.message_id,
+            initial_label=sync_initial_label,
+        )
+        user_data["legacy_sync_status_reporter"] = sync_status
+
+    if sync_status is not None:
+        with contextlib.suppress(Exception):
+            await sync_status.update("🌐 Login Proton API (SRP)…")
     try:
         from .proton_api import CaptchaChallenge, start_auth
 
         result = await asyncio.to_thread(start_auth, username, password)
     except Exception as exc:
         LOGGER.exception("proton API sync failed")
+        if sync_status is not None:
+            with contextlib.suppress(Exception):
+                await sync_status.done("❌ Login Proton gagal")
+            user_data.pop("legacy_sync_status_reporter", None)
         await update.effective_message.reply_text(  # type: ignore[union-attr]
             f"Gagal mengambil alamat dari Proton: {exc}"
         )
         return ConversationHandler.END
 
     if isinstance(result, CaptchaChallenge):
-        user_data = cast(dict, context.user_data)
         user_data["sync_challenge"] = result
+        if sync_status is not None:
+            with contextlib.suppress(Exception):
+                await sync_status.update(
+                    "⏳ Tunggu user selesaikan CAPTCHA Proton…"
+                )
         await update.effective_message.reply_text(  # type: ignore[union-attr]
             "Proton memerlukan verifikasi CAPTCHA.\n\n"
             f"1. Buka link ini di browser:\n{result.web_url}\n\n"
@@ -909,13 +1200,32 @@ async def sync_captcha_done(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     """Handle user confirming CAPTCHA is solved."""
     user_data = cast(dict, context.user_data)
     challenge = user_data.pop("sync_challenge", None)
+    sync_status: StatusReporter | None = user_data.get(
+        "legacy_sync_status_reporter"
+    )
+
+    async def _status(label: str) -> None:
+        if sync_status is None:
+            return
+        with contextlib.suppress(Exception):
+            await sync_status.update(label)
+
+    async def _status_done(label: str) -> None:
+        if sync_status is None:
+            return
+        with contextlib.suppress(Exception):
+            await sync_status.done(label)
+        user_data.pop("legacy_sync_status_reporter", None)
+
     if challenge is None:
+        await _status_done("❌ Sesi /sync kedaluwarsa")
         await update.effective_message.reply_text("Sesi sync sudah kedaluwarsa. Coba /sync lagi.")  # type: ignore[union-attr]
         return ConversationHandler.END
 
     text = (update.effective_message.text or "").strip().lower()  # type: ignore[union-attr]
     if text == "done":
         # User solved CAPTCHA on the web page; retry with the original token
+        await _status("🔁 Retry autentikasi setelah CAPTCHA…")
         await update.effective_message.reply_text("Mencoba ulang autentikasi...")  # type: ignore[union-attr]
         try:
             from .proton_api import complete_auth_with_captcha
@@ -925,6 +1235,7 @@ async def sync_captcha_done(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             )
         except Exception as exc:
             LOGGER.exception("CAPTCHA auth retry failed")
+            await _status_done("❌ Auth setelah CAPTCHA gagal")
             await update.effective_message.reply_text(  # type: ignore[union-attr]
                 f"Gagal setelah CAPTCHA: {exc}\nCoba /sync lagi."
             )
@@ -932,6 +1243,7 @@ async def sync_captcha_done(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return await _sync_complete(update, context, session)
 
     # User sent a captcha response token directly
+    await _status("🔁 Verifikasi token CAPTCHA…")
     await update.effective_message.reply_text("Memverifikasi token CAPTCHA...")  # type: ignore[union-attr]
     try:
         from .proton_api import complete_auth_with_captcha
@@ -939,6 +1251,7 @@ async def sync_captcha_done(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         session = await asyncio.to_thread(complete_auth_with_captcha, challenge, text)
     except Exception as exc:
         LOGGER.exception("CAPTCHA token auth failed")
+        await _status_done("❌ Token CAPTCHA invalid")
         await update.effective_message.reply_text(  # type: ignore[union-attr]
             f"Token CAPTCHA tidak valid: {exc}\nCoba /sync lagi."
         )
@@ -1142,6 +1455,13 @@ async def cmd_connect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     existing = await db.list_primary_accounts(chat.id)
     bridge_admin_on = _bot_bridge_admin(context) is not None
 
+    # Eagerly bring up the cleanup tracker + live status anchor so every
+    # prompt message we emit below (intro, domain hint, Step 1/2, the
+    # password prompt) is registered for the post-finalize cleanup AND
+    # the user has a live "what is the bot doing" indicator from the
+    # very first reply. See ``_ensure_connect_progress`` for rationale.
+    _tracker, _status = await _ensure_connect_progress(update, context)
+
     if bridge_admin_on:
         intro = (
             "Tambah akun Proton baru.\n\n"
@@ -1171,7 +1491,9 @@ async def cmd_connect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
             f"\n\nSudah terdaftar: <b>{html.escape(emails)}</b>. "
             "Kalau email yang sama dimasukkan ulang, kredensial-nya akan ditimpa."
         )
-    await update.effective_message.reply_text(  # type: ignore[union-attr]
+    await _send_connect_log(
+        update,
+        context,
         intro,
         parse_mode=ParseMode.HTML,
     )
@@ -1184,20 +1506,28 @@ async def cmd_connect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         email, was_suffixed = _resolve_connect_email(args[0])
         cast(dict, context.user_data)["primary_email"] = email
         if was_suffixed:
-            await update.effective_message.reply_text(  # type: ignore[union-attr]
+            await _send_connect_log(
+                update,
+                context,
                 _connect_domain_hint_html(email),
                 parse_mode=ParseMode.HTML,
             )
-        await update.effective_message.reply_text(  # type: ignore[union-attr]
+        await _send_connect_log(
+            update,
+            context,
             _connect_password_prompt(bridge_admin_on),
             parse_mode=ParseMode.HTML,
         )
+        await _set_connect_status(context, "⏳ Tunggu input password Proton…")
         return CONNECT_PASSWORD
-    await update.effective_message.reply_text(  # type: ignore[union-attr]
+    await _send_connect_log(
+        update,
+        context,
         "Step 1/2 — kirim alamat email Proton-nya (mis. "
         "<code>vielz43@proton.me</code>):",
         parse_mode=ParseMode.HTML,
     )
+    await _set_connect_status(context, "⏳ Tunggu input email Proton…")
     return CONNECT_EMAIL
 
 
@@ -1232,10 +1562,18 @@ async def connect_again_quick_entry(
 
 
 async def connect_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    # The tracker + status anchor were created in ``cmd_connect``; this
+    # call retrieves them so the auto-suffix hint and Step 2/2 prompt
+    # join the same cleanup batch and the live status indicator
+    # transitions to "Tunggu input password" without spawning a second
+    # anchor message.
+    _tracker, _status = await _ensure_connect_progress(update, context)
     text = (update.effective_message.text or "").strip()  # type: ignore[union-attr]
     if not text:
-        await update.effective_message.reply_text(  # type: ignore[union-attr]
-            "Itu bukan alamat email yang valid. Masukkan email Proton-nya:"
+        await _send_connect_log(
+            update,
+            context,
+            "Itu bukan alamat email yang valid. Masukkan email Proton-nya:",
         )
         return CONNECT_EMAIL
     # Accept bare username — :func:`_resolve_connect_email` auto-suffixes
@@ -1245,14 +1583,19 @@ async def connect_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     email, was_suffixed = _resolve_connect_email(text)
     cast(dict, context.user_data)["primary_email"] = email
     if was_suffixed:
-        await update.effective_message.reply_text(  # type: ignore[union-attr]
+        await _send_connect_log(
+            update,
+            context,
             _connect_domain_hint_html(email),
             parse_mode=ParseMode.HTML,
         )
-    await update.effective_message.reply_text(  # type: ignore[union-attr]
+    await _send_connect_log(
+        update,
+        context,
         _connect_password_prompt(_bot_bridge_admin(context) is not None),
         parse_mode=ParseMode.HTML,
     )
+    await _set_connect_status(context, "⏳ Tunggu input password Proton…")
     return CONNECT_PASSWORD
 
 
@@ -1279,8 +1622,35 @@ def _build_post_disconnect_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def _topup_label_and_count(alias_count: int) -> tuple[str, int]:
+    """Compute the recommended top-up size for the "✨ Generate …" button.
+
+    User feedback: the old hardcoded "✨ Generate 20 alamat sekarang"
+    button kept showing 20 even when the primary already had 11/20
+    aliases — confusing because the user expected the button to
+    recommend exactly *how many* more they still need ("kan kurang 9").
+
+    Returns ``(label, missing)`` where ``missing`` is the number of
+    aliases to generate to reach :data:`ALIAS_TARGET_PER_PRIMARY`.
+    Caller decides whether to render a row at all — when ``missing``
+    is 0 the button is hidden so the user doesn't get a no-op tap.
+    """
+    missing = max(0, ALIAS_TARGET_PER_PRIMARY - alias_count)
+    if missing == 0:
+        return ("", 0)
+    if alias_count == 0:
+        # Fresh account — keep the original "Generate N alamat
+        # sekarang" wording so the empty-onboarding copy still reads
+        # naturally for first-time users.
+        return (f"✨ Generate {missing} alamat sekarang", missing)
+    return (f"✨ Generate {missing} alamat lagi", missing)
+
+
 def _build_post_connect_keyboard(
-    primary_id: int, *, master_password_saved: bool = False
+    primary_id: int,
+    *,
+    master_password_saved: bool = False,
+    alias_count: int = 0,
 ) -> InlineKeyboardMarkup:
     """Quick-action buttons for an empty newly-connected primary.
 
@@ -1292,6 +1662,11 @@ def _build_post_connect_keyboard(
     :func:`_finalize_connect` succeeded — request #9), the
     "🔐 Simpan password Proton" row is omitted because there's
     nothing left to save.
+
+    ``alias_count`` parameterises the generate-button label so a
+    "fresh" primary that already happened to import some aliases
+    via auto-sync still gets the right top-up recommendation
+    (matches the /list view).
     """
     rows: list[list[InlineKeyboardButton]] = []
     if not master_password_saved:
@@ -1303,14 +1678,16 @@ def _build_post_connect_keyboard(
                 )
             ]
         )
-    rows.append(
-        [
-            InlineKeyboardButton(
-                "✨ Generate 20 alamat sekarang",
-                callback_data=f"{CB_QUICK_GENADDR}:{primary_id}:20",
-            )
-        ]
-    )
+    label, missing = _topup_label_and_count(alias_count)
+    if missing > 0:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    label,
+                    callback_data=f"{CB_QUICK_GENADDR}:{primary_id}:{missing}",
+                )
+            ]
+        )
     rows.append(
         [
             InlineKeyboardButton(
@@ -1331,47 +1708,63 @@ def _build_post_connect_keyboard_with_aliases(
     (auto-sync just imported them, or they were already in the DB from
     an earlier session). Surfaces three one-tap actions:
 
-    1. Generate 20 more random-suffix aliases — same callback the
-       fresh-account onboarding uses, so the user can extend the pool
-       without re-typing the email address. ``/genaddr`` and
-       ``/cekimap`` use independent ``chat_data`` locks
-       (``genaddr_running`` vs ``health_check_running``) so this is
-       safe to click while a background health check is running.
+    1. Generate however-many random-suffix aliases are needed to top
+       the account up to :data:`ALIAS_TARGET_PER_PRIMARY` (20).
+       Examples: 11 aliases → "✨ Generate 9 alamat lagi"; 4 aliases
+       → "✨ Generate 16 alamat lagi"; ≥20 aliases → row hidden so
+       the user doesn't get a no-op tap. Same callback the
+       fresh-account onboarding uses.
     2. Run the end-to-end IMAP listener health check.
     3. Open ``/list`` for this primary.
     """
-    return InlineKeyboardMarkup(
+    rows: list[list[InlineKeyboardButton]] = []
+    label, missing = _topup_label_and_count(alias_count)
+    if missing > 0:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    label,
+                    callback_data=f"{CB_QUICK_GENADDR}:{primary_id}:{missing}",
+                )
+            ]
+        )
+    rows.append(
         [
-            [
-                InlineKeyboardButton(
-                    "✨ Generate 20 alamat sekarang",
-                    callback_data=f"{CB_QUICK_GENADDR}:{primary_id}:20",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    f"🩺 Cek IMAP listener semua {alias_count} alias",
-                    callback_data=f"{CB_QUICK_HEALTHCHECK}:{primary_id}",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "📋 Buka /list", callback_data=f"{CB_PICK_PRIMARY}:{primary_id}"
-                )
-            ],
+            InlineKeyboardButton(
+                f"🩺 Cek IMAP listener semua {alias_count} alias",
+                callback_data=f"{CB_QUICK_HEALTHCHECK}:{primary_id}",
+            )
         ]
     )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "📋 Buka /list", callback_data=f"{CB_PICK_PRIMARY}:{primary_id}"
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
 
 
 SMTP_SMOKE_TIMEOUT_SECONDS = 60
-# When the first smoke-test attempt times out, /connect retries once
-# after a short settle window before rolling back the freshly-added
-# primary. Bridge is occasionally still warming up the SMTP listener
-# (or DNS to the temp-mail provider hasn't fully propagated) the
-# first time we hit it post add-account; a single retry catches the
-# common case without making the user re-run /connect from scratch.
+# When the first smoke-test attempt times out, /connect retries a few
+# times after a short settle window before giving up. Bridge is
+# occasionally still warming up the SMTP listener (or DNS to the
+# temp-mail provider hasn't fully propagated) the first time we hit
+# it post add-account; the retries catch the common case without
+# making the user re-run /connect from scratch.
 SMTP_SMOKE_RETRY_DELAY_SECONDS = 30
-SMTP_SMOKE_MAX_ATTEMPTS = 2
+# Bumped from 2 → 3 so we cover ~3 minutes of Bridge warm-up before
+# considering the smoke test a soft failure.
+SMTP_SMOKE_MAX_ATTEMPTS = 3
+# Hard wall-clock cap for the entire smoke-test phase. Even with all
+# retries combined, ``_finalize_connect`` can never spin in the smoke
+# branch longer than this — wrapping in ``asyncio.wait_for`` makes it
+# impossible for a hung SMTP socket / Mail.tm 500 to keep the
+# /connect coroutine alive and freeze the user's view. Picked to be
+# comfortably > MAX_ATTEMPTS * (TIMEOUT + RETRY_DELAY) so a healthy
+# slow-warm-up still completes naturally.
+SMTP_SMOKE_HARD_CAP_SECONDS = 360
 BRIDGE_SMTP_PORT = 1025
 
 
@@ -1513,9 +1906,16 @@ async def _finalize_connect(
     use_ssl = CONNECT_DEFAULT_SSL
 
     if pre_probe_settle_seconds > 0:
+        await _set_connect_status(
+            context,
+            (
+                f"⏳ Tunggu listener IMAP Bridge siap (warm-up "
+                f"{int(pre_probe_settle_seconds)}s)…"
+            ),
+        )
         await _send_connect_log(
             update,
-            tracker,
+            context,
             f"⏳ Menunggu Bridge selesai inisialisasi "
             f"<b>{html.escape(email)}</b> "
             f"({int(pre_probe_settle_seconds)}s)...",
@@ -1523,9 +1923,13 @@ async def _finalize_connect(
         )
         await asyncio.sleep(pre_probe_settle_seconds)
 
+    await _set_connect_status(
+        context,
+        "🔌 Cek login Bridge IMAP — uji LOGIN ke 127.0.0.1:1143…",
+    )
     await _send_connect_log(
         update,
-        tracker,
+        context,
         f"🔌 Cek login ke Bridge sebagai <b>{html.escape(email)}</b>...",
         parse_mode=ParseMode.HTML,
     )
@@ -1542,6 +1946,7 @@ async def _finalize_connect(
         backoff_seconds=5.0,
     )
     if not ok:
+        await _set_connect_status(context, "⏳ Tunggu password ulang…")
         await update.effective_message.reply_text(  # type: ignore[union-attr]
             "❌ Bridge menolak login. Pastikan password yang kamu kirim "
             "adalah <b>password IMAP yang di-generate Bridge</b> (bukan "
@@ -1552,6 +1957,10 @@ async def _finalize_connect(
         )
         return CONNECT_PASSWORD
 
+    await _set_connect_status(
+        context,
+        "💾 Enkripsi & simpan kredensial Bridge ke database…",
+    )
     db = _bot_db(context)
     cipher = _bot_cipher(context)
     manager = _bot_manager(context)
@@ -1599,12 +2008,16 @@ async def _finalize_connect(
 
     await _send_connect_log(
         update,
-        tracker,
+        context,
         f"✅ Tersambung ke <b>{html.escape(email)}</b> — kredensial "
         "disimpan terenkripsi & jadi akun aktif.\n"
         "Listener IMAP otomatis menyala. Email belum diteruskan otomatis: "
         "buka <b>/list</b> dan pilih alias yang mau dipakai dulu.",
         parse_mode=ParseMode.HTML,
+    )
+    await _set_connect_status(
+        context,
+        "📡 Start listener IMAP — pantau INBOX semua alias…",
     )
     try:
         await manager.start_for_primary(primary_id)
@@ -1616,6 +2029,7 @@ async def _finalize_connect(
             f"Gagal start listener: {exc}\n"
             "Bridge mungkin belum siap. Coba /connect ulang dalam beberapa detik."
         )
+        await _close_connect_status(context, "❌ Listener gagal start")
         return ConversationHandler.END
 
     if smoke_test_tempmail is not None:
@@ -1638,9 +2052,13 @@ async def _finalize_connect(
                 exc,
                 smoke_test_tempmail.address,
             )
+        await _set_connect_status(
+            context,
+            f"🧪 Smoke test 1/{SMTP_SMOKE_MAX_ATTEMPTS} (kirim email uji)…",
+        )
         await _send_connect_log(
             update,
-            tracker,
+            context,
             "🧪 Smoke test IMAP/SMTP: kirim email uji ke temp mail "
             f"(<code>{html.escape(smoke_tempmail.address)}</code>)...",
             parse_mode=ParseMode.HTML,
@@ -1658,55 +2076,109 @@ async def _finalize_connect(
                 email,
                 SMTP_SMOKE_RETRY_DELAY_SECONDS,
             )
+            # Live status: tell the user we're between attempts so the
+            # button doesn't look frozen on "Smoke test 1/3" while we
+            # actually sleep ``RETRY_DELAY`` then re-probe.
+            next_attempt = attempt + 1
+            await _set_connect_status(
+                context,
+                f"⏳ Smoke retry: tunggu {SMTP_SMOKE_RETRY_DELAY_SECONDS}s lalu "
+                f"attempt {next_attempt}/{SMTP_SMOKE_MAX_ATTEMPTS}…",
+            )
             await _send_connect_log(
                 update,
-                tracker,
+                context,
                 "⚠️ Smoke test belum dapat email uji — Bridge mungkin "
                 f"masih warm-up. Tunggu {SMTP_SMOKE_RETRY_DELAY_SECONDS}s "
                 "lalu coba sekali lagi…",
                 parse_mode=ParseMode.HTML,
             )
 
-        smoke_ok = await _smoke_test_with_retry(
-            email=email,
-            imap_username=imap_username,
-            imap_password=imap_password,
-            tempmail=smoke_tempmail,
-            on_retry=_on_retry,
-        )
+        # The smoke test runs under a hard wall-clock cap (``wait_for``)
+        # so even pathological cases — Mail.tm 500ing for minutes,
+        # Bridge SMTP socket accepting but never delivering — can't
+        # keep this coroutine alive past ``SMTP_SMOKE_HARD_CAP_SECONDS``
+        # and starve every other handler. ``concurrent_updates=True``
+        # in __main__ already prevents one user's flow from blocking
+        # another's, but capping the duration makes the *log experience*
+        # reliable: the user always sees either ✅ or ⚠ within bounded
+        # time, never an indefinite "kirim email uji..." stall.
+        try:
+            smoke_ok = await asyncio.wait_for(
+                _smoke_test_with_retry(
+                    email=email,
+                    imap_username=imap_username,
+                    imap_password=imap_password,
+                    tempmail=smoke_tempmail,
+                    on_retry=_on_retry,
+                ),
+                timeout=SMTP_SMOKE_HARD_CAP_SECONDS,
+            )
+        except TimeoutError:
+            LOGGER.warning(
+                "smoke test for %s exceeded hard cap of %ds; treating as soft fail",
+                email,
+                SMTP_SMOKE_HARD_CAP_SECONDS,
+            )
+            smoke_ok = False
         if smoke_ok:
             await _send_connect_log(
                 update,
-                tracker,
+                context,
                 "✅ <b>IMAP/SMTP berjalan sempurna</b> — email uji "
                 "diterima di temp mail.",
                 parse_mode=ParseMode.HTML,
             )
         else:
+            # Soft-fail: smoke test couldn't verify SMTP delivery, but
+            # the IMAP listener has already started successfully (a
+            # previous call to ``_verify_bridge_login`` confirmed the
+            # credentials, and ``manager.start_for_primary`` returned
+            # without exception). Rolling the primary back here forced
+            # the user to redo the entire /connect flow — including
+            # the recovery-email Playwright dance — for what is often
+            # a transient Mail.tm hiccup. The user pushed back hard
+            # ("lebih baik mengulang flow daripada bot tidak merespon
+            # atau mati"), so we now keep the primary, surface a
+            # warning with concrete next steps, and let the user
+            # verify with /cekimap when they want.
             LOGGER.warning(
-                "smoke test failed for %s after %d attempts; rolling back primary %d",
+                "smoke test failed for %s after %d attempts; KEEPING "
+                "primary %d (listener already up — soft fail)",
                 email,
                 SMTP_SMOKE_MAX_ATTEMPTS,
                 primary_id,
             )
-            await update.effective_message.reply_text(  # type: ignore[union-attr]
-                "❌ <b>Smoke test gagal</b> — email uji tidak sampai ke "
-                f"temp mail dalam {SMTP_SMOKE_MAX_ATTEMPTS}x percobaan "
-                f"({SMTP_SMOKE_TIMEOUT_SECONDS}s + retry "
-                f"{SMTP_SMOKE_RETRY_DELAY_SECONDS}s). Bridge mungkin "
-                "belum benar-benar siap atau IMAP/SMTP tidak jalan.\n\n"
-                "Sesi ini di-rollback. Silakan <b>/connect</b> lagi.",
-                parse_mode=ParseMode.HTML,
+            keyboard = InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "🩺 Jalankan /cekimap sekarang",
+                            callback_data=f"{CB_QUICK_HEALTHCHECK}:{primary_id}",
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "📋 Buka /list",
+                            callback_data=f"{CB_PICK_PRIMARY}:{primary_id}",
+                        )
+                    ],
+                ]
             )
-            with contextlib.suppress(Exception):
-                await manager.stop_for_primary(primary_id)
-            with contextlib.suppress(Exception):
-                await db.delete_primary_account(chat.id, primary_id)
-            bridge_admin = _bot_bridge_admin(context)
-            if bridge_admin is not None:
-                with contextlib.suppress(Exception):
-                    await bridge_admin.remove_account(email)
-            return ConversationHandler.END
+            await update.effective_message.reply_text(  # type: ignore[union-attr]
+                "⚠️ <b>Smoke test belum dapat email uji</b> dalam "
+                f"{SMTP_SMOKE_MAX_ATTEMPTS}x percobaan "
+                f"({SMTP_SMOKE_TIMEOUT_SECONDS}s + retry "
+                f"{SMTP_SMOKE_RETRY_DELAY_SECONDS}s). Mail.tm bisa lemot "
+                "atau Bridge masih warm-up.\n\n"
+                "<b>Akun TIDAK di-rollback</b> — IMAP listener sudah jalan "
+                f"untuk <code>{html.escape(email)}</code>. Cek manual:\n"
+                "• Tap tombol di bawah untuk jalankan health check, atau\n"
+                "• Kirim email uji ke alias dari device lain dan lihat "
+                "apakah bot meneruskannya.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboard,
+            )
 
     # Auto-sync addresses from Proton account API if we have them.
     # The recovery-email Playwright flow stashes the full address list
@@ -1715,6 +2187,10 @@ async def _finalize_connect(
     # We persist them as aliases here, after the primary row exists,
     # so the user doesn't have to run /sync separately to populate
     # the 18+ existing addresses on a Business account.
+    await _set_connect_status(
+        context,
+        "🔍 Buka Proton (Playwright) & ambil semua alamat → DB…",
+    )
     proton_addresses = user_data.pop("proton_account_addresses", None)
     if proton_addresses is None:
         # Existing-creds path skipped the recovery Playwright flow.
@@ -1728,7 +2204,7 @@ async def _finalize_connect(
 
             await _send_connect_log(
                 update,
-                tracker,
+                context,
                 "🔍 Sync semua alamat Proton ke DB...",
             )
             proton_addresses = await fetch_all_addresses_via_browser(
@@ -1754,7 +2230,7 @@ async def _finalize_connect(
             if added > 0:
                 await _send_connect_log(
                     update,
-                    tracker,
+                    context,
                     f"📥 Auto-sync: <b>{added}</b> alias dari "
                     f"akun Proton ditambahkan ke DB "
                     f"(total {len(candidate_aliases)} terdeteksi).",
@@ -1805,7 +2281,9 @@ async def _finalize_connect(
             onboarding_text,
             parse_mode=ParseMode.HTML,
             reply_markup=_build_post_connect_keyboard(
-                primary_id, master_password_saved=master_password_saved
+                primary_id,
+                master_password_saved=master_password_saved,
+                alias_count=len(real_aliases),
             ),
         )
     else:
@@ -1820,6 +2298,13 @@ async def _finalize_connect(
                 primary_id, len(real_aliases)
             ),
         )
+
+    # Flip the live status anchor to its terminal label so the user
+    # sees "✅ Selesai" briefly before the cleanup tracker deletes the
+    # whole log series. Doing this BEFORE scheduling the cleanup task
+    # ensures the final transition is visible even on slow Telegram
+    # networks where the delete races the edit.
+    await _close_connect_status(context, "✅ Selesai — siap dipakai")
 
     # Request #8 — auto-cleanup the verbose log messages 3 seconds
     # after success. The CTA messages above are intentionally NOT
@@ -1839,8 +2324,12 @@ async def _finalize_connect(
         cleanup_task.add_done_callback(_CONNECT_CLEANUP_TASKS.discard)
     # Drop the stash so a follow-up /connect in the same chat starts
     # with a fresh tracker (the old one's ids are already scheduled
-    # for deletion).
+    # for deletion). The dedupe stash also goes — without this the
+    # *next* /connect would suppress legitimately-identical opening
+    # messages thinking they're a re-send.
     user_data.pop("connect_log_tracker", None)
+    user_data.pop("connect_last_log_text", None)
+    user_data.pop("connect_last_log_msg", None)
 
     return ConversationHandler.END
 
@@ -1851,6 +2340,7 @@ async def _setup_tempmail_recovery(
     proton_password: str,
     *,
     tracker: TaskMessageTracker | None = None,
+    context: ContextTypes.DEFAULT_TYPE | None = None,
 ) -> tuple[TempMailbox | None, bool, list[str] | None, bool]:
     """Create a temp mail and set it as recovery email in Proton settings.
 
@@ -1895,7 +2385,7 @@ async def _setup_tempmail_recovery(
 
         await _send_connect_log(
             update,
-            tracker,
+            context,
             f"📧 Temp mail dibuat: <code>{html.escape(tempmail.address)}</code>\n"
             "Mengubah recovery email di Proton...",
             parse_mode=ParseMode.HTML,
@@ -2012,7 +2502,7 @@ async def _setup_tempmail_recovery(
                 if auto_verified:
                     await _send_connect_log(
                         update,
-                        tracker,
+                        context,
                         f"✅ Recovery email <code>{html.escape(tempmail.address)}</code> "
                         "otomatis diverifikasi — lanjut Bridge add-account.",
                         parse_mode=ParseMode.HTML,
@@ -2024,7 +2514,7 @@ async def _setup_tempmail_recovery(
                 # for the user's "ok".
                 await _send_connect_log(
                     update,
-                    tracker,
+                    context,
                     f"📧 Recovery email diubah ke <code>{html.escape(tempmail.address)}</code>\n\n"
                     "Auto-verify tidak bisa konfirmasi otomatis — klik link "
                     "berikut untuk verifikasi manual:\n"
@@ -2164,13 +2654,17 @@ async def _drive_bridge_login(
     # Step 0: set up temp mail + change recovery email BEFORE Bridge login.
     # This must happen before Bridge login because the Bridge CLI stops
     # the service (and thus the Proton web session is separate).
+    await _set_connect_status(
+        context,
+        "🌐 Buka Proton (Playwright) untuk pasang recovery email…",
+    )
     (
         tempmail,
         recovery_ok,
         proton_addresses,
         auto_verified,
     ) = await _setup_tempmail_recovery(
-        update, email, proton_password, tracker=tracker
+        update, email, proton_password, tracker=tracker, context=context
     )
     if not recovery_ok:
         # Recovery email step failed: do NOT attempt Bridge add-account.
@@ -2179,6 +2673,7 @@ async def _drive_bridge_login(
         # recovery email Proton will demand human verification we cannot
         # automate.  Better to abort cleanly than leave the user with a
         # confusing TimeoutError after a broken recovery flow.
+        await _close_connect_status(context, "❌ Recovery email gagal")
         return ConversationHandler.END
 
     # Persist context for either the auto-verified fast path OR the
@@ -2223,9 +2718,12 @@ async def _drive_bridge_login(
     # user has confirmed (sent "ok") and _finalize_connect ran, so
     # at that point the prompt has served its purpose and is safe
     # to delete alongside the rest of the success log.
+    await _set_connect_status(
+        context, "⏳ Tunggu user klik link recovery email…"
+    )
     await _send_connect_log(
         update,
-        tracker,
+        context,
         "👆 Klik link verifikasi di atas dan selesaikan di browser "
         "(buka link, tekan tombol verifikasi di halaman Proton).\n\n"
         "Begitu Proton mengonfirmasi recovery email <b>terverifikasi</b>, "
@@ -2253,6 +2751,10 @@ async def _perform_bridge_add_account(
     link, without duplicating the iterator/CAPTCHA bookkeeping.
     """
     user_data = cast(dict, context.user_data)
+    await _set_connect_status(
+        context,
+        "🔧 Daftar akun ke Bridge — stop service, CLI login, restart…",
+    )
     progress = await update.effective_message.reply_text(  # type: ignore[union-attr]
         f"🔧 Mendaftarkan <b>{html.escape(email)}</b> ke Proton Bridge "
         "(stop service → cli login → restart)...",
@@ -2272,17 +2774,26 @@ async def _perform_bridge_add_account(
                 captcha_count += 1
 
                 # Try auto-verification for email-based challenges
+                await _set_connect_status(
+                    context, "🤖 Auto-verifikasi CAPTCHA email…"
+                )
                 auto_ok = await _try_auto_verify(
                     update, event.url, bridge_admin, tempmail
                 )
                 if auto_ok:
                     # Continue consuming events — Bridge should proceed
+                    await _set_connect_status(
+                        context, "✅ CAPTCHA auto-verified — lanjut…"
+                    )
                     continue
 
                 # Auto-verify failed: fall back to manual flow
                 user_data["bridge_captcha_iterator"] = iterator
                 user_data["bridge_email"] = email
                 user_data["bridge_smoke_tempmail"] = tempmail
+                await _set_connect_status(
+                    context, "⏳ Tunggu user selesaikan CAPTCHA manual…"
+                )
                 await update.effective_message.reply_text(  # type: ignore[union-attr]
                     "🔒 Proton minta verifikasi manusia.\n\n"
                     "Auto-verify gagal. Selesaikan manual:\n"
@@ -2305,6 +2816,7 @@ async def _perform_bridge_add_account(
             f"❌ BridgeAdmin error: <code>{html.escape(str(exc))}</code>",
             parse_mode=ParseMode.HTML,
         )
+        await _close_connect_status(context, "❌ Bridge admin error")
         return ConversationHandler.END
     finally:
         try:
@@ -2322,12 +2834,14 @@ async def _perform_bridge_add_account(
             "atau /cancel untuk batal.",
             parse_mode=ParseMode.HTML,
         )
+        await _close_connect_status(context, "❌ Bridge tolak login")
         return ConversationHandler.END
     if creds is None:
         await update.effective_message.reply_text(  # type: ignore[union-attr]
             "❌ Login Bridge sukses tapi password IMAP tidak ditemukan "
             "di vault. Coba /connect lagi atau cek konfigurasi Bridge."
         )
+        await _close_connect_status(context, "❌ IMAP password hilang")
         return ConversationHandler.END
 
     return await _finalize_connect(
@@ -2343,6 +2857,17 @@ async def _perform_bridge_add_account(
 
 
 async def connect_password(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    # Pull the same tracker + status anchor that ``cmd_connect`` set
+    # up. Calling ``_ensure_connect_progress`` here guarantees that
+    # entry points which skipped ``cmd_connect`` (e.g. an unusual
+    # re-entry path that lands directly in CONNECT_PASSWORD) still
+    # get a tracker; in the normal flow this just returns the
+    # already-stashed pair.
+    tracker, _status = await _ensure_connect_progress(update, context)
+    await _set_connect_status(
+        context,
+        "🔍 Validasi format password Proton…",
+    )
     text = (update.effective_message.text or "").strip()  # type: ignore[union-attr]
     # Security: scrub the user's password message from the chat as
     # soon as we've read it. Telegram bots can delete user messages
@@ -2352,7 +2877,10 @@ async def connect_password(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     with contextlib.suppress(Exception):
         await update.effective_message.delete()  # type: ignore[union-attr]
     if not text:
-        await update.effective_message.reply_text("Password tidak boleh kosong:")  # type: ignore[union-attr]
+        await _send_connect_log(
+            update, context, "Password tidak boleh kosong:"
+        )
+        await _set_connect_status(context, "⏳ Tunggu input password Proton…")
         return CONNECT_PASSWORD
     chat = update.effective_chat
     if chat is None:
@@ -2363,6 +2891,7 @@ async def connect_password(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await update.effective_message.reply_text(  # type: ignore[union-attr]
             "Sesi /connect kedaluwarsa. Mulai lagi dengan /connect."
         )
+        await _close_connect_status(context, "❌ Sesi kedaluwarsa")
         return ConversationHandler.END
 
     # Stash the Proton account password so _finalize_connect can pull
@@ -2386,26 +2915,16 @@ async def connect_password(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             imap_password=text,
         )
 
-    # Bridge-admin path: build a tracker that follows the entire
-    # success log (probe → smoke test → auto-sync → "Tersambung")
-    # so it can be 3-second-deleted after :func:`_finalize_connect`
-    # finishes. The tracker is stashed in ``user_data`` so the
-    # recovery-email wait state (``CONNECT_RECOVERY_VERIFY``) can
-    # restore it after the user confirms the verification click —
-    # otherwise the wait would discard the tracked ids and the
-    # post-add log would persist.
-    bot = context.bot if hasattr(context, "bot") else None
-    tracker: TaskMessageTracker | None = None
-    if bot is not None:
-        tracker = TaskMessageTracker(bot, chat.id)
-        user_data["connect_log_tracker"] = tracker
-
     # Auto-add path: text is the Proton account password. If the account
     # is already in Bridge AND the cached IMAP creds actually work, skip
     # the cli login and go straight to vault extraction. Otherwise (no
     # vault entry, OR vault entry is stale because Bridge forgot the
     # user but we never rewrote the vault), drive the full flow:
     # proton-login + recovery-email setup + ``bridge --cli login``.
+    await _set_connect_status(
+        context,
+        "🗄️ Cek vault Bridge — apakah akun sudah terdaftar?",
+    )
     try:
         existing = await bridge_admin.fetch_imap_credentials(email)
     except BridgeAdminError as exc:
@@ -2418,6 +2937,10 @@ async def connect_password(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         # after the rate-limit backoff before deciding to re-add the
         # whole account (which would needlessly redo the recovery-email
         # flow).
+        await _set_connect_status(
+            context,
+            "🔐 Verifikasi kredensial IMAP — LOGIN test ke Bridge",
+        )
         ok, detail = await _verify_bridge_login(
             host=CONNECT_DEFAULT_HOST,
             port=CONNECT_DEFAULT_PORT,
@@ -2442,6 +2965,10 @@ async def connect_password(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             detail,
         )
 
+    await _set_connect_status(
+        context,
+        "🛠️ Bridge CLI: stop service → login Proton → restart…",
+    )
     return await _drive_bridge_login(
         update,
         context,
@@ -2480,12 +3007,17 @@ async def connect_recovery_verify(
         await update.effective_message.reply_text(  # type: ignore[union-attr]
             "Sesi /connect kedaluwarsa. Mulai lagi dengan /connect."
         )
+        await _close_connect_status(context, "❌ Sesi kedaluwarsa")
         return ConversationHandler.END
 
     # Restore the tracker stashed at the start of ``connect_password``
     # so the success-log cleanup in :func:`_finalize_connect` includes
     # everything emitted before the recovery-verify wait state.
     tracker = user_data.get("connect_log_tracker")
+    await _set_connect_status(
+        context,
+        "🛠️ Bridge CLI: stop service → login Proton → restart…",
+    )
     return await _perform_bridge_add_account(
         update,
         context,
@@ -2579,10 +3111,18 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_data.pop("bridge_email", None)
     user_data.pop("bridge_smoke_tempmail", None)
     user_data.pop("proton_password", None)
+    # Flip the live status anchor (if any) to a terminal "Dibatalkan"
+    # label first so the indicator doesn't keep displaying a stale
+    # "Tunggu input password…" after the user has clearly chosen to
+    # abort. The anchor message itself stays in chat (no tracker
+    # cleanup on cancel — see comment below).
+    await _close_connect_status(context, "🛑 Dibatalkan oleh user")
     # Drop the success-log tracker stash (request #8). On cancel we
     # deliberately do NOT cleanup the chat: the user might want to
     # see the partial log to understand what failed.
     user_data.pop("connect_log_tracker", None)
+    user_data.pop("connect_last_log_text", None)
+    user_data.pop("connect_last_log_msg", None)
     user_data.pop("connect_proton_password", None)
     bridge_admin = _bot_bridge_admin(context)
     if bridge_admin is not None:
@@ -4104,7 +4644,35 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if primary is None:
             await query.answer("Email utama tidak ditemukan.", show_alert=True)
             return
+        # Disconnect can take 10-30s end-to-end (stop_for_primary →
+        # bridge --cli delete account → bridge restart → DB delete).
+        # Without a live anchor the user just stares at the unchanged
+        # picker message wondering if the bot died — exactly the
+        # complaint that drove the /connect progress indicator. Anchor
+        # the same StatusReporter pattern here so every >3s phase is
+        # narrated. Best-effort: if the anchor send fails (rare) we
+        # silently fall back to the original code path.
+        disconnect_status: StatusReporter | None = None
+        disconnect_initial_label = "⏳ Mempersiapkan hapus akun…"
+        try:
+            anchor = await query.message.reply_text(  # type: ignore[union-attr]
+                f"🗑️ Hapus akun <b>{html.escape(primary.email)}</b>…",
+                parse_mode=ParseMode.HTML,
+                reply_markup=build_status_keyboard(disconnect_initial_label),
+            )
+        except Exception:
+            anchor = None
+        if anchor is not None:
+            disconnect_status = StatusReporter(
+                context.application.bot,
+                chat_id,
+                anchor.message_id,
+                initial_label=disconnect_initial_label,
+            )
         manager = _bot_manager(context)
+        if disconnect_status is not None:
+            with contextlib.suppress(Exception):
+                await disconnect_status.update("🛑 Stop IMAP listener…")
         await manager.stop_for_primary(primary_id)
         # Best-effort logout from the host Proton Bridge so a future
         # /connect for the same email is a clean slate (no cached
@@ -4113,6 +4681,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         bridge_admin = _bot_bridge_admin(context)
         bridge_removed = False
         if bridge_admin is not None:
+            if disconnect_status is not None:
+                with contextlib.suppress(Exception):
+                    await disconnect_status.update(
+                        "🗑️ Hapus akun dari Proton Bridge vault…"
+                    )
             try:
                 bridge_removed = await bridge_admin.remove_account(primary.email)
             except Exception:
@@ -4120,7 +4693,18 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     "bridge_admin.remove_account failed for %s",
                     primary.email,
                 )
+        if disconnect_status is not None:
+            with contextlib.suppress(Exception):
+                await disconnect_status.update(
+                    "🗄️ Hapus alias + kredensial dari DB…"
+                )
         await db.delete_primary_account(chat_id, primary_id)
+        if disconnect_status is not None:
+            with contextlib.suppress(Exception):
+                await disconnect_status.done(
+                    "✅ Akun dihapus" if bridge_removed or bridge_admin is None
+                    else "⚠️ DB dihapus, Bridge perlu cek manual"
+                )
         if bridge_admin is None:
             suffix = ""
         elif bridge_removed:

@@ -197,6 +197,51 @@ def test_alias_keyboard_empty_state_has_back_button() -> None:
     assert any(b.callback_data == "backp" for b in flat)
 
 
+def test_alias_keyboard_shows_smart_topup_when_below_target() -> None:
+    """User screenshot: with 12 aliases (target 20), the alias list view
+    must show a "✨ Tambah 8 alamat lagi" button so the user can top
+    up without computing the math themselves. The callback embeds the
+    primary id and the missing count so /genaddr generates the exact
+    number requested.
+    """
+    primary = _fake_primary(pid=7, email="vielz64@proton.me")
+    aliases = [
+        AliasRecord(
+            id=i, chat_id=1, email=f"vielz0{i}@proton.me", status=AliasStatus.AVAILABLE
+        )
+        for i in range(12)
+    ]
+    markup = _build_alias_keyboard_for_primary(primary, aliases)
+    flat = [b for row in markup.inline_keyboard for b in row]
+    topup_buttons = [
+        b for b in flat if (b.callback_data or "").startswith("qgenaddr:")
+    ]
+    assert len(topup_buttons) == 1
+    assert topup_buttons[0].callback_data == "qgenaddr:7:8"
+    assert topup_buttons[0].text == "✨ Tambah 8 alamat lagi"
+
+
+def test_alias_keyboard_hides_smart_topup_when_at_or_above_target() -> None:
+    """When the primary already meets / exceeds ``ALIAS_TARGET_PER_PRIMARY``
+    the smart top-up button must NOT be rendered — the user explicitly
+    asked for it to disappear ("klo sudh 20 tidak usah di tampilkan
+    lagi"). Otherwise tapping the button would generate 0 aliases.
+    """
+    primary = _fake_primary(pid=7, email="vielz64@proton.me")
+    aliases = [
+        AliasRecord(
+            id=i, chat_id=1, email=f"vielz0{i}@proton.me", status=AliasStatus.AVAILABLE
+        )
+        for i in range(20)
+    ]
+    markup = _build_alias_keyboard_for_primary(primary, aliases)
+    flat = [b for row in markup.inline_keyboard for b in row]
+    topup_buttons = [
+        b for b in flat if (b.callback_data or "").startswith("qgenaddr:")
+    ]
+    assert topup_buttons == []
+
+
 def test_primary_keyboard_includes_alias_counts_and_active_marker() -> None:
     p1 = _fake_primary(pid=1, email="vielz43@proton.me")
     p2 = _fake_primary(pid=2, email="vielz22@proton.me")

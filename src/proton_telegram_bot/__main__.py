@@ -7,7 +7,7 @@ import logging
 from telegram import BotCommand
 from telegram.ext import Application, ApplicationBuilder
 
-from .bot import TelegramNotifier, build_handlers
+from .bot import TelegramNotifier, build_handlers, on_error
 from .bridge_admin import BridgeAdmin
 from .config import Settings, load_settings
 from .crypto import CredentialCipher
@@ -79,13 +79,24 @@ async def _post_shutdown(application: Application) -> None:
 
 
 def _build_application(settings: Settings) -> Application:
+    # ``concurrent_updates=True`` lets PTB dispatch handlers in parallel
+    # tasks instead of one-at-a-time. Without this a single user whose
+    # /connect flow is mid smoke-test (60-150s) blocks every other
+    # update — including /start, /cancel, /accounts — making the bot
+    # appear "mati" even though the polling loop is healthy. The user
+    # explicitly asked: "jangan error stuck lagi kedepannya".
     application = (
         ApplicationBuilder()
         .token(settings.telegram_bot_token)
+        .concurrent_updates(True)
         .post_init(_post_init)
         .post_shutdown(_post_shutdown)
         .build()
     )
+    # Global error handler: any exception raised inside a handler funnels
+    # here instead of bubbling up and silently killing the polling loop.
+    # See ``on_error`` for the reply-and-log behaviour.
+    application.add_error_handler(on_error)
     db = Database(settings.database_path)
     cipher = CredentialCipher(settings.encryption_key)
     notifier = TelegramNotifier(application)

@@ -12,7 +12,38 @@ from html.parser import HTMLParser
 from typing import ClassVar
 
 RECIPIENT_HEADERS = ("Delivered-To", "X-Original-To", "To", "Cc", "Bcc")
-MAX_BODY_PREVIEW_CHARS = 1500
+# Cap on the body preview rendered into a Telegram message. The user
+# complained that Stripe / Cognition-style notifications produced huge
+# walls of whitespace + boilerplate footer ("Unsubscribe Preferences",
+# legal address, "View in browser" …) that pushed the actual content
+# off-screen. 700 chars fits roughly one phone-screen of text; the
+# footer-stripping pass below removes most marketing fluff before
+# truncation kicks in.
+MAX_BODY_PREVIEW_CHARS = 700
+
+# Lines / phrases that mark the boundary between the actual email
+# content and marketing / legal boilerplate. Anything from the FIRST
+# match onward is dropped before the body is shown to the user. Match
+# is case-insensitive and looks at *whole-line* matches so a sentence
+# like "please don't unsubscribe yet!" inside the actual body isn't
+# accidentally treated as a footer marker.
+_FOOTER_MARKERS: tuple[str, ...] = (
+    "unsubscribe",
+    "unsubscribe preferences",
+    "manage preferences",
+    "manage your preferences",
+    "update your preferences",
+    "view this email in your browser",
+    "view in browser",
+    "view it in your browser",
+    "this email was sent to",
+    "you are receiving this email because",
+    "you received this email because",
+    "no longer wish to receive",
+    "© ",
+    "(c) ",
+    "all rights reserved",
+)
 
 # Match a 4-8 digit code that stands alone (surrounded by non-digit / boundary).
 # Telegram's HTML parser will render ``<code>...</code>`` as tap-to-copy on
@@ -129,11 +160,54 @@ def _decode_part(part: Message) -> str:
         return bytes(payload).decode("utf-8", errors="replace")
 
 
+def _strip_email_footer(text: str) -> str:
+    """Drop everything from the first known boilerplate marker onward.
+
+    Marketing emails (Stripe, Mailchimp, Cognition transactional, …)
+    almost always end with "Unsubscribe / Unsubscribe Preferences /
+    legal address / © Year Co." — and those footers convert to huge
+    whitespace blobs after HTML→text. The user explicitly complained
+    that those footers were pushing the real content off-screen
+    ("hasilnya terlalu makan banyak text"). We scan whole-line
+    occurrences (case-insensitive) and cut the body at the first
+    match. The match is anchored to "whole line ≈ marker" — i.e. the
+    line, after stripping leading/trailing whitespace, is *only* the
+    marker — so a sentence like "please don't unsubscribe yet" in
+    the actual body never accidentally triggers a cut.
+    """
+    if not text:
+        return text
+    lines = text.splitlines()
+    cut_at: int | None = None
+    for idx, line in enumerate(lines):
+        normalized = line.strip().lower()
+        if not normalized:
+            continue
+        for marker in _FOOTER_MARKERS:
+            # Whole-line marker: the line is essentially just the
+            # marker (possibly with trailing punctuation/colon).
+            if normalized == marker:
+                cut_at = idx
+                break
+            if normalized.startswith(marker) and len(normalized) <= len(marker) + 6:
+                cut_at = idx
+                break
+        if cut_at is not None:
+            break
+    if cut_at is None:
+        return text
+    trimmed = "\n".join(lines[:cut_at]).rstrip()
+    return trimmed
+
+
 def get_text_body(message: Message) -> str:
     """Best-effort extraction of a readable plain-text body from an email message.
 
     Prefers ``text/plain`` parts. Falls back to ``text/html`` and strips the
     HTML so users see clean text in Telegram instead of raw markup.
+    Marketing/legal footers ("Unsubscribe", "© 2026 Co.", "view in
+    browser", …) are removed before the body is returned so the
+    Telegram preview doesn't get drowned in boilerplate.
     """
     plain_part: Message | None = None
     html_part: Message | None = None
@@ -159,9 +233,9 @@ def get_text_body(message: Message) -> str:
             # Unknown single-part body; return whatever decodes.
             return _decode_part(message)
     if plain_part is not None:
-        return _decode_part(plain_part)
+        return _strip_email_footer(_decode_part(plain_part))
     if html_part is not None:
-        return html_to_text(_decode_part(html_part))
+        return _strip_email_footer(html_to_text(_decode_part(html_part)))
     return ""
 
 
@@ -184,18 +258,43 @@ def summarize(message: Message, max_chars: int = MAX_BODY_PREVIEW_CHARS) -> dict
 
 
 def collapse_blank_lines(text: str) -> str:
-    """Collapse runs of 2+ blank lines into a single blank line.
+    """Collapse runs of 2+ blank lines into a single blank line and
+    drop "decorative" lines that contribute no information.
 
     Forwarded emails often arrive with huge vertical gaps (HTML→text
-    conversion + signature padding). Telegram doesn't render extra blank
-    space well on mobile, so we cap at one blank line between paragraphs.
+    conversion + signature padding) and decorator lines like ``"---"``
+    or ``"   -   "`` between sections. Telegram renders both as wasted
+    space on mobile, so we:
+
+    * strip trailing whitespace from every line;
+    * drop lines that are only punctuation / whitespace (e.g. ``"-"``,
+      ``"  -  "``, ``"==="``) — the surrounding paragraph break is
+      kept;
+    * cap consecutive newlines at 2 (one blank line) so paragraphs
+      stay separated but never sprawl into screenfuls of empty space.
+
     Returns ``text`` with trailing whitespace stripped per-line and at
     most ``\\n\\n`` between non-empty paragraphs.
     """
     if not text:
         return text
     # Strip trailing spaces per line so " \n" doesn't read as content.
-    cleaned = "\n".join(line.rstrip() for line in text.splitlines())
+    cleaned_lines: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.rstrip()
+        # Drop separator-only lines like "---", "  -  ", "===", "***"
+        # — they provide visual structure in HTML emails but only
+        # eat space in Telegram. Keep blank lines (they participate
+        # in paragraph collapsing below).
+        stripped = line.strip()
+        if stripped and not re.search(r"[A-Za-z0-9]", stripped):
+            # No alphanumeric content → decorator only. Replace with a
+            # blank line so paragraphs above and below stay separated
+            # without an explicit "  -  " in between.
+            cleaned_lines.append("")
+            continue
+        cleaned_lines.append(line)
+    cleaned = "\n".join(cleaned_lines)
     # Collapse 3+ consecutive newlines down to 2 (one blank line).
     return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
 

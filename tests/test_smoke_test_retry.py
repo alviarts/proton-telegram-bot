@@ -99,12 +99,18 @@ async def test_smoke_test_with_retry_succeeds_on_second_attempt(
 async def test_smoke_test_with_retry_returns_false_after_exhaustion(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Both attempts fail → returns False, on_retry fired once (between
-    the two attempts), no sleep AFTER the final attempt."""
+    """All attempts fail → returns False, on_retry fired between every
+    consecutive pair (so ``MAX_ATTEMPTS - 1`` times), and no sleep
+    AFTER the final attempt.
+
+    The sequence has to match the production ``SMTP_SMOKE_MAX_ATTEMPTS``
+    constant — bumping the constant from 2 → 3 (PR-anti-stuck) means
+    we now feed three False values to exhaust the loop.
+    """
     monkeypatch.setattr(
         bot,
         "_smoke_test_via_tempmail",
-        _make_smoke_sequence([False, False]),
+        _make_smoke_sequence([False] * bot.SMTP_SMOKE_MAX_ATTEMPTS),
     )
     retries: list[int] = []
     sleeps: list[float] = []
@@ -124,9 +130,10 @@ async def test_smoke_test_with_retry_returns_false_after_exhaustion(
         sleep=_sleep,
     )
     assert ok is False
-    # on_retry fired between attempt 1 and 2, NOT after the final one.
-    assert retries == [1]
-    assert sleeps == [bot.SMTP_SMOKE_RETRY_DELAY_SECONDS]
+    # on_retry fires between every consecutive pair, NOT after the last.
+    expected_retries = list(range(1, bot.SMTP_SMOKE_MAX_ATTEMPTS))
+    assert retries == expected_retries
+    assert sleeps == [bot.SMTP_SMOKE_RETRY_DELAY_SECONDS] * len(expected_retries)
 
 
 async def test_smoke_test_with_retry_swallows_on_retry_exception(
