@@ -47,6 +47,7 @@ def test_build_handlers_registers_new_commands() -> None:
     # Service-label feature
     assert "services" in commands
     assert "aliasinfo" in commands
+    assert "cleanmail" in commands
 
 
 def test_build_handlers_has_setprotonpw_conversation() -> None:

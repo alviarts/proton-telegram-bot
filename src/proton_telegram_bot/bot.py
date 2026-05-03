@@ -1430,6 +1430,91 @@ async def cmd_aliasinfo(
     )
 
 
+# --------------------------------------------------------------- /cleanmail
+
+
+@_gate
+async def cmd_cleanmail(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """One-shot cleanup of legacy email forwards in the chat.
+
+    The auto-purge on alias-switch only knows about messages forwarded
+    *after* the feature was deployed (the bot writes to
+    ``forwarded_emails`` then). For chats that already accumulated lots
+    of stale forwards before the feature shipped — or for any other
+    bot-sent message we want to wipe — this command walks message ids
+    backward from the ``/cleanmail`` invocation itself and best-effort
+    calls ``delete_message`` on each. Telegram silently rejects deletes
+    on user-sent messages and on messages older than 48h, so the worst
+    case is "did nothing" rather than data loss.
+
+    Usage:
+      /cleanmail            — try the last 100 message ids
+      /cleanmail <count>    — try the last <count> ids (capped at 500)
+    """
+    chat = update.effective_chat
+    msg = update.effective_message
+    if chat is None or msg is None:
+        return
+    requested = 100
+    if context.args:
+        try:
+            requested = int(context.args[0])
+        except (TypeError, ValueError):
+            await msg.reply_text(
+                "Format: <code>/cleanmail [jumlah]</code>\n"
+                "Contoh: <code>/cleanmail 200</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+    # Cap so we don't accidentally hammer the Bot API. 500 ids ≈ ~17s
+    # of API calls under the default rate limit of ~30/sec.
+    requested = max(1, min(requested, 500))
+    bot = context.application.bot
+    db = _bot_db(context)
+    cleanmail_msg_id = msg.message_id
+    progress = await msg.reply_text(
+        f"🧹 Membersihkan {requested} pesan terakhir… (best-effort)"
+    )
+    deleted = 0
+    failed = 0
+    # Iterate from the most recent id backward (skip the cleanmail
+    # command and progress reply themselves so the user keeps a
+    # confirmation in chat).
+    skip_ids = {cleanmail_msg_id, progress.message_id}
+    for offset in range(1, requested + 1):
+        candidate = cleanmail_msg_id - offset
+        if candidate <= 0 or candidate in skip_ids:
+            continue
+        try:
+            await bot.delete_message(chat_id=chat.id, message_id=candidate)
+            deleted += 1
+        except Exception:
+            failed += 1
+    # Pop any remaining forwarded_emails rows for this chat too — those
+    # message ids were either inside the deletion window above or they
+    # were already wiped by an earlier alias-switch. Either way the
+    # bookkeeping should match the chat state.
+    await db.conn.execute(
+        "DELETE FROM forwarded_emails WHERE chat_id = ?", (chat.id,)
+    )
+    await db.conn.commit()
+    try:
+        await progress.edit_text(
+            f"🧹 Selesai: dihapus <b>{deleted}</b>, dilewati <b>{failed}</b> "
+            f"(milik user, &gt;48 jam, atau bukan dari bot).\n"
+            f"Tabel <code>forwarded_emails</code> juga di-reset untuk chat ini.",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        # If the progress message itself was caught in the sweep, just
+        # send a fresh one.
+        await msg.reply_text(
+            f"🧹 Selesai: dihapus {deleted}, dilewati {failed}."
+        )
+
+
 # ----------------------------------------------- /tag-service conversation
 
 
@@ -5941,6 +6026,7 @@ def build_handlers() -> list:
         CommandHandler("cekimap", cmd_cekimap),
         CommandHandler("services", cmd_services),
         CommandHandler("aliasinfo", cmd_aliasinfo),
+        CommandHandler("cleanmail", cmd_cleanmail),
         connect_conv,
         sync_conv,
         setpw_conv,
