@@ -8,7 +8,62 @@ from pathlib import Path
 import aiosqlite
 
 from .alias_gen import GenState
-from .models import AliasRecord, AliasStatus, BridgeCredentials, PrimaryAccount, UserRecord
+from .models import (
+    AliasRecord,
+    AliasSenderRecord,
+    AliasStatus,
+    BridgeCredentials,
+    PrimaryAccount,
+    UserRecord,
+)
+
+# Built-in domain → friendly-label fallback. Chat-level overrides
+# (``service_labels`` table) take priority; this dict is the last resort.
+DEFAULT_SERVICE_LABELS: dict[str, str] = {
+    "cognition.ai": "Devin",
+    "github.com": "GitHub",
+    "google.com": "Google",
+    "accounts.google.com": "Google",
+    "discord.com": "Discord",
+    "openai.com": "OpenAI",
+    "chat.openai.com": "OpenAI",
+    "linkedin.com": "LinkedIn",
+    "twitter.com": "X/Twitter",
+    "x.com": "X/Twitter",
+    "facebook.com": "Facebook",
+    "meta.com": "Meta",
+    "instagram.com": "Instagram",
+    "apple.com": "Apple",
+    "microsoft.com": "Microsoft",
+    "live.com": "Microsoft",
+    "outlook.com": "Microsoft",
+    "amazon.com": "Amazon",
+    "aws.amazon.com": "AWS",
+    "stripe.com": "Stripe",
+    "netlify.com": "Netlify",
+    "vercel.com": "Vercel",
+    "cloudflare.com": "Cloudflare",
+    "digitalocean.com": "DigitalOcean",
+    "heroku.com": "Heroku",
+    "gitlab.com": "GitLab",
+    "bitbucket.org": "Bitbucket",
+    "notion.so": "Notion",
+    "slack.com": "Slack",
+    "telegram.org": "Telegram",
+    "reddit.com": "Reddit",
+    "stackoverflow.com": "StackOverflow",
+    "npm.io": "npm",
+    "npmjs.com": "npm",
+    "pypi.org": "PyPI",
+    "docker.com": "Docker",
+    "fly.io": "Fly.io",
+    "railway.app": "Railway",
+    "supabase.io": "Supabase",
+    "supabase.com": "Supabase",
+    "firebase.google.com": "Firebase",
+    "sentry.io": "Sentry",
+    "datadog.com": "Datadog",
+}
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -65,8 +120,41 @@ CREATE TABLE IF NOT EXISTS alias_generator_state (
     FOREIGN KEY(chat_id) REFERENCES users(chat_id) ON DELETE CASCADE
 );
 
+-- Records unique (alias, sender_domain) pairs from incoming emails so each
+-- alias can be labelled with the services that have used it ("Devin",
+-- "GitHub", …). One row per alias+domain combination — we de-duplicate
+-- at insert time using ON CONFLICT.
+CREATE TABLE IF NOT EXISTS alias_senders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    alias_id INTEGER NOT NULL,
+    chat_id INTEGER NOT NULL,
+    sender_email TEXT,
+    sender_domain TEXT NOT NULL,
+    service_label TEXT,
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    seen_count INTEGER NOT NULL DEFAULT 1,
+    UNIQUE(alias_id, sender_domain),
+    FOREIGN KEY(alias_id) REFERENCES aliases(id) ON DELETE CASCADE,
+    FOREIGN KEY(chat_id) REFERENCES users(chat_id) ON DELETE CASCADE
+);
+
+-- Per-chat domain → friendly label mapping. The user can create/edit
+-- these via /services; they take priority over the built-in defaults
+-- in ``DEFAULT_SERVICE_LABELS``.
+CREATE TABLE IF NOT EXISTS service_labels (
+    chat_id INTEGER NOT NULL,
+    domain TEXT NOT NULL,
+    label TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (chat_id, domain),
+    FOREIGN KEY(chat_id) REFERENCES users(chat_id) ON DELETE CASCADE
+);
+
 CREATE INDEX IF NOT EXISTS idx_aliases_chat_status ON aliases(chat_id, status);
 CREATE INDEX IF NOT EXISTS idx_primary_chat ON primary_accounts(chat_id);
+CREATE INDEX IF NOT EXISTS idx_alias_senders_alias ON alias_senders(alias_id);
+CREATE INDEX IF NOT EXISTS idx_alias_senders_chat ON alias_senders(chat_id);
 """
 
 
@@ -736,6 +824,179 @@ class Database:
         await self.conn.commit()
         return (cursor.rowcount or 0) > 0
 
+    # -------------------------------------------------------- alias_senders
+
+    async def record_alias_sender(
+        self,
+        chat_id: int,
+        alias_id: int,
+        sender_email: str,
+        sender_domain: str,
+    ) -> str | None:
+        """Insert/update the (alias, sender_domain) row.
+
+        Returns the resolved service label at insert time (chat override
+        first, then ``DEFAULT_SERVICE_LABELS``, walking parent domains).
+        Subsequent emails from the same sender bump ``seen_count`` /
+        ``last_seen_at`` only — they do *not* re-resolve the label so a
+        manual rename in /services is preserved.
+        """
+        sender_domain = sender_domain.strip().lower()
+        sender_email = sender_email.strip().lower() if sender_email else None
+        if not sender_domain:
+            return None
+        label = await self.resolve_service_label(chat_id, sender_domain)
+        now = _utcnow()
+        await self.conn.execute(
+            "INSERT INTO alias_senders "
+            "(alias_id, chat_id, sender_email, sender_domain, "
+            "service_label, first_seen_at, last_seen_at, seen_count) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, 1) "
+            "ON CONFLICT(alias_id, sender_domain) DO UPDATE SET "
+            "last_seen_at = excluded.last_seen_at, "
+            "seen_count = seen_count + 1, "
+            "sender_email = COALESCE(excluded.sender_email, sender_email)",
+            (
+                alias_id,
+                chat_id,
+                sender_email,
+                sender_domain,
+                label,
+                now,
+                now,
+            ),
+        )
+        await self.conn.commit()
+        return label
+
+    async def list_alias_senders(
+        self, chat_id: int, alias_id: int
+    ) -> list[AliasSenderRecord]:
+        """Full sender history for one alias, most-recent first."""
+        async with self.conn.execute(
+            "SELECT id, alias_id, chat_id, sender_email, sender_domain, "
+            "service_label, first_seen_at, last_seen_at, seen_count "
+            "FROM alias_senders "
+            "WHERE chat_id = ? AND alias_id = ? "
+            "ORDER BY last_seen_at DESC",
+            (chat_id, alias_id),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [_row_to_alias_sender(row) for row in rows]
+
+    async def get_alias_service_labels(
+        self, chat_id: int, primary_id: int | None = None
+    ) -> dict[int, list[str]]:
+        """Return ``{alias_id: [labels…]}`` for the chat (optionally one primary).
+
+        Labels are re-resolved on every call so a /services edit takes
+        effect immediately without backfilling old rows. Domains with
+        no resolvable label appear as the raw domain so the user always
+        sees *something* useful.
+        """
+        if primary_id is None:
+            async with self.conn.execute(
+                "SELECT s.alias_id, s.sender_domain, s.last_seen_at "
+                "FROM alias_senders s "
+                "WHERE s.chat_id = ? "
+                "ORDER BY s.last_seen_at DESC",
+                (chat_id,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+        else:
+            async with self.conn.execute(
+                "SELECT s.alias_id, s.sender_domain, s.last_seen_at "
+                "FROM alias_senders s "
+                "JOIN aliases a ON a.id = s.alias_id "
+                "WHERE s.chat_id = ? AND a.primary_id = ? "
+                "ORDER BY s.last_seen_at DESC",
+                (chat_id, primary_id),
+            ) as cursor:
+                rows = await cursor.fetchall()
+        # Resolve labels in bulk by domain so we don't hit the DB once
+        # per row when many aliases share a sender domain.
+        unique_domains = {row["sender_domain"] for row in rows}
+        resolved: dict[str, str] = {}
+        for domain in unique_domains:
+            label = await self.resolve_service_label(chat_id, domain)
+            resolved[domain] = label or domain
+        out: dict[int, list[str]] = {}
+        for row in rows:
+            alias_id = row["alias_id"]
+            label = resolved[row["sender_domain"]]
+            bucket = out.setdefault(alias_id, [])
+            if label not in bucket:
+                bucket.append(label)
+        return out
+
+    # -------------------------------------------------------- service_labels
+
+    async def resolve_service_label(
+        self, chat_id: int, domain: str
+    ) -> str | None:
+        """Resolve a domain to its friendly label.
+
+        Lookup order:
+        1. Chat's own ``service_labels`` (exact match, then strip leftmost
+           subdomain and retry until 2 labels remain).
+        2. ``DEFAULT_SERVICE_LABELS`` with the same parent-domain walk.
+        3. ``None`` if nothing matches — caller usually shows the raw
+           domain as a last resort.
+        """
+        domain = domain.strip().lower()
+        if not domain:
+            return None
+        candidates: list[str] = [domain]
+        parts = domain.split(".")
+        while len(parts) > 2:
+            parts = parts[1:]
+            candidates.append(".".join(parts))
+        # Chat-level override wins, walked parent → root.
+        async with self.conn.execute(
+            "SELECT domain, label FROM service_labels WHERE chat_id = ?",
+            (chat_id,),
+        ) as cursor:
+            user_rows = await cursor.fetchall()
+        user_map = {row["domain"]: row["label"] for row in user_rows}
+        for candidate in candidates:
+            if candidate in user_map:
+                return user_map[candidate]
+        for candidate in candidates:
+            if candidate in DEFAULT_SERVICE_LABELS:
+                return DEFAULT_SERVICE_LABELS[candidate]
+        return None
+
+    async def set_service_label(
+        self, chat_id: int, domain: str, label: str
+    ) -> None:
+        domain = domain.strip().lower()
+        label = label.strip()
+        await self.upsert_user(chat_id)
+        await self.conn.execute(
+            "INSERT INTO service_labels (chat_id, domain, label, created_at) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(chat_id, domain) DO UPDATE SET label = excluded.label",
+            (chat_id, domain, label, _utcnow()),
+        )
+        await self.conn.commit()
+
+    async def remove_service_label(self, chat_id: int, domain: str) -> bool:
+        cursor = await self.conn.execute(
+            "DELETE FROM service_labels WHERE chat_id = ? AND domain = ?",
+            (chat_id, domain.strip().lower()),
+        )
+        await self.conn.commit()
+        return (cursor.rowcount or 0) > 0
+
+    async def list_service_labels(self, chat_id: int) -> list[tuple[str, str]]:
+        async with self.conn.execute(
+            "SELECT domain, label FROM service_labels "
+            "WHERE chat_id = ? ORDER BY domain",
+            (chat_id,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [(row["domain"], row["label"]) for row in rows]
+
 
 def credentials_from_user(user: UserRecord, plaintext_password: str) -> BridgeCredentials:
     """Reconstruct a BridgeCredentials object after decrypting the stored password."""
@@ -771,6 +1032,20 @@ def _row_to_alias(row: aiosqlite.Row) -> AliasRecord:
         consumed_at=row["consumed_at"],
         last_message_id=row["last_message_id"],
         primary_id=row["primary_id"] if "primary_id" in row.keys() else None,
+    )
+
+
+def _row_to_alias_sender(row: aiosqlite.Row) -> AliasSenderRecord:
+    return AliasSenderRecord(
+        id=row["id"],
+        alias_id=row["alias_id"],
+        chat_id=row["chat_id"],
+        sender_email=row["sender_email"],
+        sender_domain=row["sender_domain"],
+        service_label=row["service_label"],
+        first_seen_at=row["first_seen_at"],
+        last_seen_at=row["last_seen_at"],
+        seen_count=row["seen_count"],
     )
 
 

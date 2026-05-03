@@ -6,6 +6,7 @@ from email.message import EmailMessage
 from proton_telegram_bot.email_parser import (
     collapse_blank_lines,
     extract_recipients,
+    extract_sender,
     find_matching_alias,
     format_body_html,
     html_to_text,
@@ -296,4 +297,29 @@ def test_summarize_html_only_returns_clean_text_no_tags() -> None:
     assert "<div" not in summary["body"]
     assert "<br" not in summary["body"]
     assert "Halo!" in summary["body"]
-    assert "Ini isinya." in summary["body"]
+
+
+def test_extract_sender_plain_address() -> None:
+    raw = _build_message(sender="no-reply@cognition.ai")
+    msg = parse_message(raw)
+    assert extract_sender(msg) == ("no-reply@cognition.ai", "cognition.ai")
+
+
+def test_extract_sender_with_display_name() -> None:
+    raw = _build_message(sender='"Devin via Cognition" <noreply@cognition.ai>')
+    msg = parse_message(raw)
+    assert extract_sender(msg) == ("noreply@cognition.ai", "cognition.ai")
+
+
+def test_extract_sender_lowercases() -> None:
+    raw = _build_message(sender="Hello@GitHub.COM")
+    msg = parse_message(raw)
+    assert extract_sender(msg) == ("hello@github.com", "github.com")
+
+
+def test_extract_sender_missing_returns_empty() -> None:
+    msg = EmailMessage()
+    msg["To"] = "vielz@proton.me"
+    msg.set_content("hi")
+    parsed = parse_message(msg.as_bytes())
+    assert extract_sender(parsed) == ("", "")

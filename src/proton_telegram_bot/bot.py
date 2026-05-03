@@ -195,6 +195,11 @@ SYNC_CAPTCHA = 10
 # Conversation states for /setprotonpw
 SETPW_PICK_PRIMARY, SETPW_PASSWORD = 20, 21
 
+# Conversation states for the "🏷️ Tag ulang" button on forwarded emails.
+# Single-state flow: we kick off when the inline button is tapped, ask
+# for free-text label, persist it via ``set_service_label``, and end.
+TAG_AWAIT_LABEL = 30
+
 # Throttle: at most one progress edit every N addresses to stay well under
 # Telegram's edit_message rate limit during long /genaddr runs.
 # Kept for backwards-compat callers; the new background flow uses
@@ -279,6 +284,16 @@ CB_QUICK_HEALTHCHECK = "qhc"
 # progress through a :class:`StatusReporter` button that updates as
 # the scrape moves through its phases.
 CB_SYNC_PRIMARY = "syncp"
+# Tag-service flow: button attached to forwarded emails so the user can
+# label / re-label the sender's domain without using /services. Format:
+# ``tagsvc:<alias_id>:<sender_domain>``. The conversation handler asks
+# for the new label via free text. ``tagsvc_clear:<alias_id>:<domain>``
+# wipes the label so the alias falls back to the raw domain.
+CB_TAG_SERVICE = "tagsvc"
+CB_TAG_SERVICE_CLEAR = "tagsvc_clear"
+# /services keyboard: rows of ``svcdel:<domain>`` entries to one-tap
+# delete a chat-level mapping.
+CB_SVC_DELETE = "svcdel"
 
 # Soft target for total aliases per primary. After /cekimap or after
 # the per-primary "🔄 Sync" button finishes, if the alias count for
@@ -596,6 +611,55 @@ def _build_poll_now_keyboard(
     return InlineKeyboardMarkup(rows)
 
 
+# Telegram caps callback_data at 64 bytes. ``tagsvc:<alias_id>:<domain>``
+# fits comfortably for typical domains (alias_id ≤ 6 digits + colons +
+# domain ≤ 50 chars = well under 64). For pathologically long domains
+# we silently skip the button rather than truncating the domain (which
+# would break the round-trip to ``set_service_label``).
+_TG_CALLBACK_DATA_LIMIT = 64
+
+
+def _build_tag_service_keyboard(
+    *,
+    alias_id: int,
+    sender_domain: str,
+    current_label: str | None,
+) -> InlineKeyboardMarkup | None:
+    """Single-row keyboard attached to forwarded emails.
+
+    Lets the user (re)label the sender's domain (chat-wide mapping) or
+    clear an existing label. Returns ``None`` when the callback_data
+    payload would overflow Telegram's 64-byte cap so the email is
+    forwarded without buttons rather than crashing the send.
+    """
+    domain = sender_domain.strip().lower()
+    if not domain:
+        return None
+    tag_data = f"{CB_TAG_SERVICE}:{alias_id}:{domain}"
+    clear_data = f"{CB_TAG_SERVICE_CLEAR}:{alias_id}:{domain}"
+    if len(tag_data.encode()) > _TG_CALLBACK_DATA_LIMIT:
+        return None
+    label_for_button = current_label or domain
+    rows: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(
+                f"🏷️ Tag ulang ({label_for_button})", callback_data=tag_data
+            )
+        ]
+    ]
+    if current_label is not None:
+        # Only show "Hapus label" when there's actually a label to wipe.
+        if len(clear_data.encode()) <= _TG_CALLBACK_DATA_LIMIT:
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        "🗑️ Hapus label", callback_data=clear_data
+                    )
+                ]
+            )
+    return InlineKeyboardMarkup(rows)
+
+
 async def _alias_count_per_primary(
     db: Database, chat_id: int, primaries: list[PrimaryAccount]
 ) -> dict[int, int]:
@@ -604,6 +668,65 @@ async def _alias_count_per_primary(
         aliases = await db.list_aliases(chat_id, primary_id=primary.id)
         counts[primary.id] = len(aliases)
     return counts
+
+
+def _format_alias_with_labels(
+    alias_email: str,
+    labels: list[str],
+    *,
+    is_active: bool = False,
+    max_labels: int = 3,
+) -> str:
+    """Render a single ``"vielz008 · 📧 Devin, GitHub"`` line for /list.
+
+    Caps at ``max_labels`` visible labels with a ``+N`` overflow tail
+    so an alias used by many services doesn't blow out the message
+    width on mobile. The active alias gets a leading 🔒 to mirror the
+    keyboard button.
+    """
+    prefix = "🔒 " if is_active else "• "
+    base = f"{prefix}<code>{html.escape(alias_email)}</code>"
+    if not labels:
+        return base
+    visible = labels[:max_labels]
+    extra = len(labels) - len(visible)
+    rendered_labels = ", ".join(html.escape(label) for label in visible)
+    if extra > 0:
+        rendered_labels = f"{rendered_labels} +{extra}"
+    return f"{base}  ·  📧 {rendered_labels}"
+
+
+def _build_alias_list_text(
+    primary: PrimaryAccount,
+    aliases: list[AliasRecord],
+    labels_by_alias: dict[int, list[str]],
+    active_alias_id: int | None,
+) -> str:
+    """Compose the message body for ``/list`` per-primary view.
+
+    Header line is the primary's email + alias count. Each alias gets
+    one line with its service labels (when known). When *no* alias has
+    been tagged yet the body collapses back to the original single-
+    line header so the message stays short for fresh accounts.
+    """
+    header = (
+        f"📧 Alias di <b>{html.escape(primary.email)}</b> "
+        f"({len(aliases)} alias):"
+    )
+    has_any_label = any(labels_by_alias.get(a.id) for a in aliases)
+    if not has_any_label:
+        return header
+    lines = [header, ""]
+    for alias in aliases:
+        labels = labels_by_alias.get(alias.id, [])
+        lines.append(
+            _format_alias_with_labels(
+                alias.email,
+                labels,
+                is_active=(alias.id == active_alias_id),
+            )
+        )
+    return "\n".join(lines)
 
 
 async def _render_primary_alias_list(
@@ -628,11 +751,20 @@ async def _render_primary_alias_list(
         return None
     active = await db.get_active_alias(chat_id)
     active_alias_id = active.id if active and active.primary_id == primary.id else None
+    try:
+        labels_by_alias = await db.get_alias_service_labels(
+            chat_id, primary_id=primary.id
+        )
+    except Exception:
+        LOGGER.debug(
+            "get_alias_service_labels failed; falling back to empty",
+            exc_info=True,
+        )
+        labels_by_alias = {}
     return await bot.send_message(
         chat_id=chat_id,
-        text=(
-            f"📧 Alias di <b>{html.escape(primary.email)}</b> "
-            f"({len(aliases)} alias):"
+        text=_build_alias_list_text(
+            primary, aliases, labels_by_alias, active_alias_id
         ),
         parse_mode=ParseMode.HTML,
         reply_markup=_build_alias_keyboard_for_primary(
@@ -998,6 +1130,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/history — Lihat alias yang sudah terpakai\n"
         "/reset — Kembalikan alias ke daftar tersedia\n"
         "/cekimap — Cek IMAP listener semua alias (jalan di background)\n"
+        "/services — Atur label service (mis. cognition.ai → Devin)\n"
+        "/aliasinfo &lt;email&gt; — Lihat history pengirim alias tertentu\n"
         "/cancel — Batalkan dialog /connect"
     )
     greeting = _greeting(update)
@@ -1051,6 +1185,272 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     lines.append("\nUntuk mengaktifkan kembali: /reset <email>")
     await update.effective_message.reply_text("\n".join(lines))  # type: ignore[union-attr]
     await _maybe_send_lock_reminder(update, context)
+
+
+# --------------------------------------------------------------- /services
+
+
+def _build_services_keyboard(
+    user_labels: list[tuple[str, str]],
+) -> InlineKeyboardMarkup | None:
+    """One row per user-defined label with a 🗑 button to delete it.
+
+    Defaults from :data:`db.DEFAULT_SERVICE_LABELS` are NOT listed here
+    — they're an implicit fallback the user can override by saving
+    their own ``domain → label`` row. ``None`` means the user has no
+    custom mappings yet.
+    """
+    if not user_labels:
+        return None
+    rows: list[list[InlineKeyboardButton]] = []
+    for domain, label in user_labels:
+        callback = f"{CB_SVC_DELETE}:{domain}"
+        if len(callback.encode()) > _TG_CALLBACK_DATA_LIMIT:
+            # Domain too long to round-trip safely; show as informational.
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        f"{label}  ·  {domain}", callback_data=CB_NOOP
+                    )
+                ]
+            )
+            continue
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"🗑 {label}  ·  {domain}", callback_data=callback
+                )
+            ]
+        )
+    return InlineKeyboardMarkup(rows)
+
+
+@_gate
+async def cmd_services(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List/edit chat-level domain → service-label mappings.
+
+    Forms:
+      /services                     — list current mappings
+      /services <domain> = <label>  — upsert a mapping
+      /services del <domain>        — remove a mapping
+    """
+    chat = update.effective_chat
+    if chat is None or update.effective_message is None:
+        return
+    db = _bot_db(context)
+    args_text = " ".join(context.args or []).strip() if context.args else ""
+
+    if args_text:
+        lower = args_text.lower()
+        if lower.startswith("del ") or lower.startswith("delete "):
+            target = args_text.split(None, 1)[1].strip().lower()
+            removed = await db.remove_service_label(chat.id, target)
+            if removed:
+                await update.effective_message.reply_text(
+                    f"🗑 Mapping untuk <code>{html.escape(target)}</code> dihapus.",
+                    parse_mode=ParseMode.HTML,
+                )
+            else:
+                await update.effective_message.reply_text(
+                    f"Mapping untuk <code>{html.escape(target)}</code> tidak ada.",
+                    parse_mode=ParseMode.HTML,
+                )
+            return
+        if "=" in args_text:
+            domain_part, label_part = args_text.split("=", 1)
+            domain = domain_part.strip().lower()
+            label = label_part.strip()
+            if not domain or not label:
+                await update.effective_message.reply_text(
+                    "Format: <code>/services domain = label</code>",
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+            await db.set_service_label(chat.id, domain, label)
+            await update.effective_message.reply_text(
+                f"✅ <code>{html.escape(domain)}</code> → "
+                f"<b>{html.escape(label)}</b> tersimpan.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        await update.effective_message.reply_text(
+            "Format yang dikenali:\n"
+            "• <code>/services</code> — lihat semua mapping\n"
+            "• <code>/services domain = Label</code> — simpan / ubah\n"
+            "• <code>/services del domain</code> — hapus",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    user_labels = await db.list_service_labels(chat.id)
+    intro = (
+        "🏷️ <b>Mapping domain → service label</b>\n"
+        "Setiap email yang masuk ke alias akan diberi label sesuai "
+        "domain pengirimnya. Default sudah berisi <i>cognition.ai → "
+        "Devin</i>, <i>github.com → GitHub</i>, dst (lihat dokumentasi).\n\n"
+    )
+    if user_labels:
+        intro += "<b>Mapping kamu:</b>\n"
+        intro += "\n".join(
+            f"• <code>{html.escape(d)}</code> → <b>{html.escape(label)}</b>"
+            for d, label in user_labels
+        )
+        intro += (
+            "\n\nTap tombol di bawah untuk menghapus. "
+            "Untuk menambah/ubah: <code>/services domain = Label</code>."
+        )
+    else:
+        intro += (
+            "<i>Belum ada mapping kustom.</i>\n\n"
+            "Tambah dengan: <code>/services domain = Label</code>\n"
+            "Contoh: <code>/services roboneo.com = Roboneo</code>"
+        )
+    await update.effective_message.reply_text(
+        intro,
+        parse_mode=ParseMode.HTML,
+        reply_markup=_build_services_keyboard(user_labels),
+    )
+
+
+# --------------------------------------------------------------- /aliasinfo
+
+
+@_gate
+async def cmd_aliasinfo(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Show the sender history for one alias.
+
+    Usage: ``/aliasinfo <alias_email>``. Lists every domain that has
+    sent mail to this alias, with the resolved service label, first/
+    last-seen timestamps, and the number of messages.
+    """
+    chat = update.effective_chat
+    if chat is None or update.effective_message is None:
+        return
+    if not context.args:
+        await update.effective_message.reply_text(
+            "Format: <code>/aliasinfo &lt;email_alias&gt;</code>\n"
+            "Contoh: <code>/aliasinfo vielz008@proton.me</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    db = _bot_db(context)
+    target = context.args[0].strip().lower()
+    alias = await db.find_alias(chat.id, target)
+    if alias is None:
+        await update.effective_message.reply_text(
+            f"Alias <code>{html.escape(target)}</code> tidak ditemukan.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    senders = await db.list_alias_senders(chat.id, alias.id)
+    if not senders:
+        await update.effective_message.reply_text(
+            f"Alias <code>{html.escape(alias.email)}</code> belum pernah "
+            "menerima email (atau email-nya datang sebelum fitur tracking aktif).",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    lines = [
+        f"📧 <b>{html.escape(alias.email)}</b>",
+        f"Total <b>{len(senders)}</b> domain pengirim:",
+        "",
+    ]
+    for sender in senders:
+        # Re-resolve so a /services edit reflects without a backfill.
+        label = (
+            await db.resolve_service_label(chat.id, sender.sender_domain)
+            or sender.sender_domain
+        )
+        line = (
+            f"• 🏷️ <b>{html.escape(label)}</b>  ·  "
+            f"<code>{html.escape(sender.sender_domain)}</code>\n"
+            f"  {sender.seen_count}× — terakhir {sender.last_seen_at}"  # noqa: RUF001
+        )
+        lines.append(line)
+    await update.effective_message.reply_text(
+        "\n".join(lines), parse_mode=ParseMode.HTML
+    )
+
+
+# ----------------------------------------------- /tag-service conversation
+
+
+async def tag_service_entry(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Entry point for the ``🏷️ Tag ulang`` button.
+
+    Stashes ``(alias_id, sender_domain)`` in ``chat_data`` so the
+    follow-up text reply can persist the new label without re-parsing
+    the original callback payload (already consumed by Telegram).
+    """
+    query = update.callback_query
+    if query is None or query.data is None:
+        return ConversationHandler.END
+    parts = query.data.split(":", 2)
+    if len(parts) != 3:
+        await query.answer("Data tag tidak valid.", show_alert=True)
+        return ConversationHandler.END
+    try:
+        alias_id = int(parts[1])
+    except ValueError:
+        await query.answer("Alias id tidak valid.", show_alert=True)
+        return ConversationHandler.END
+    domain = parts[2].strip().lower()
+    if not domain:
+        await query.answer("Domain pengirim kosong.", show_alert=True)
+        return ConversationHandler.END
+    await query.answer()
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    if chat_id is None:
+        return ConversationHandler.END
+    db = _bot_db(context)
+    current = await db.resolve_service_label(chat_id, domain)
+    context.chat_data["pending_service_tag"] = {
+        "alias_id": alias_id,
+        "domain": domain,
+    }
+    prompt = (
+        f"🏷️ Set label untuk domain <code>{html.escape(domain)}</code>.\n"
+        f"Saat ini: <b>{html.escape(current or '(belum ada)')}</b>.\n\n"
+        "Balas dengan label baru (mis. <code>Devin</code>, <code>Roboneo</code>, "
+        "<code>Skip — work</code>). Kirim /cancel untuk batal."
+    )
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=prompt,
+        parse_mode=ParseMode.HTML,
+    )
+    return TAG_AWAIT_LABEL
+
+
+async def tag_service_label_received(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Persist the user's chosen label and end the conversation."""
+    if update.effective_message is None or update.effective_chat is None:
+        return ConversationHandler.END
+    pending = context.chat_data.pop("pending_service_tag", None)
+    if not isinstance(pending, dict):
+        return ConversationHandler.END
+    label = (update.effective_message.text or "").strip()
+    if not label:
+        await update.effective_message.reply_text(
+            "Label kosong, batal. Coba lagi via tombol 🏷️ di email."
+        )
+        return ConversationHandler.END
+    domain = pending["domain"]
+    db = _bot_db(context)
+    await db.set_service_label(update.effective_chat.id, domain, label)
+    await update.effective_message.reply_text(
+        f"✅ <code>{html.escape(domain)}</code> → "
+        f"<b>{html.escape(label)}</b> tersimpan. Email berikutnya dari "
+        "domain ini akan otomatis pakai label ini.",
+        parse_mode=ParseMode.HTML,
+    )
+    return ConversationHandler.END
 
 
 # --------------------------------------------------------------- /addalias
@@ -4491,6 +4891,66 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     data = query.data
     if data == CB_NOOP:
         return
+    if data.startswith(f"{CB_TAG_SERVICE_CLEAR}:"):
+        # ``tagsvc_clear:<alias_id>:<domain>`` — wipe the chat-level
+        # mapping so the alias falls back to the raw domain (or any
+        # built-in default that still applies).
+        parts = data.split(":", 2)
+        if len(parts) != 3:
+            await query.answer("Data tag tidak valid.", show_alert=True)
+            return
+        domain = parts[2].strip().lower()
+        removed = await db.remove_service_label(chat_id, domain)
+        if removed:
+            await query.answer(f"Label untuk {domain} dihapus.")
+        else:
+            await query.answer(
+                "Tidak ada label kustom untuk domain ini "
+                "(default bawaan bot tetap berlaku).",
+                show_alert=True,
+            )
+        # Refresh the inline keyboard on the email message so the
+        # "Tag ulang" button shows the new state immediately.
+        try:
+            new_label = await db.resolve_service_label(chat_id, domain)
+            try:
+                alias_id = int(parts[1])
+            except ValueError:
+                alias_id = -1
+            if alias_id > 0:
+                await query.edit_message_reply_markup(
+                    reply_markup=_build_tag_service_keyboard(
+                        alias_id=alias_id,
+                        sender_domain=domain,
+                        current_label=new_label,
+                    )
+                )
+        except Exception:
+            pass
+        return
+    if data.startswith(f"{CB_SVC_DELETE}:"):
+        # ``svcdel:<domain>`` from the /services keyboard.
+        domain = data.split(":", 1)[1].strip().lower()
+        if not domain:
+            await query.answer("Domain kosong.", show_alert=True)
+            return
+        removed = await db.remove_service_label(chat_id, domain)
+        if removed:
+            await query.answer(f"🗑 Mapping {domain} dihapus.")
+        else:
+            await query.answer(
+                "Mapping tidak ditemukan (mungkin sudah dihapus).",
+                show_alert=True,
+            )
+        # Re-render the /services keyboard in place.
+        try:
+            user_labels = await db.list_service_labels(chat_id)
+            await query.edit_message_reply_markup(
+                reply_markup=_build_services_keyboard(user_labels)
+            )
+        except Exception:
+            pass
+        return
     if data == CB_GENADDR_CANCEL:
         cancel_event = context.chat_data.get("genaddr_cancel_event")
         if cancel_event is None:
@@ -4622,9 +5082,16 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             else None
         )
         try:
+            labels_by_alias = await db.get_alias_service_labels(
+                chat_id, primary_id=primary_id
+            )
+        except Exception:
+            labels_by_alias = {}
+        try:
             await query.edit_message_text(
-                f"📧 Alias di <b>{html.escape(primary.email)}</b> "
-                f"({len(aliases)} alias):",
+                _build_alias_list_text(
+                    primary, aliases, labels_by_alias, active_alias_id
+                ),
                 reply_markup=_build_alias_keyboard_for_primary(
                     primary, aliases, active_alias_id
                 ),
@@ -4976,11 +5443,43 @@ class TelegramNotifier(Notifier):
         chat_id: int,
         alias_email: str,
         summary: dict[str, str],
+        *,
+        alias_id: int | None = None,
+        sender_email: str = "",
+        sender_domain: str = "",
     ) -> None:
+        # Resolve the current label so the forwarded email can show the
+        # service name in its header AND the inline button can offer an
+        # accurate "Tag ulang" affordance. ``resolve_service_label``
+        # walks ``service_labels`` then ``DEFAULT_SERVICE_LABELS`` so a
+        # /services edit reflects in real time without a backfill.
+        current_label: str | None = None
+        if sender_domain:
+            try:
+                db = self._application.bot_data.get("db")
+                if db is not None:
+                    current_label = await db.resolve_service_label(
+                        chat_id, sender_domain
+                    )
+            except Exception:
+                LOGGER.debug(
+                    "resolve_service_label failed in notifier", exc_info=True
+                )
+        text = _render_email_message(
+            alias_email, summary, service_label=current_label
+        )
+        markup: InlineKeyboardMarkup | None = None
+        if alias_id is not None and sender_domain:
+            markup = _build_tag_service_keyboard(
+                alias_id=alias_id,
+                sender_domain=sender_domain,
+                current_label=current_label,
+            )
         await self._application.bot.send_message(
             chat_id=chat_id,
-            text=_render_email_message(alias_email, summary),
+            text=text,
             parse_mode=ParseMode.HTML,
+            reply_markup=markup,
         )
 
     async def notify_aliases_discovered(
@@ -5007,7 +5506,12 @@ _TELEGRAM_MESSAGE_LIMIT = 4000
 _TRUNCATION_MARKER = "\n…(dipotong)"
 
 
-def _render_email_message(alias_email: str, summary: dict[str, str]) -> str:
+def _render_email_message(
+    alias_email: str,
+    summary: dict[str, str],
+    *,
+    service_label: str | None = None,
+) -> str:
     """Render the email-received Telegram message safely under the 4096-byte limit.
 
     The body is rendered through :func:`email_parser.format_body_html`, which:
@@ -5019,11 +5523,21 @@ def _render_email_message(alias_email: str, summary: dict[str, str]) -> str:
     The body is truncated *before* the final ``<code>`` injection so we never
     split an HTML entity (e.g. ``&amp;``) or a ``<code>`` tag at the byte
     boundary, which would cause Telegram's HTML parser to reject the message.
+
+    ``service_label`` is the currently-resolved friendly name for the
+    sender's domain (e.g. ``"Devin"``). When supplied it's appended to
+    the ``Dari:`` line so the user can spot at a glance which service
+    used the alias without scrolling to the keyboard below.
     """
     body = summary.get("body") or "(tidak ada isi text)"
+    from_rendered = html.escape(summary.get("from", "?"))
+    if service_label:
+        from_rendered = (
+            f"{from_rendered}  ·  🏷️ <b>{html.escape(service_label)}</b>"
+        )
     header = (
         f"<b>Email masuk untuk</b> <code>{html.escape(alias_email)}</code>\n"
-        f"<b>Dari:</b> {html.escape(summary.get('from', '?'))}\n"
+        f"<b>Dari:</b> {from_rendered}\n"
         f"<b>Subjek:</b> {html.escape(summary.get('subject', ''))}\n"
         f"<b>Tanggal:</b> {html.escape(summary.get('date', ''))}\n"
     )
@@ -5129,6 +5643,29 @@ def build_handlers() -> list:
         allow_reentry=True,
     )
 
+    # /tag-service: triggered by the inline "🏷️ Tag ulang" button on
+    # forwarded emails. The pattern matches ``tagsvc:<alias_id>:<domain>``
+    # — domain may contain dots/hyphens but no whitespace/colons.
+    tag_service_conv = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(
+                tag_service_entry,
+                pattern=rf"^{CB_TAG_SERVICE}:\d+:[A-Za-z0-9.\-]+$",
+            ),
+        ],
+        states={
+            TAG_AWAIT_LABEL: [
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND, tag_service_label_received
+                ),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cmd_cancel)],
+        name="tag_service",
+        persistent=False,
+        allow_reentry=True,
+    )
+
     setpw_conv = ConversationHandler(
         entry_points=[
             CommandHandler("setprotonpw", cmd_setprotonpw),
@@ -5164,9 +5701,15 @@ def build_handlers() -> list:
         CommandHandler("disconnect", cmd_disconnect),
         CommandHandler("genaddr", cmd_genaddr),
         CommandHandler("cekimap", cmd_cekimap),
+        CommandHandler("services", cmd_services),
+        CommandHandler("aliasinfo", cmd_aliasinfo),
         connect_conv,
         sync_conv,
         setpw_conv,
+        # Tag-service conv MUST come before the catch-all
+        # ``CallbackQueryHandler(on_callback)`` so the inline-button
+        # entry point wins over the catch-all.
+        tag_service_conv,
         # Live-status indicator buttons. The button is purely
         # informational; this handler just acks the tap so Telegram
         # clients drop the spinner. Must come BEFORE the catch-all

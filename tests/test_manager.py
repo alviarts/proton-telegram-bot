@@ -18,7 +18,16 @@ class _RecordingNotifier(Notifier):
         self.calls: list[tuple[int, str, dict[str, str]]] = []
         self.discovery_calls: list[tuple[int, list[str]]] = []
 
-    async def notify_email_received(self, chat_id, alias_email, summary) -> None:
+    async def notify_email_received(
+        self,
+        chat_id,
+        alias_email,
+        summary,
+        *,
+        alias_id=None,
+        sender_email="",
+        sender_domain="",
+    ) -> None:
         self.calls.append((chat_id, alias_email, summary))
 
     async def notify_aliases_discovered(self, chat_id, aliases) -> None:

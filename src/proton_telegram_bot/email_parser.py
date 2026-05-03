@@ -140,6 +140,21 @@ def extract_recipients(message: Message) -> set[str]:
     return recipients
 
 
+def extract_sender(message: Message) -> tuple[str, str]:
+    """Return ``(sender_email, sender_domain)`` from the From header.
+
+    Falls back to ``("", "")`` when the header is missing or unparsable.
+    """
+    raw_from = message.get("From") or ""
+    pairs = getaddresses([raw_from])
+    for _name, addr in pairs:
+        addr = addr.strip().lower()
+        if "@" in addr:
+            domain = addr.rsplit("@", 1)[1]
+            return addr, domain
+    return "", ""
+
+
 def find_matching_alias(message: Message, candidate_aliases: set[str]) -> str | None:
     """Return the first candidate alias that appears in the message recipients, if any."""
     recipients = extract_recipients(message)

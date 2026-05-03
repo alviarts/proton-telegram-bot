@@ -48,6 +48,21 @@ class AliasRecord:
 
 
 @dataclass(slots=True)
+class AliasSenderRecord:
+    """One row from ``alias_senders`` — a unique (alias, sender_domain) pair."""
+
+    id: int
+    alias_id: int
+    chat_id: int
+    sender_email: str | None
+    sender_domain: str
+    service_label: str | None
+    first_seen_at: str
+    last_seen_at: str
+    seen_count: int
+
+
+@dataclass(slots=True)
 class PrimaryAccount:
     """A single Proton Mail account that the bot monitors via Bridge IMAP.
 
