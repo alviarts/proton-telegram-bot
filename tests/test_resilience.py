@@ -171,3 +171,136 @@ def test_build_application_enables_concurrent_updates_and_error_handler(
     assert len(application.error_handlers) == 1
     handler_func = next(iter(application.error_handlers))
     assert handler_func is bot.on_error
+
+
+# ---------------------------------------------------------------------
+# Tests for /connect progress indicator + cleanup wiring
+# ---------------------------------------------------------------------
+#
+# The user explicitly asked for two UX guarantees:
+#
+#   1. "berikan progress bar dibawah sedang melakukan apa bot nya jadi
+#      user tidak mengira bot sudah selesai" — a single live status
+#      anchor whose label rotates through the current /connect phase
+#      so the user never confuses a 60-180s flow with a hung bot.
+#
+#   2. "hapus yang saya pilih ketika sudah berhasil" — every transient
+#      prompt the bot emits during /connect (intro, Step 1/2, password
+#      prompt, …) plus the status anchor itself must auto-delete a few
+#      seconds after the conversation completes successfully.
+#
+# These tests pin down the structural contract that satisfies both
+# requirements: ``_ensure_connect_progress`` creates exactly one
+# tracker + one StatusReporter pair (idempotent on re-entry),
+# ``_set_connect_status`` uses the reporter when it exists and is a
+# silent no-op otherwise, and ``_close_connect_status`` removes the
+# reporter from ``user_data`` so subsequent /connect runs start fresh.
+
+
+class _FakeMessage:
+    """Stand-in for ``telegram.Message`` used by the tracker tests."""
+
+    _next_id = 1000
+
+    def __init__(self) -> None:
+        type(self)._next_id += 1
+        self.message_id = type(self)._next_id
+
+    async def reply_text(self, *args: Any, **kwargs: Any) -> _FakeMessage:
+        return _FakeMessage()
+
+
+class _FakeUpdateWithMessage:
+    def __init__(self, chat_id: int = 12345) -> None:
+        self.effective_chat = _FakeChat(chat_id)
+        self.effective_message = _FakeMessage()
+
+
+def _make_progress_context(user_data: dict | None = None) -> Any:
+    ctx = MagicMock()
+    ctx.user_data = user_data if user_data is not None else {}
+    ctx.bot = MagicMock()
+    ctx.bot.edit_message_reply_markup = AsyncMock()
+    ctx.bot.delete_message = AsyncMock()
+    return ctx
+
+
+async def test_ensure_connect_progress_creates_tracker_and_status() -> None:
+    """First call must build a fresh tracker + StatusReporter pair and
+    stash them on ``user_data`` under the canonical keys so subsequent
+    handlers can retrieve them."""
+    update = _FakeUpdateWithMessage()
+    ctx = _make_progress_context()
+
+    tracker, status = await bot._ensure_connect_progress(update, ctx)
+
+    assert tracker is not None
+    assert status is not None
+    assert ctx.user_data["connect_log_tracker"] is tracker
+    assert ctx.user_data["connect_status_reporter"] is status
+    # The status anchor message must be tracked for cleanup so the
+    # final tracker.cleanup() deletes it alongside the rest of the log.
+    assert len(tracker) == 1
+
+
+async def test_ensure_connect_progress_is_idempotent() -> None:
+    """Second call (e.g. from ``connect_email`` after ``cmd_connect``)
+    must return the same tracker + reporter without spawning a second
+    anchor message — otherwise the user would see two status buttons."""
+    update = _FakeUpdateWithMessage()
+    ctx = _make_progress_context()
+
+    tracker1, status1 = await bot._ensure_connect_progress(update, ctx)
+    tracker2, status2 = await bot._ensure_connect_progress(update, ctx)
+
+    assert tracker1 is tracker2
+    assert status1 is status2
+    assert len(tracker1) == 1, "anchor message must not be re-tracked"
+
+
+async def test_set_connect_status_no_op_when_no_reporter() -> None:
+    """The label updater must silently degrade when no reporter has
+    been set up (legacy /connect path or direct call from a non-flow
+    handler) — never raise."""
+    ctx = _make_progress_context()
+    # Should be a complete no-op; if it raised we'd see it here.
+    await bot._set_connect_status(ctx, "🔌 Probe Bridge IMAP login…")
+
+
+async def test_set_connect_status_invokes_reporter_update() -> None:
+    """When a reporter exists, ``_set_connect_status`` must forward
+    the label to ``StatusReporter.update`` so the live button label
+    is actually edited."""
+    update = _FakeUpdateWithMessage()
+    ctx = _make_progress_context()
+    _, status = await bot._ensure_connect_progress(update, ctx)
+    assert status is not None
+    status.update = AsyncMock()  # type: ignore[method-assign]
+
+    await bot._set_connect_status(ctx, "🧪 Smoke test 1/3…")
+
+    status.update.assert_awaited_once_with("🧪 Smoke test 1/3…", force=False)
+
+
+async def test_close_connect_status_pops_and_calls_done() -> None:
+    """``_close_connect_status`` must transition the reporter to its
+    terminal label and remove it from ``user_data`` so a follow-up
+    /connect creates a fresh one instead of editing the deleted
+    anchor."""
+    update = _FakeUpdateWithMessage()
+    ctx = _make_progress_context()
+    _, status = await bot._ensure_connect_progress(update, ctx)
+    assert status is not None
+    status.done = AsyncMock()  # type: ignore[method-assign]
+
+    await bot._close_connect_status(ctx, "✅ Selesai")
+
+    status.done.assert_awaited_once_with("✅ Selesai")
+    assert "connect_status_reporter" not in ctx.user_data
+
+
+async def test_close_connect_status_no_op_without_reporter() -> None:
+    """No reporter stashed = silent no-op (legacy path / already closed)."""
+    ctx = _make_progress_context()
+    # Must not raise even though ``connect_status_reporter`` is missing.
+    await bot._close_connect_status(ctx, "anything")
