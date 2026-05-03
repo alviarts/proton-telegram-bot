@@ -212,6 +212,12 @@ GENADDR_NOTIFY_EVERY = 5
 # Force-edits on milestones bypass this throttle so the user never
 # misses an "every 5 sukses" tick.
 GENADDR_BODY_EDIT_INTERVAL_S = 2.0
+# How often the background heartbeat task force-refreshes the starter
+# message body even when no new address has been created yet (e.g.
+# during browser startup, login, captcha solve). The user explicitly
+# asked for a "sedang membuat address X/Y" tick every 5 seconds so they
+# always see something move regardless of whether a new alias landed.
+GENADDR_BODY_REFRESH_INTERVAL_S = 5.0
 # Cap how many of the most-recent successful aliases we list in the
 # rolling body update. Five is the sweet spot the user asked for in
 # their handoff: enough to verify progress at a glance, short enough to
@@ -2259,7 +2265,7 @@ async def _finalize_connect(
                 "✅ siap dipakai.\n"
                 "2️⃣  Klik <b>✨ Generate 20 alamat sekarang</b> — bot bikin "
                 "20 alias <code>vielz001..vielz020</code> otomatis di background.\n"
-                "   Bot kirim update tiap 5 alias (5/20, 10/20, ...) dan kamu "
+                "   Pesan progress update tiap 5 detik (live counter + alias terbaru) dan kamu "
                 "tetap bisa pakai perintah lain sambil generate jalan.\n"
                 "3️⃣  Pakai <b>🩺 Cek IMAP listener</b> kapan aja buat "
                 "validasi semua alias bisa terima email."
@@ -2272,7 +2278,7 @@ async def _finalize_connect(
                 "buat akun ini.\n"
                 "2️⃣  Klik <b>✨ Generate 20 alamat sekarang</b> — bot bikin "
                 "20 alias <code>vielz001..vielz020</code> otomatis di background.\n"
-                "   Bot kirim update tiap 5 alias (5/20, 10/20, ...) dan kamu "
+                "   Pesan progress update tiap 5 detik (live counter + alias terbaru) dan kamu "
                 "tetap bisa pakai perintah lain sambil generate jalan.\n"
                 "3️⃣  Pakai <b>🩺 Cek IMAP listener</b> kapan aja buat "
                 "validasi semua alias bisa terima email."
@@ -3815,19 +3821,28 @@ def _render_genaddr_body(
     success_count: int,
     fail_count: int,
     recent: list[str],
+    elapsed_seconds: int = 0,
+    finished: bool = False,
 ) -> str:
     """Render the rolling body text on the /genaddr starter message.
 
     The user wanted the starter message itself to keep showing fresh
     counts so they don't have to scroll through the chat to see how
     many addresses have landed. Format mirrors the spec from the PR-C
-    handoff:
+    handoff with the time-based heartbeat refresh:
 
         🚀 Generate <count> alamat di background — <primary>
         📊 Sudah berhasil: <ok>/<count> sukses
         ⚠️ Gagal/duplikat: <fail>
         🪄 Terbaru: <recent_5>
+        🔄 Sedang membuat alamat <ok+1>/<count> · live <mm:ss>
         Bot tetap responsif — kirim /list, /cekimap, atau perintah lain.
+
+    The heartbeat line embeds the elapsed-time counter so the body
+    text always changes between refreshes — that way the periodic
+    task's ``editMessageText`` doesn't bounce off Telegram's
+    "message is not modified" guard when no new alias landed in
+    the last 5 seconds.
 
     Lines are kept compact (max one blank line) so the message doesn't
     push other chat content off the screen while it's still ticking.
@@ -3840,6 +3855,18 @@ def _render_genaddr_body(
     else:
         recent_line = f"🪄 Terbaru: <code>{recent_html}</code>"
     pattern_line = f"Pola: {pattern}\n" if pattern else ""
+    mm, ss = divmod(max(0, elapsed_seconds), 60)
+    elapsed_str = f"{mm}:{ss:02d}"
+    if finished:
+        heartbeat_line = f"✅ Selesai · live {elapsed_str}"
+    elif success_count >= count:
+        heartbeat_line = f"⏳ Menutup browser… · live {elapsed_str}"
+    else:
+        next_idx = success_count + 1
+        heartbeat_line = (
+            f"🔄 Sedang membuat alamat <b>{next_idx}/{count}</b> · "
+            f"live {elapsed_str}"
+        )
     return (
         f"🚀 Generate <b>{count}</b> alamat di background — "
         f"<b>{html.escape(primary_email)}</b>{proxy_note}\n"
@@ -3847,10 +3874,10 @@ def _render_genaddr_body(
         f"📊 Sudah berhasil: <b>{success_count}/{count}</b> sukses\n"
         f"⚠️ Gagal/duplikat: <b>{fail_count}</b>\n"
         f"{recent_line}\n"
+        f"{heartbeat_line}\n"
         f"\n"
         f"Bot tetap responsif — kirim /list, /cekimap, atau perintah lain "
-        f"sambil generate jalan. Update tiap "
-        f"<b>{GENADDR_NOTIFY_EVERY}</b> alamat sukses."
+        f"sambil generate jalan. Update tiap <b>5 detik</b>."
     )
 
 
@@ -3913,6 +3940,47 @@ async def _safe_force_close(force_close) -> None:  # type: ignore[no-untyped-def
         await force_close()
     except Exception:
         LOGGER.exception("force_close raised while cancelling /genaddr")
+
+
+def _signal_genaddr_cancel(context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Best-effort cancel of any /genaddr currently running in this chat.
+
+    Returns ``True`` if a running task was found and the cancel signal
+    was delivered (cancel_event set + browser force-close scheduled).
+    Returns ``False`` if no /genaddr was running for this chat.
+
+    Why this is a separate helper:
+
+    The user reported that ``/disconnect`` (delete primary account) did
+    NOT abort an in-flight ``/genaddr`` — the Playwright browser kept
+    creating addresses against the about-to-be-deleted account, with
+    those new aliases dropping on the floor when the primary was wiped
+    from the DB seconds later. The fix is the same logic the
+    ``CB_GENADDR_CANCEL`` button runs (``cancel_event.set()`` +
+    ``browser.force_close()``), so this helper centralises it for
+    reuse from both the explicit cancel button and the delete-primary
+    flow.
+    """
+    cancel_event = context.chat_data.get("genaddr_cancel_event")
+    if cancel_event is None:
+        return False
+    cancel_event.set()
+    browser_handle = context.chat_data.get("genaddr_browser_handle")
+    browser = (
+        browser_handle.get("browser")
+        if isinstance(browser_handle, dict)
+        else None
+    )
+    force_close = getattr(browser, "force_close", None) if browser else None
+    if callable(force_close):
+        # Hold a reference on chat_data so the GC doesn't collect the
+        # task before it finishes (RUF006). The genaddr ``finally`` clears
+        # this slot, which is fine — by then the task is done or the next
+        # /genaddr will overwrite it.
+        context.chat_data["genaddr_force_close_task"] = asyncio.create_task(
+            _safe_force_close(force_close)
+        )
+    return True
 
 
 @_gate
@@ -4209,6 +4277,11 @@ async def _run_genaddr_background(
     # count at those points (which is also when a new progress message
     # was previously posted).
     last_body_edit_at = 0.0
+    started_at = asyncio.get_event_loop().time()
+    # Set to ``True`` by ``_run_genaddr_background`` once the batch has
+    # finished (success, error, or cancellation) so the heartbeat
+    # renderer can switch to the "✅ Selesai" line on the final tick.
+    body_finished = False
 
     async def _edit_body(*, force: bool = False) -> None:
         nonlocal last_body_edit_at
@@ -4217,6 +4290,7 @@ async def _run_genaddr_background(
         now = asyncio.get_event_loop().time()
         if not force and now - last_body_edit_at < GENADDR_BODY_EDIT_INTERVAL_S:
             return
+        elapsed = max(0, int(now - started_at))
         text = _render_genaddr_body(
             count=count,
             primary_email=primary.email,
@@ -4225,6 +4299,8 @@ async def _run_genaddr_background(
             success_count=len(successes),
             fail_count=len(failures),
             recent=successes,
+            elapsed_seconds=elapsed,
+            finished=body_finished,
         )
         # ``editMessageText`` raises ``BadRequest("message is not modified")``
         # when the rendered text is byte-identical to the previous edit
@@ -4241,6 +4317,32 @@ async def _run_genaddr_background(
             )
         last_body_edit_at = now
 
+    async def _heartbeat_loop() -> None:
+        """Refresh the starter message body every 5 seconds.
+
+        The user reported the progress message felt "static" because
+        :func:`_edit_body` only fired on the success callback — during
+        long browser-startup / login / captcha pauses, no new alias
+        landed for tens of seconds and the message just sat there.
+        This task force-edits the body on a steady cadence
+        (``GENADDR_BODY_REFRESH_INTERVAL_S``) so the elapsed-time
+        counter ticks even when the count is stuck. Cancelled in the
+        ``finally`` block of the parent run.
+        """
+        while True:
+            try:
+                await asyncio.sleep(GENADDR_BODY_REFRESH_INTERVAL_S)
+            except asyncio.CancelledError:
+                raise
+            try:
+                await _edit_body(force=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOGGER.debug(
+                    "genaddr heartbeat body edit failed", exc_info=True
+                )
+
     async def _on_progress(success_count: int, target: int, result) -> None:
         nonlocal last_notified_count
         if result.status is CreationStatus.SUCCESS:
@@ -4248,33 +4350,38 @@ async def _run_genaddr_background(
         else:
             failures.append((result.email, result.status.value))
 
-        # Live status: narrate every attempt so the user always sees
-        # the bot working. The 1.5s throttle inside StatusReporter
-        # absorbs bursts without rate-limiting Telegram.
-        if result.status is CreationStatus.SUCCESS:
-            label = (
-                f"🪄 {success_count}/{target} sukses · "
-                f"{result.email}"
-            )
-        else:
-            label = (
-                f"⚠️ {len(failures)} gagal/duplikat · "
-                f"{result.email}"
-            )
-        await _status(label)
-
-        # Body live update — runs on every progress callback but is
-        # internally throttled to the 2-second interval. We force-edit
-        # on milestones (multiples of GENADDR_NOTIFY_EVERY) and on the
-        # final success so the user always sees the milestone counts.
-        force_body = (
+        # The user reported the inline keyboard "muncul redup muncul
+        # redup" — flickering on every address — because every progress
+        # callback used to call ``_status`` which fires
+        # ``editMessageReplyMarkup`` and forces Telegram clients to
+        # redraw both the status row and the ❌ Batalkan row underneath
+        # it. We now only update the status button on milestones (every
+        # ``GENADDR_NOTIFY_EVERY`` successes) and on the very last
+        # alias, which keeps the keyboard stable in between. Live
+        # progress is still visible — the body refreshes every 5s via
+        # the heartbeat task.
+        is_milestone = (
             success_count > 0
             and (
                 success_count % GENADDR_NOTIFY_EVERY == 0
                 or success_count == target
             )
         )
-        await _edit_body(force=force_body)
+        if is_milestone:
+            if result.status is CreationStatus.SUCCESS:
+                label = f"🪄 {success_count}/{target} sukses"
+            else:
+                label = f"⚠️ {len(failures)} gagal/duplikat"
+            await _status(label)
+
+        # Body live update — runs on every progress callback but is
+        # internally throttled to the 2-second interval. We force-edit
+        # on milestones (multiples of GENADDR_NOTIFY_EVERY) and on the
+        # final success so the user always sees the milestone counts.
+        # The 5-second heartbeat task picks up the slack between
+        # milestones so the message keeps ticking even when the browser
+        # is stuck on login or captcha.
+        await _edit_body(force=is_milestone)
 
         # Only post a new message when we cross a multiple of NOTIFY_EVERY
         # (or on the very last success), so the chat doesn't get spammed
@@ -4313,9 +4420,22 @@ async def _run_genaddr_background(
 
     summary = None
     final_status_label = "✅ Selesai"
+    # 5-second heartbeat: refreshes the starter message body so the
+    # user sees a ticking "live" indicator even while the browser is
+    # busy logging in / solving captcha (no progress callbacks fire
+    # during those phases). ``starter_msg_id is None`` happens in
+    # tests that drive the flow without a real anchor message — skip
+    # the heartbeat there to keep the test surface stable.
+    heartbeat_task: asyncio.Task | None = None
+    if starter_msg_id is not None:
+        heartbeat_task = asyncio.create_task(_heartbeat_loop())
     try:
         try:
             await _status("🌐 Buka browser proxy & login Proton…", force=True)
+            # Force one initial body render so the user sees the new
+            # heartbeat line immediately instead of waiting up to 5s
+            # for the first periodic tick.
+            await _edit_body(force=True)
             summary = await address_generator.run_batch(
                 db=db,
                 cipher=cipher,
@@ -4383,6 +4503,17 @@ async def _run_genaddr_background(
                 tracker=tracker,
             )
     finally:
+        # Stop the body heartbeat first so it doesn't race with the
+        # final body edit / status.done() below. Force one last body
+        # render with ``finished=True`` so the user sees ``✅ Selesai``
+        # in the heartbeat line even before the tracker cleans up.
+        body_finished = True
+        if heartbeat_task is not None and not heartbeat_task.done():
+            heartbeat_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await heartbeat_task
+        with contextlib.suppress(Exception):
+            await _edit_body(force=True)
         chat_data = context.application.chat_data.get(chat_id)
         if chat_data is not None:
             chat_data.pop("genaddr_running", None)
@@ -4492,8 +4623,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if data == CB_NOOP:
         return
     if data == CB_GENADDR_CANCEL:
-        cancel_event = context.chat_data.get("genaddr_cancel_event")
-        if cancel_event is None:
+        # ``_signal_genaddr_cancel`` returns False when there's no
+        # task to cancel — same UX as before (alert + clear keyboard).
+        # When there IS a task, it sets the cancel_event and schedules
+        # the Playwright force-close as a fire-and-forget task, so
+        # any in-flight ``page.click`` / ``wait_for_url`` raises
+        # ``TargetClosedError`` immediately instead of running out
+        # its 60s timeout.
+        cancelled = _signal_genaddr_cancel(context)
+        if not cancelled:
             await query.answer(
                 "Tidak ada /genaddr aktif untuk dibatalkan.", show_alert=False
             )
@@ -4502,27 +4640,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             except Exception:
                 pass
             return
-        cancel_event.set()
-        # Force-close the live browser so any in-flight Playwright await
-        # (``page.click``, ``wait_for_url``, …) raises ``TargetClosedError``
-        # right now instead of running the rest of its 60s timeout.
-        # ``force_close`` itself is best-effort + bounded, so we fire it
-        # off in a background task to keep this callback snappy.
-        browser_handle = context.chat_data.get("genaddr_browser_handle")
-        browser = (
-            browser_handle.get("browser")
-            if isinstance(browser_handle, dict)
-            else None
-        )
-        force_close = getattr(browser, "force_close", None) if browser else None
-        if callable(force_close):
-            # Hold a reference on chat_data so the GC doesn't collect the
-            # task before it finishes (RUF006). The handler's ``finally``
-            # clears chat_data, which is fine — by then the task is done
-            # or the next /genaddr will overwrite the slot.
-            context.chat_data["genaddr_force_close_task"] = asyncio.create_task(
-                _safe_force_close(force_close)
-            )
         await query.answer("Membatalkan & menutup browser...")
         try:
             # Disable the button immediately so the user knows their click
@@ -4644,6 +4761,16 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if primary is None:
             await query.answer("Email utama tidak ditemukan.", show_alert=True)
             return
+        # Disconnect must abort any /genaddr that is currently running
+        # in this chat. The user reported the Playwright browser kept
+        # creating addresses after they hit "❌ Hapus" — those new
+        # aliases dropped on the floor when the primary's DB row got
+        # wiped seconds later, and the cookies/cert the browser was
+        # holding became invalid the moment the Bridge account was
+        # logged out. Cancel BEFORE running ``stop_for_primary`` /
+        # ``remove_account`` / ``delete_primary_account`` so the
+        # browser tears down cleanly instead of racing the deletion.
+        genaddr_was_cancelled = _signal_genaddr_cancel(context)
         # Disconnect can take 10-30s end-to-end (stop_for_primary →
         # bridge --cli delete account → bridge restart → DB delete).
         # Without a live anchor the user just stares at the unchanged
@@ -4653,7 +4780,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         # narrated. Best-effort: if the anchor send fails (rare) we
         # silently fall back to the original code path.
         disconnect_status: StatusReporter | None = None
-        disconnect_initial_label = "⏳ Mempersiapkan hapus akun…"
+        disconnect_initial_label = (
+            "🛑 Stop /genaddr yang sedang jalan…"
+            if genaddr_was_cancelled
+            else "⏳ Mempersiapkan hapus akun…"
+        )
         try:
             anchor = await query.message.reply_text(  # type: ignore[union-attr]
                 f"🗑️ Hapus akun <b>{html.escape(primary.email)}</b>…",
