@@ -195,6 +195,11 @@ SYNC_CAPTCHA = 10
 # Conversation states for /setprotonpw
 SETPW_PICK_PRIMARY, SETPW_PASSWORD = 20, 21
 
+# Conversation states for the "🏷️ Tag ulang" button on forwarded emails.
+# Single-state flow: we kick off when the inline button is tapped, ask
+# for free-text label, persist it via ``set_service_label``, and end.
+TAG_AWAIT_LABEL = 30
+
 # Throttle: at most one progress edit every N addresses to stay well under
 # Telegram's edit_message rate limit during long /genaddr runs.
 # Kept for backwards-compat callers; the new background flow uses
@@ -212,6 +217,12 @@ GENADDR_NOTIFY_EVERY = 5
 # Force-edits on milestones bypass this throttle so the user never
 # misses an "every 5 sukses" tick.
 GENADDR_BODY_EDIT_INTERVAL_S = 2.0
+# How often the background heartbeat task force-refreshes the starter
+# message body even when no new address has been created yet (e.g.
+# during browser startup, login, captcha solve). The user explicitly
+# asked for a "sedang membuat address X/Y" tick every 5 seconds so they
+# always see something move regardless of whether a new alias landed.
+GENADDR_BODY_REFRESH_INTERVAL_S = 5.0
 # Cap how many of the most-recent successful aliases we list in the
 # rolling body update. Five is the sweet spot the user asked for in
 # their handoff: enough to verify progress at a glance, short enough to
@@ -279,6 +290,16 @@ CB_QUICK_HEALTHCHECK = "qhc"
 # progress through a :class:`StatusReporter` button that updates as
 # the scrape moves through its phases.
 CB_SYNC_PRIMARY = "syncp"
+# Tag-service flow: button attached to forwarded emails so the user can
+# label / re-label the sender's domain without using /services. Format:
+# ``tagsvc:<alias_id>:<sender_domain>``. The conversation handler asks
+# for the new label via free text. ``tagsvc_clear:<alias_id>:<domain>``
+# wipes the label so the alias falls back to the raw domain.
+CB_TAG_SERVICE = "tagsvc"
+CB_TAG_SERVICE_CLEAR = "tagsvc_clear"
+# /services keyboard: rows of ``svcdel:<domain>`` entries to one-tap
+# delete a chat-level mapping.
+CB_SVC_DELETE = "svcdel"
 
 # Soft target for total aliases per primary. After /cekimap or after
 # the per-primary "🔄 Sync" button finishes, if the alias count for
@@ -331,6 +352,92 @@ def _bot_cipher(context: ContextTypes.DEFAULT_TYPE) -> CredentialCipher:
 
 def _bot_manager(context: ContextTypes.DEFAULT_TYPE) -> ListenerManager:
     return cast(ListenerManager, context.application.bot_data["manager"])
+
+
+async def _purge_alias_email_messages(
+    bot, db: Database, chat_id: int, alias_id: int
+) -> int:
+    """Delete every previously-forwarded email message for ``alias_id``.
+
+    Called on the three "active alias just changed" boundaries
+    (``/list`` pick, ``/unlock``, lock-reminder Lepas) so the chat stops
+    accumulating stale email forwards from an alias the user is no
+    longer using. Returns the count actually deleted from Telegram —
+    rows are popped from the DB regardless so we don't retry forever
+    on messages older than Telegram's 48-hour deletion window.
+    """
+    message_ids = await db.pop_forwarded_email_message_ids(chat_id, alias_id)
+    if not message_ids:
+        return 0
+    deleted = 0
+    for mid in message_ids:
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=mid)
+            deleted += 1
+        except Exception:
+            # Message may already be gone (user deleted it, >48h old,
+            # bot lost permission, etc.). Silently skip — the DB row
+            # was already popped so we won't retry it forever.
+            LOGGER.debug(
+                "delete_message failed for chat=%s mid=%s",
+                chat_id,
+                mid,
+                exc_info=True,
+            )
+    return deleted
+
+
+async def _purge_transient_status_messages(
+    bot, db: Database, chat_id: int, *, kinds: tuple[str, ...] | None = None
+) -> int:
+    """Delete every previously-recorded ``🔒 Aktif: …`` / ``🔓 Kunci dilepas …``
+    confirmation message in the chat. Called right BEFORE the bot posts a fresh
+    confirmation on alias-switch / unlock so the user only ever sees ONE such
+    message at a time, never a stack of stale ones from previous picks.
+
+    Returns the number of messages actually deleted from Telegram. Rows are
+    popped regardless so >48h-old messages don't keep being retried forever.
+    """
+    message_ids = await db.pop_transient_status_message_ids(chat_id, kinds=kinds)
+    if not message_ids:
+        return 0
+    deleted = 0
+    for mid in message_ids:
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=mid)
+            deleted += 1
+        except Exception:
+            LOGGER.debug(
+                "delete_message (transient) failed chat=%s mid=%s",
+                chat_id,
+                mid,
+                exc_info=True,
+            )
+    return deleted
+
+
+async def _record_transient_status_message(
+    db: Database, chat_id: int, message: object | None, kind: str
+) -> None:
+    """Best-effort: write the just-sent confirmation's ``message_id`` into
+    ``transient_status_messages`` so the next alias-switch can wipe it.
+    Failures (network blip, DB locked) are swallowed — they only mean the
+    next switch leaves an extra leftover message, never a crash."""
+    if message is None:
+        return
+    mid = getattr(message, "message_id", None)
+    if mid is None:
+        return
+    try:
+        await db.record_transient_status_message(chat_id, mid, kind)
+    except Exception:
+        LOGGER.debug(
+            "record_transient_status_message failed chat=%s mid=%s kind=%s",
+            chat_id,
+            mid,
+            kind,
+            exc_info=True,
+        )
 
 
 def _bot_bridge_admin(
@@ -596,6 +703,55 @@ def _build_poll_now_keyboard(
     return InlineKeyboardMarkup(rows)
 
 
+# Telegram caps callback_data at 64 bytes. ``tagsvc:<alias_id>:<domain>``
+# fits comfortably for typical domains (alias_id ≤ 6 digits + colons +
+# domain ≤ 50 chars = well under 64). For pathologically long domains
+# we silently skip the button rather than truncating the domain (which
+# would break the round-trip to ``set_service_label``).
+_TG_CALLBACK_DATA_LIMIT = 64
+
+
+def _build_tag_service_keyboard(
+    *,
+    alias_id: int,
+    sender_domain: str,
+    current_label: str | None,
+) -> InlineKeyboardMarkup | None:
+    """Single-row keyboard attached to forwarded emails.
+
+    Lets the user (re)label the sender's domain (chat-wide mapping) or
+    clear an existing label. Returns ``None`` when the callback_data
+    payload would overflow Telegram's 64-byte cap so the email is
+    forwarded without buttons rather than crashing the send.
+    """
+    domain = sender_domain.strip().lower()
+    if not domain:
+        return None
+    tag_data = f"{CB_TAG_SERVICE}:{alias_id}:{domain}"
+    clear_data = f"{CB_TAG_SERVICE_CLEAR}:{alias_id}:{domain}"
+    if len(tag_data.encode()) > _TG_CALLBACK_DATA_LIMIT:
+        return None
+    label_for_button = current_label or domain
+    rows: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(
+                f"🏷️ Tag ulang ({label_for_button})", callback_data=tag_data
+            )
+        ]
+    ]
+    if current_label is not None:
+        # Only show "Hapus label" when there's actually a label to wipe.
+        if len(clear_data.encode()) <= _TG_CALLBACK_DATA_LIMIT:
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        "🗑️ Hapus label", callback_data=clear_data
+                    )
+                ]
+            )
+    return InlineKeyboardMarkup(rows)
+
+
 async def _alias_count_per_primary(
     db: Database, chat_id: int, primaries: list[PrimaryAccount]
 ) -> dict[int, int]:
@@ -604,6 +760,65 @@ async def _alias_count_per_primary(
         aliases = await db.list_aliases(chat_id, primary_id=primary.id)
         counts[primary.id] = len(aliases)
     return counts
+
+
+def _format_alias_with_labels(
+    alias_email: str,
+    labels: list[str],
+    *,
+    is_active: bool = False,
+    max_labels: int = 3,
+) -> str:
+    """Render a single ``"vielz008 · 📧 Devin, GitHub"`` line for /list.
+
+    Caps at ``max_labels`` visible labels with a ``+N`` overflow tail
+    so an alias used by many services doesn't blow out the message
+    width on mobile. The active alias gets a leading 🔒 to mirror the
+    keyboard button.
+    """
+    prefix = "🔒 " if is_active else "• "
+    base = f"{prefix}<code>{html.escape(alias_email)}</code>"
+    if not labels:
+        return base
+    visible = labels[:max_labels]
+    extra = len(labels) - len(visible)
+    rendered_labels = ", ".join(html.escape(label) for label in visible)
+    if extra > 0:
+        rendered_labels = f"{rendered_labels} +{extra}"
+    return f"{base}  ·  📧 {rendered_labels}"
+
+
+def _build_alias_list_text(
+    primary: PrimaryAccount,
+    aliases: list[AliasRecord],
+    labels_by_alias: dict[int, list[str]],
+    active_alias_id: int | None,
+) -> str:
+    """Compose the message body for ``/list`` per-primary view.
+
+    Header line is the primary's email + alias count. Each alias gets
+    one line with its service labels (when known). When *no* alias has
+    been tagged yet the body collapses back to the original single-
+    line header so the message stays short for fresh accounts.
+    """
+    header = (
+        f"📧 Alias di <b>{html.escape(primary.email)}</b> "
+        f"({len(aliases)} alias):"
+    )
+    has_any_label = any(labels_by_alias.get(a.id) for a in aliases)
+    if not has_any_label:
+        return header
+    lines = [header, ""]
+    for alias in aliases:
+        labels = labels_by_alias.get(alias.id, [])
+        lines.append(
+            _format_alias_with_labels(
+                alias.email,
+                labels,
+                is_active=(alias.id == active_alias_id),
+            )
+        )
+    return "\n".join(lines)
 
 
 async def _render_primary_alias_list(
@@ -628,11 +843,20 @@ async def _render_primary_alias_list(
         return None
     active = await db.get_active_alias(chat_id)
     active_alias_id = active.id if active and active.primary_id == primary.id else None
+    try:
+        labels_by_alias = await db.get_alias_service_labels(
+            chat_id, primary_id=primary.id
+        )
+    except Exception:
+        LOGGER.debug(
+            "get_alias_service_labels failed; falling back to empty",
+            exc_info=True,
+        )
+        labels_by_alias = {}
     return await bot.send_message(
         chat_id=chat_id,
-        text=(
-            f"📧 Alias di <b>{html.escape(primary.email)}</b> "
-            f"({len(aliases)} alias):"
+        text=_build_alias_list_text(
+            primary, aliases, labels_by_alias, active_alias_id
         ),
         parse_mode=ParseMode.HTML,
         reply_markup=_build_alias_keyboard_for_primary(
@@ -905,6 +1129,14 @@ async def _maybe_send_lock_reminder(
     msg_id = getattr(msg, "message_id", None)
     if isinstance(msg_id, int):
         chat_data["lock_reminder_msg_id"] = msg_id
+        # Also park the message id in the per-chat transient table so a
+        # future /list pick or /unlock wipes the reminder bubble too,
+        # not just the "🔒 Aktif: …" / "🔓 Kunci dilepas …" notes.
+        db = context.application.bot_data.get("db")
+        if db is not None:
+            await _record_transient_status_message(
+                db, chat.id, msg, "lock_reminder"
+            )
 
 
 async def _show_primary_list(
@@ -998,6 +1230,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/history — Lihat alias yang sudah terpakai\n"
         "/reset — Kembalikan alias ke daftar tersedia\n"
         "/cekimap — Cek IMAP listener semua alias (jalan di background)\n"
+        "/services — Atur label service (mis. cognition.ai → Devin)\n"
+        "/aliasinfo &lt;email&gt; — Lihat history pengirim alias tertentu\n"
         "/cancel — Batalkan dialog /connect"
     )
     greeting = _greeting(update)
@@ -1051,6 +1285,374 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     lines.append("\nUntuk mengaktifkan kembali: /reset <email>")
     await update.effective_message.reply_text("\n".join(lines))  # type: ignore[union-attr]
     await _maybe_send_lock_reminder(update, context)
+
+
+# --------------------------------------------------------------- /services
+
+
+def _build_services_keyboard(
+    user_labels: list[tuple[str, str]],
+) -> InlineKeyboardMarkup | None:
+    """One row per user-defined label with a 🗑 button to delete it.
+
+    Defaults from :data:`db.DEFAULT_SERVICE_LABELS` are NOT listed here
+    — they're an implicit fallback the user can override by saving
+    their own ``domain → label`` row. Rows with an *empty* label
+    represent an explicit suppression (the user tapped "🗑 Hapus label"
+    on a forwarded email) and are rendered with a 🚫 icon so the user
+    can clearly tell them apart from named mappings. ``None`` means the
+    user has no custom mappings yet.
+    """
+    if not user_labels:
+        return None
+    rows: list[list[InlineKeyboardButton]] = []
+    for domain, label in user_labels:
+        is_suppressed = not (label or "").strip()
+        display = "(disembunyikan)" if is_suppressed else label
+        icon = "🚫" if is_suppressed else "🗑"
+        callback = f"{CB_SVC_DELETE}:{domain}"
+        if len(callback.encode()) > _TG_CALLBACK_DATA_LIMIT:
+            # Domain too long to round-trip safely; show as informational.
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        f"{display}  ·  {domain}", callback_data=CB_NOOP
+                    )
+                ]
+            )
+            continue
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"{icon} {display}  ·  {domain}", callback_data=callback
+                )
+            ]
+        )
+    return InlineKeyboardMarkup(rows)
+
+
+@_gate
+async def cmd_services(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List/edit chat-level domain → service-label mappings.
+
+    Forms:
+      /services                     — list current mappings
+      /services <domain> = <label>  — upsert a mapping
+      /services del <domain>        — remove a mapping
+    """
+    chat = update.effective_chat
+    if chat is None or update.effective_message is None:
+        return
+    db = _bot_db(context)
+    args_text = " ".join(context.args or []).strip() if context.args else ""
+
+    if args_text:
+        lower = args_text.lower()
+        if lower.startswith("del ") or lower.startswith("delete "):
+            target = args_text.split(None, 1)[1].strip().lower()
+            removed = await db.remove_service_label(chat.id, target)
+            if removed:
+                await update.effective_message.reply_text(
+                    f"🗑 Mapping untuk <code>{html.escape(target)}</code> dihapus.",
+                    parse_mode=ParseMode.HTML,
+                )
+            else:
+                await update.effective_message.reply_text(
+                    f"Mapping untuk <code>{html.escape(target)}</code> tidak ada.",
+                    parse_mode=ParseMode.HTML,
+                )
+            return
+        if "=" in args_text:
+            domain_part, label_part = args_text.split("=", 1)
+            domain = domain_part.strip().lower()
+            label = label_part.strip()
+            if not domain or not label:
+                await update.effective_message.reply_text(
+                    "Format: <code>/services domain = label</code>",
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+            await db.set_service_label(chat.id, domain, label)
+            await update.effective_message.reply_text(
+                f"✅ <code>{html.escape(domain)}</code> → "
+                f"<b>{html.escape(label)}</b> tersimpan.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        await update.effective_message.reply_text(
+            "Format yang dikenali:\n"
+            "• <code>/services</code> — lihat semua mapping\n"
+            "• <code>/services domain = Label</code> — simpan / ubah\n"
+            "• <code>/services del domain</code> — hapus",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    user_labels = await db.list_service_labels(chat.id)
+    intro = (
+        "🏷️ <b>Mapping domain → service label</b>\n"
+        "Setiap email yang masuk ke alias akan diberi label sesuai "
+        "domain pengirimnya. Default sudah berisi <i>cognition.ai → "
+        "Devin</i>, <i>github.com → GitHub</i>, dst (lihat dokumentasi).\n\n"
+    )
+    if user_labels:
+        intro += "<b>Mapping kamu:</b>\n"
+        rendered_lines: list[str] = []
+        for d, label in user_labels:
+            stripped = (label or "").strip()
+            if stripped:
+                rendered_lines.append(
+                    f"• <code>{html.escape(d)}</code> → "
+                    f"<b>{html.escape(stripped)}</b>"
+                )
+            else:
+                # Empty-string row → explicit suppression via 🗑 button.
+                rendered_lines.append(
+                    f"• <code>{html.escape(d)}</code> → "
+                    f"<i>🚫 disembunyikan</i>"
+                )
+        intro += "\n".join(rendered_lines)
+        intro += (
+            "\n\nTap tombol di bawah untuk menghapus. "
+            "Untuk menambah/ubah: <code>/services domain = Label</code>."
+        )
+    else:
+        intro += (
+            "<i>Belum ada mapping kustom.</i>\n\n"
+            "Tambah dengan: <code>/services domain = Label</code>\n"
+            "Contoh: <code>/services roboneo.com = Roboneo</code>"
+        )
+    await update.effective_message.reply_text(
+        intro,
+        parse_mode=ParseMode.HTML,
+        reply_markup=_build_services_keyboard(user_labels),
+    )
+
+
+# --------------------------------------------------------------- /aliasinfo
+
+
+@_gate
+async def cmd_aliasinfo(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Show the sender history for one alias.
+
+    Usage: ``/aliasinfo <alias_email>``. Lists every domain that has
+    sent mail to this alias, with the resolved service label, first/
+    last-seen timestamps, and the number of messages.
+    """
+    chat = update.effective_chat
+    if chat is None or update.effective_message is None:
+        return
+    if not context.args:
+        await update.effective_message.reply_text(
+            "Format: <code>/aliasinfo &lt;email_alias&gt;</code>\n"
+            "Contoh: <code>/aliasinfo vielz008@proton.me</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    db = _bot_db(context)
+    target = context.args[0].strip().lower()
+    alias = await db.find_alias(chat.id, target)
+    if alias is None:
+        await update.effective_message.reply_text(
+            f"Alias <code>{html.escape(target)}</code> tidak ditemukan.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    senders = await db.list_alias_senders(chat.id, alias.id)
+    if not senders:
+        await update.effective_message.reply_text(
+            f"Alias <code>{html.escape(alias.email)}</code> belum pernah "
+            "menerima email (atau email-nya datang sebelum fitur tracking aktif).",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    lines = [
+        f"📧 <b>{html.escape(alias.email)}</b>",
+        f"Total <b>{len(senders)}</b> domain pengirim:",
+        "",
+    ]
+    for sender in senders:
+        # Re-resolve so a /services edit reflects without a backfill.
+        label = (
+            await db.resolve_service_label(chat.id, sender.sender_domain)
+            or sender.sender_domain
+        )
+        line = (
+            f"• 🏷️ <b>{html.escape(label)}</b>  ·  "
+            f"<code>{html.escape(sender.sender_domain)}</code>\n"
+            f"  {sender.seen_count}× — terakhir {sender.last_seen_at}"  # noqa: RUF001
+        )
+        lines.append(line)
+    await update.effective_message.reply_text(
+        "\n".join(lines), parse_mode=ParseMode.HTML
+    )
+
+
+# --------------------------------------------------------------- /cleanmail
+
+
+@_gate
+async def cmd_cleanmail(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """One-shot cleanup of legacy email forwards in the chat.
+
+    The auto-purge on alias-switch only knows about messages forwarded
+    *after* the feature was deployed (the bot writes to
+    ``forwarded_emails`` then). For chats that already accumulated lots
+    of stale forwards before the feature shipped — or for any other
+    bot-sent message we want to wipe — this command walks message ids
+    backward from the ``/cleanmail`` invocation itself and best-effort
+    calls ``delete_message`` on each. Telegram silently rejects deletes
+    on user-sent messages and on messages older than 48h, so the worst
+    case is "did nothing" rather than data loss.
+
+    Usage:
+      /cleanmail            — try the last 100 message ids
+      /cleanmail <count>    — try the last <count> ids (capped at 500)
+    """
+    chat = update.effective_chat
+    msg = update.effective_message
+    if chat is None or msg is None:
+        return
+    requested = 100
+    if context.args:
+        try:
+            requested = int(context.args[0])
+        except (TypeError, ValueError):
+            await msg.reply_text(
+                "Format: <code>/cleanmail [jumlah]</code>\n"
+                "Contoh: <code>/cleanmail 200</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+    # Cap so we don't accidentally hammer the Bot API. 500 ids ≈ ~17s
+    # of API calls under the default rate limit of ~30/sec.
+    requested = max(1, min(requested, 500))
+    bot = context.application.bot
+    db = _bot_db(context)
+    cleanmail_msg_id = msg.message_id
+    progress = await msg.reply_text(
+        f"🧹 Membersihkan {requested} pesan terakhir… (best-effort)"
+    )
+    deleted = 0
+    failed = 0
+    # Iterate from the most recent id backward (skip the cleanmail
+    # command and progress reply themselves so the user keeps a
+    # confirmation in chat).
+    skip_ids = {cleanmail_msg_id, progress.message_id}
+    for offset in range(1, requested + 1):
+        candidate = cleanmail_msg_id - offset
+        if candidate <= 0 or candidate in skip_ids:
+            continue
+        try:
+            await bot.delete_message(chat_id=chat.id, message_id=candidate)
+            deleted += 1
+        except Exception:
+            failed += 1
+    # Pop any remaining forwarded_emails rows for this chat too — those
+    # message ids were either inside the deletion window above or they
+    # were already wiped by an earlier alias-switch. Either way the
+    # bookkeeping should match the chat state.
+    await db.conn.execute(
+        "DELETE FROM forwarded_emails WHERE chat_id = ?", (chat.id,)
+    )
+    await db.conn.commit()
+    try:
+        await progress.edit_text(
+            f"🧹 Selesai: dihapus <b>{deleted}</b>, dilewati <b>{failed}</b> "
+            f"(milik user, &gt;48 jam, atau bukan dari bot).\n"
+            f"Tabel <code>forwarded_emails</code> juga di-reset untuk chat ini.",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        # If the progress message itself was caught in the sweep, just
+        # send a fresh one.
+        await msg.reply_text(
+            f"🧹 Selesai: dihapus {deleted}, dilewati {failed}."
+        )
+
+
+# ----------------------------------------------- /tag-service conversation
+
+
+async def tag_service_entry(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Entry point for the ``🏷️ Tag ulang`` button.
+
+    Stashes ``(alias_id, sender_domain)`` in ``chat_data`` so the
+    follow-up text reply can persist the new label without re-parsing
+    the original callback payload (already consumed by Telegram).
+    """
+    query = update.callback_query
+    if query is None or query.data is None:
+        return ConversationHandler.END
+    parts = query.data.split(":", 2)
+    if len(parts) != 3:
+        await query.answer("Data tag tidak valid.", show_alert=True)
+        return ConversationHandler.END
+    try:
+        alias_id = int(parts[1])
+    except ValueError:
+        await query.answer("Alias id tidak valid.", show_alert=True)
+        return ConversationHandler.END
+    domain = parts[2].strip().lower()
+    if not domain:
+        await query.answer("Domain pengirim kosong.", show_alert=True)
+        return ConversationHandler.END
+    await query.answer()
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    if chat_id is None:
+        return ConversationHandler.END
+    db = _bot_db(context)
+    current = await db.resolve_service_label(chat_id, domain)
+    context.chat_data["pending_service_tag"] = {
+        "alias_id": alias_id,
+        "domain": domain,
+    }
+    prompt = (
+        f"🏷️ Set label untuk domain <code>{html.escape(domain)}</code>.\n"
+        f"Saat ini: <b>{html.escape(current or '(belum ada)')}</b>.\n\n"
+        "Balas dengan label baru (mis. <code>Devin</code>, <code>Roboneo</code>, "
+        "<code>Skip — work</code>). Kirim /cancel untuk batal."
+    )
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=prompt,
+        parse_mode=ParseMode.HTML,
+    )
+    return TAG_AWAIT_LABEL
+
+
+async def tag_service_label_received(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Persist the user's chosen label and end the conversation."""
+    if update.effective_message is None or update.effective_chat is None:
+        return ConversationHandler.END
+    pending = context.chat_data.pop("pending_service_tag", None)
+    if not isinstance(pending, dict):
+        return ConversationHandler.END
+    label = (update.effective_message.text or "").strip()
+    if not label:
+        await update.effective_message.reply_text(
+            "Label kosong, batal. Coba lagi via tombol 🏷️ di email."
+        )
+        return ConversationHandler.END
+    domain = pending["domain"]
+    db = _bot_db(context)
+    await db.set_service_label(update.effective_chat.id, domain, label)
+    await update.effective_message.reply_text(
+        f"✅ <code>{html.escape(domain)}</code> → "
+        f"<b>{html.escape(label)}</b> tersimpan. Email berikutnya dari "
+        "domain ini akan otomatis pakai label ini.",
+        parse_mode=ParseMode.HTML,
+    )
+    return ConversationHandler.END
 
 
 # --------------------------------------------------------------- /addalias
@@ -2259,7 +2861,7 @@ async def _finalize_connect(
                 "✅ siap dipakai.\n"
                 "2️⃣  Klik <b>✨ Generate 20 alamat sekarang</b> — bot bikin "
                 "20 alias <code>vielz001..vielz020</code> otomatis di background.\n"
-                "   Bot kirim update tiap 5 alias (5/20, 10/20, ...) dan kamu "
+                "   Pesan progress update tiap 5 detik (live counter + alias terbaru) dan kamu "
                 "tetap bisa pakai perintah lain sambil generate jalan.\n"
                 "3️⃣  Pakai <b>🩺 Cek IMAP listener</b> kapan aja buat "
                 "validasi semua alias bisa terima email."
@@ -2272,7 +2874,7 @@ async def _finalize_connect(
                 "buat akun ini.\n"
                 "2️⃣  Klik <b>✨ Generate 20 alamat sekarang</b> — bot bikin "
                 "20 alias <code>vielz001..vielz020</code> otomatis di background.\n"
-                "   Bot kirim update tiap 5 alias (5/20, 10/20, ...) dan kamu "
+                "   Pesan progress update tiap 5 detik (live counter + alias terbaru) dan kamu "
                 "tetap bisa pakai perintah lain sambil generate jalan.\n"
                 "3️⃣  Pakai <b>🩺 Cek IMAP listener</b> kapan aja buat "
                 "validasi semua alias bisa terima email."
@@ -3161,12 +3763,27 @@ async def cmd_unlock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             "Tidak ada alias yang sedang aktif. Pilih satu di /list."
         )
         return
+    # Tear down the lock first so any in-flight email-forward racing
+    # against this command is rejected by strict lock-mode, then bulk
+    # delete every message we previously forwarded for this alias so
+    # the chat doesn't stay polluted with stale emails.
     await db.set_active_alias(chat.id, None)
-    await update.effective_message.reply_text(  # type: ignore[union-attr]
+    await _purge_alias_email_messages(
+        context.application.bot, db, chat.id, active.id
+    )
+    # Also wipe any previous "🔒 Aktif: …" / "🔓 Kunci dilepas …" notes
+    # AND the lock-reminder bubble (kind='lock_reminder') so the user
+    # only ever sees the single freshest confirmation in the chat.
+    await _purge_transient_status_messages(
+        context.application.bot, db, chat.id
+    )
+    cast(dict, context.chat_data).pop("lock_reminder_msg_id", None)
+    sent = await update.effective_message.reply_text(  # type: ignore[union-attr]
         f"🔓 Kunci dilepas dari <b>{html.escape(active.email)}</b>. "
         "Pilih alias di /list saat siap menerima email lagi.",
         parse_mode=ParseMode.HTML,
     )
+    await _record_transient_status_message(db, chat.id, sent, "unlock")
 
 
 @_gate
@@ -3815,19 +4432,28 @@ def _render_genaddr_body(
     success_count: int,
     fail_count: int,
     recent: list[str],
+    elapsed_seconds: int = 0,
+    finished: bool = False,
 ) -> str:
     """Render the rolling body text on the /genaddr starter message.
 
     The user wanted the starter message itself to keep showing fresh
     counts so they don't have to scroll through the chat to see how
     many addresses have landed. Format mirrors the spec from the PR-C
-    handoff:
+    handoff with the time-based heartbeat refresh:
 
         🚀 Generate <count> alamat di background — <primary>
         📊 Sudah berhasil: <ok>/<count> sukses
         ⚠️ Gagal/duplikat: <fail>
         🪄 Terbaru: <recent_5>
+        🔄 Sedang membuat alamat <ok+1>/<count> · live <mm:ss>
         Bot tetap responsif — kirim /list, /cekimap, atau perintah lain.
+
+    The heartbeat line embeds the elapsed-time counter so the body
+    text always changes between refreshes — that way the periodic
+    task's ``editMessageText`` doesn't bounce off Telegram's
+    "message is not modified" guard when no new alias landed in
+    the last 5 seconds.
 
     Lines are kept compact (max one blank line) so the message doesn't
     push other chat content off the screen while it's still ticking.
@@ -3840,6 +4466,18 @@ def _render_genaddr_body(
     else:
         recent_line = f"🪄 Terbaru: <code>{recent_html}</code>"
     pattern_line = f"Pola: {pattern}\n" if pattern else ""
+    mm, ss = divmod(max(0, elapsed_seconds), 60)
+    elapsed_str = f"{mm}:{ss:02d}"
+    if finished:
+        heartbeat_line = f"✅ Selesai · live {elapsed_str}"
+    elif success_count >= count:
+        heartbeat_line = f"⏳ Menutup browser… · live {elapsed_str}"
+    else:
+        next_idx = success_count + 1
+        heartbeat_line = (
+            f"🔄 Sedang membuat alamat <b>{next_idx}/{count}</b> · "
+            f"live {elapsed_str}"
+        )
     return (
         f"🚀 Generate <b>{count}</b> alamat di background — "
         f"<b>{html.escape(primary_email)}</b>{proxy_note}\n"
@@ -3847,10 +4485,10 @@ def _render_genaddr_body(
         f"📊 Sudah berhasil: <b>{success_count}/{count}</b> sukses\n"
         f"⚠️ Gagal/duplikat: <b>{fail_count}</b>\n"
         f"{recent_line}\n"
+        f"{heartbeat_line}\n"
         f"\n"
         f"Bot tetap responsif — kirim /list, /cekimap, atau perintah lain "
-        f"sambil generate jalan. Update tiap "
-        f"<b>{GENADDR_NOTIFY_EVERY}</b> alamat sukses."
+        f"sambil generate jalan. Update tiap <b>5 detik</b>."
     )
 
 
@@ -3913,6 +4551,47 @@ async def _safe_force_close(force_close) -> None:  # type: ignore[no-untyped-def
         await force_close()
     except Exception:
         LOGGER.exception("force_close raised while cancelling /genaddr")
+
+
+def _signal_genaddr_cancel(context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Best-effort cancel of any /genaddr currently running in this chat.
+
+    Returns ``True`` if a running task was found and the cancel signal
+    was delivered (cancel_event set + browser force-close scheduled).
+    Returns ``False`` if no /genaddr was running for this chat.
+
+    Why this is a separate helper:
+
+    The user reported that ``/disconnect`` (delete primary account) did
+    NOT abort an in-flight ``/genaddr`` — the Playwright browser kept
+    creating addresses against the about-to-be-deleted account, with
+    those new aliases dropping on the floor when the primary was wiped
+    from the DB seconds later. The fix is the same logic the
+    ``CB_GENADDR_CANCEL`` button runs (``cancel_event.set()`` +
+    ``browser.force_close()``), so this helper centralises it for
+    reuse from both the explicit cancel button and the delete-primary
+    flow.
+    """
+    cancel_event = context.chat_data.get("genaddr_cancel_event")
+    if cancel_event is None:
+        return False
+    cancel_event.set()
+    browser_handle = context.chat_data.get("genaddr_browser_handle")
+    browser = (
+        browser_handle.get("browser")
+        if isinstance(browser_handle, dict)
+        else None
+    )
+    force_close = getattr(browser, "force_close", None) if browser else None
+    if callable(force_close):
+        # Hold a reference on chat_data so the GC doesn't collect the
+        # task before it finishes (RUF006). The genaddr ``finally`` clears
+        # this slot, which is fine — by then the task is done or the next
+        # /genaddr will overwrite it.
+        context.chat_data["genaddr_force_close_task"] = asyncio.create_task(
+            _safe_force_close(force_close)
+        )
+    return True
 
 
 @_gate
@@ -4209,6 +4888,11 @@ async def _run_genaddr_background(
     # count at those points (which is also when a new progress message
     # was previously posted).
     last_body_edit_at = 0.0
+    started_at = asyncio.get_event_loop().time()
+    # Set to ``True`` by ``_run_genaddr_background`` once the batch has
+    # finished (success, error, or cancellation) so the heartbeat
+    # renderer can switch to the "✅ Selesai" line on the final tick.
+    body_finished = False
 
     async def _edit_body(*, force: bool = False) -> None:
         nonlocal last_body_edit_at
@@ -4217,6 +4901,7 @@ async def _run_genaddr_background(
         now = asyncio.get_event_loop().time()
         if not force and now - last_body_edit_at < GENADDR_BODY_EDIT_INTERVAL_S:
             return
+        elapsed = max(0, int(now - started_at))
         text = _render_genaddr_body(
             count=count,
             primary_email=primary.email,
@@ -4225,6 +4910,8 @@ async def _run_genaddr_background(
             success_count=len(successes),
             fail_count=len(failures),
             recent=successes,
+            elapsed_seconds=elapsed,
+            finished=body_finished,
         )
         # ``editMessageText`` raises ``BadRequest("message is not modified")``
         # when the rendered text is byte-identical to the previous edit
@@ -4241,6 +4928,32 @@ async def _run_genaddr_background(
             )
         last_body_edit_at = now
 
+    async def _heartbeat_loop() -> None:
+        """Refresh the starter message body every 5 seconds.
+
+        The user reported the progress message felt "static" because
+        :func:`_edit_body` only fired on the success callback — during
+        long browser-startup / login / captcha pauses, no new alias
+        landed for tens of seconds and the message just sat there.
+        This task force-edits the body on a steady cadence
+        (``GENADDR_BODY_REFRESH_INTERVAL_S``) so the elapsed-time
+        counter ticks even when the count is stuck. Cancelled in the
+        ``finally`` block of the parent run.
+        """
+        while True:
+            try:
+                await asyncio.sleep(GENADDR_BODY_REFRESH_INTERVAL_S)
+            except asyncio.CancelledError:
+                raise
+            try:
+                await _edit_body(force=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOGGER.debug(
+                    "genaddr heartbeat body edit failed", exc_info=True
+                )
+
     async def _on_progress(success_count: int, target: int, result) -> None:
         nonlocal last_notified_count
         if result.status is CreationStatus.SUCCESS:
@@ -4248,33 +4961,38 @@ async def _run_genaddr_background(
         else:
             failures.append((result.email, result.status.value))
 
-        # Live status: narrate every attempt so the user always sees
-        # the bot working. The 1.5s throttle inside StatusReporter
-        # absorbs bursts without rate-limiting Telegram.
-        if result.status is CreationStatus.SUCCESS:
-            label = (
-                f"🪄 {success_count}/{target} sukses · "
-                f"{result.email}"
-            )
-        else:
-            label = (
-                f"⚠️ {len(failures)} gagal/duplikat · "
-                f"{result.email}"
-            )
-        await _status(label)
-
-        # Body live update — runs on every progress callback but is
-        # internally throttled to the 2-second interval. We force-edit
-        # on milestones (multiples of GENADDR_NOTIFY_EVERY) and on the
-        # final success so the user always sees the milestone counts.
-        force_body = (
+        # The user reported the inline keyboard "muncul redup muncul
+        # redup" — flickering on every address — because every progress
+        # callback used to call ``_status`` which fires
+        # ``editMessageReplyMarkup`` and forces Telegram clients to
+        # redraw both the status row and the ❌ Batalkan row underneath
+        # it. We now only update the status button on milestones (every
+        # ``GENADDR_NOTIFY_EVERY`` successes) and on the very last
+        # alias, which keeps the keyboard stable in between. Live
+        # progress is still visible — the body refreshes every 5s via
+        # the heartbeat task.
+        is_milestone = (
             success_count > 0
             and (
                 success_count % GENADDR_NOTIFY_EVERY == 0
                 or success_count == target
             )
         )
-        await _edit_body(force=force_body)
+        if is_milestone:
+            if result.status is CreationStatus.SUCCESS:
+                label = f"🪄 {success_count}/{target} sukses"
+            else:
+                label = f"⚠️ {len(failures)} gagal/duplikat"
+            await _status(label)
+
+        # Body live update — runs on every progress callback but is
+        # internally throttled to the 2-second interval. We force-edit
+        # on milestones (multiples of GENADDR_NOTIFY_EVERY) and on the
+        # final success so the user always sees the milestone counts.
+        # The 5-second heartbeat task picks up the slack between
+        # milestones so the message keeps ticking even when the browser
+        # is stuck on login or captcha.
+        await _edit_body(force=is_milestone)
 
         # Only post a new message when we cross a multiple of NOTIFY_EVERY
         # (or on the very last success), so the chat doesn't get spammed
@@ -4313,9 +5031,22 @@ async def _run_genaddr_background(
 
     summary = None
     final_status_label = "✅ Selesai"
+    # 5-second heartbeat: refreshes the starter message body so the
+    # user sees a ticking "live" indicator even while the browser is
+    # busy logging in / solving captcha (no progress callbacks fire
+    # during those phases). ``starter_msg_id is None`` happens in
+    # tests that drive the flow without a real anchor message — skip
+    # the heartbeat there to keep the test surface stable.
+    heartbeat_task: asyncio.Task | None = None
+    if starter_msg_id is not None:
+        heartbeat_task = asyncio.create_task(_heartbeat_loop())
     try:
         try:
             await _status("🌐 Buka browser proxy & login Proton…", force=True)
+            # Force one initial body render so the user sees the new
+            # heartbeat line immediately instead of waiting up to 5s
+            # for the first periodic tick.
+            await _edit_body(force=True)
             summary = await address_generator.run_batch(
                 db=db,
                 cipher=cipher,
@@ -4345,24 +5076,47 @@ async def _run_genaddr_background(
                 )
             )
         except Exception as exc:
-            LOGGER.exception("genaddr background crashed")
-            final_status_label = "❌ Browser crash"
-            tracker.track(
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text=(
-                        f"❌ /genaddr untuk <b>{html.escape(primary.email)}</b>: "
-                        f"browser otomasi crash.\n"
-                        f"Detail: <code>"
-                        f"{html.escape(str(exc) or type(exc).__name__)}</code>\n\n"
-                        "Screenshot + HTML halaman terakhir disimpan di "
-                        "<code>/tmp/proton-browser-debug/</code> dalam container.\n"
-                        "Ambil dengan: <code>docker compose cp "
-                        "bot:/tmp/proton-browser-debug ./debug</code>"
-                    ),
-                    parse_mode=ParseMode.HTML,
+            # If the user already pressed ❌ Batalkan or fired
+            # /disconnect, the in-flight Playwright operation raises
+            # ``TargetClosedError`` (or similar) as a *side-effect* of
+            # the force_close we just performed. That's not a genuine
+            # crash — surface it as a clean cancellation instead so
+            # the user doesn't see a scary "browser otomasi crash"
+            # report after intentionally pulling the plug.
+            if cancel_event.is_set():
+                LOGGER.info(
+                    "genaddr cancelled mid-flight (browser closed): %s", exc
                 )
-            )
+                final_status_label = "❌ Dibatalkan"
+                tracker.track(
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            f"❌ /genaddr untuk <b>{html.escape(primary.email)}</b>"
+                            " dibatalkan. Browser sudah ditutup."
+                        ),
+                        parse_mode=ParseMode.HTML,
+                    )
+                )
+            else:
+                LOGGER.exception("genaddr background crashed")
+                final_status_label = "❌ Browser crash"
+                tracker.track(
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            f"❌ /genaddr untuk <b>{html.escape(primary.email)}</b>: "
+                            f"browser otomasi crash.\n"
+                            f"Detail: <code>"
+                            f"{html.escape(str(exc) or type(exc).__name__)}</code>\n\n"
+                            "Screenshot + HTML halaman terakhir disimpan di "
+                            "<code>/tmp/proton-browser-debug/</code> dalam container.\n"
+                            "Ambil dengan: <code>docker compose cp "
+                            "bot:/tmp/proton-browser-debug ./debug</code>"
+                        ),
+                        parse_mode=ParseMode.HTML,
+                    )
+                )
 
         if summary is not None:
             if cancel_event.is_set():
@@ -4383,6 +5137,17 @@ async def _run_genaddr_background(
                 tracker=tracker,
             )
     finally:
+        # Stop the body heartbeat first so it doesn't race with the
+        # final body edit / status.done() below. Force one last body
+        # render with ``finished=True`` so the user sees ``✅ Selesai``
+        # in the heartbeat line even before the tracker cleans up.
+        body_finished = True
+        if heartbeat_task is not None and not heartbeat_task.done():
+            heartbeat_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await heartbeat_task
+        with contextlib.suppress(Exception):
+            await _edit_body(force=True)
         chat_data = context.application.chat_data.get(chat_id)
         if chat_data is not None:
             chat_data.pop("genaddr_running", None)
@@ -4491,9 +5256,73 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     data = query.data
     if data == CB_NOOP:
         return
+    if data.startswith(f"{CB_TAG_SERVICE_CLEAR}:"):
+        # ``tagsvc_clear:<alias_id>:<domain>`` — explicitly suppress the
+        # label so even built-in defaults (cognition.ai → Devin, …)
+        # stop showing up in /list and the email header. We write an
+        # empty-string chat row instead of deleting the row, so the
+        # resolver knows to stop walking the parent-domain chain.
+        parts = data.split(":", 2)
+        if len(parts) != 3:
+            await query.answer("Data tag tidak valid.", show_alert=True)
+            return
+        domain = parts[2].strip().lower()
+        await db.set_service_label(chat_id, domain, "")
+        await query.answer(f"Label untuk {domain} dihapus.")
+        # Refresh the inline keyboard on the email message so the
+        # "Tag ulang" button shows the new state immediately. After
+        # suppression, the resolver returns None → only the
+        # "Tag ulang" button remains (no "Hapus label").
+        try:
+            new_label = await db.resolve_service_label(chat_id, domain)
+            try:
+                alias_id = int(parts[1])
+            except ValueError:
+                alias_id = -1
+            if alias_id > 0:
+                await query.edit_message_reply_markup(
+                    reply_markup=_build_tag_service_keyboard(
+                        alias_id=alias_id,
+                        sender_domain=domain,
+                        current_label=new_label,
+                    )
+                )
+        except Exception:
+            pass
+        return
+    if data.startswith(f"{CB_SVC_DELETE}:"):
+        # ``svcdel:<domain>`` from the /services keyboard.
+        domain = data.split(":", 1)[1].strip().lower()
+        if not domain:
+            await query.answer("Domain kosong.", show_alert=True)
+            return
+        removed = await db.remove_service_label(chat_id, domain)
+        if removed:
+            await query.answer(f"🗑 Mapping {domain} dihapus.")
+        else:
+            await query.answer(
+                "Mapping tidak ditemukan (mungkin sudah dihapus).",
+                show_alert=True,
+            )
+        # Re-render the /services keyboard in place.
+        try:
+            user_labels = await db.list_service_labels(chat_id)
+            await query.edit_message_reply_markup(
+                reply_markup=_build_services_keyboard(user_labels)
+            )
+        except Exception:
+            pass
+        return
     if data == CB_GENADDR_CANCEL:
-        cancel_event = context.chat_data.get("genaddr_cancel_event")
-        if cancel_event is None:
+        # ``_signal_genaddr_cancel`` returns False when there's no
+        # task to cancel — same UX as before (alert + clear keyboard).
+        # When there IS a task, it sets the cancel_event and schedules
+        # the Playwright force-close as a fire-and-forget task, so
+        # any in-flight ``page.click`` / ``wait_for_url`` raises
+        # ``TargetClosedError`` immediately instead of running out
+        # its 60s timeout.
+        cancelled = _signal_genaddr_cancel(context)
+        if not cancelled:
             await query.answer(
                 "Tidak ada /genaddr aktif untuk dibatalkan.", show_alert=False
             )
@@ -4502,27 +5331,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             except Exception:
                 pass
             return
-        cancel_event.set()
-        # Force-close the live browser so any in-flight Playwright await
-        # (``page.click``, ``wait_for_url``, …) raises ``TargetClosedError``
-        # right now instead of running the rest of its 60s timeout.
-        # ``force_close`` itself is best-effort + bounded, so we fire it
-        # off in a background task to keep this callback snappy.
-        browser_handle = context.chat_data.get("genaddr_browser_handle")
-        browser = (
-            browser_handle.get("browser")
-            if isinstance(browser_handle, dict)
-            else None
-        )
-        force_close = getattr(browser, "force_close", None) if browser else None
-        if callable(force_close):
-            # Hold a reference on chat_data so the GC doesn't collect the
-            # task before it finishes (RUF006). The handler's ``finally``
-            # clears chat_data, which is fine — by then the task is done
-            # or the next /genaddr will overwrite the slot.
-            context.chat_data["genaddr_force_close_task"] = asyncio.create_task(
-                _safe_force_close(force_close)
-            )
         await query.answer("Membatalkan & menutup browser...")
         try:
             # Disable the button immediately so the user knows their click
@@ -4622,9 +5430,16 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             else None
         )
         try:
+            labels_by_alias = await db.get_alias_service_labels(
+                chat_id, primary_id=primary_id
+            )
+        except Exception:
+            labels_by_alias = {}
+        try:
             await query.edit_message_text(
-                f"📧 Alias di <b>{html.escape(primary.email)}</b> "
-                f"({len(aliases)} alias):",
+                _build_alias_list_text(
+                    primary, aliases, labels_by_alias, active_alias_id
+                ),
                 reply_markup=_build_alias_keyboard_for_primary(
                     primary, aliases, active_alias_id
                 ),
@@ -4644,6 +5459,16 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if primary is None:
             await query.answer("Email utama tidak ditemukan.", show_alert=True)
             return
+        # Disconnect must abort any /genaddr that is currently running
+        # in this chat. The user reported the Playwright browser kept
+        # creating addresses after they hit "❌ Hapus" — those new
+        # aliases dropped on the floor when the primary's DB row got
+        # wiped seconds later, and the cookies/cert the browser was
+        # holding became invalid the moment the Bridge account was
+        # logged out. Cancel BEFORE running ``stop_for_primary`` /
+        # ``remove_account`` / ``delete_primary_account`` so the
+        # browser tears down cleanly instead of racing the deletion.
+        genaddr_was_cancelled = _signal_genaddr_cancel(context)
         # Disconnect can take 10-30s end-to-end (stop_for_primary →
         # bridge --cli delete account → bridge restart → DB delete).
         # Without a live anchor the user just stares at the unchanged
@@ -4653,7 +5478,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         # narrated. Best-effort: if the anchor send fails (rare) we
         # silently fall back to the original code path.
         disconnect_status: StatusReporter | None = None
-        disconnect_initial_label = "⏳ Mempersiapkan hapus akun…"
+        disconnect_initial_label = (
+            "🛑 Stop /genaddr yang sedang jalan…"
+            if genaddr_was_cancelled
+            else "⏳ Mempersiapkan hapus akun…"
+        )
         try:
             anchor = await query.message.reply_text(  # type: ignore[union-attr]
                 f"🗑️ Hapus akun <b>{html.escape(primary.email)}</b>…",
@@ -4748,6 +5577,23 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if current is not None and current.id == alias.id:
             await query.answer("Sudah aktif.", show_alert=False)
             return
+        # When switching FROM another alias, purge that alias' previously
+        # forwarded email messages so the chat isn't littered with stale
+        # forwards. We do this BEFORE flipping the active flag so any
+        # in-flight delivery to the old alias still reflects the right
+        # owner in our bookkeeping.
+        if current is not None and current.id != alias.id:
+            await _purge_alias_email_messages(
+                context.application.bot, db, chat_id, current.id
+            )
+        # Wipe any previous "🔒 Aktif: …" / "🔓 Kunci dilepas …" notes
+        # AND any lingering lock-reminder bubble from earlier picks so
+        # the user only ever sees the freshest confirmation in their
+        # chat (they piled up otherwise).
+        await _purge_transient_status_messages(
+            context.application.bot, db, chat_id
+        )
+        cast(dict, context.chat_data).pop("lock_reminder_msg_id", None)
         await db.set_active_alias(chat_id, alias.id)
         # Refresh the inline keyboard so the 🔒 marker moves to the new alias
         # in-place (no second list message clutter).
@@ -4763,7 +5609,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     )
                 except Exception:
                     pass
-        await query.message.reply_text(  # type: ignore[union-attr]
+        sent_lock = await query.message.reply_text(  # type: ignore[union-attr]
             # Wrap the alias in ``<code>`` so Telegram mobile users can
             # tap-to-copy directly from the lock-confirmation header. Desktop
             # users get the "📋 Copy email aktif" button below for one-click
@@ -4778,6 +5624,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             parse_mode=ParseMode.HTML,
             reply_markup=_build_poll_now_keyboard(with_copy_active=True),
         )
+        await _record_transient_status_message(db, chat_id, sent_lock, "lock")
         return
     if data == CB_POLL_NOW:
         manager = _bot_manager(context)
@@ -4803,11 +5650,35 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 )
             return
         await db.set_active_alias(chat_id, None)
+        # Bulk-purge the just-released alias' forwarded emails so the
+        # chat doesn't accumulate stale emails between locks.
+        await _purge_alias_email_messages(
+            context.application.bot, db, chat_id, active.id
+        )
+        # Wipe older 'lock' / 'unlock' confirmations only — NOT the
+        # lock_reminder bubble itself, since we're about to edit-in-place.
+        # If we wiped 'lock_reminder' we'd delete the very message we're
+        # editing and the user would see an empty chat.
+        await _purge_transient_status_messages(
+            context.application.bot, db, chat_id, kinds=("lock", "unlock")
+        )
+        edited_ok = False
         with contextlib.suppress(BadRequest, Exception):
             await query.edit_message_text(
                 f"🔓 Kunci dilepas dari <b>{html.escape(active.email)}</b>. "
                 "Pilih alias di /list saat siap menerima email lagi.",
                 parse_mode=ParseMode.HTML,
+            )
+            edited_ok = True
+        # The bubble that USED to be a 'lock_reminder' is now an
+        # 'unlock' confirmation. Drop the old row and re-record under
+        # the new kind so the next /list pick wipes it correctly.
+        await db.pop_transient_status_message_ids(
+            chat_id, kinds=("lock_reminder",)
+        )
+        if edited_ok and query.message is not None:
+            await _record_transient_status_message(
+                db, chat_id, query.message, "unlock"
             )
         return
     if data == CB_LOCK_REMINDER_PICK_NEW:
@@ -4816,6 +5687,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         # itself so the chat doesn't accumulate stale prompts.
         chat_data = cast(dict, context.chat_data)
         chat_data.pop("lock_reminder_msg_id", None)
+        # Drop the row in transient_status_messages too so a follow-up
+        # /list pick doesn't try (and silently fail) to re-delete the
+        # already-gone bubble.
+        await db.pop_transient_status_message_ids(
+            chat_id, kinds=("lock_reminder",)
+        )
         with contextlib.suppress(BadRequest, Exception):
             await query.delete_message()
         await _show_primary_list(update, db, chat_id)
@@ -4976,12 +5853,60 @@ class TelegramNotifier(Notifier):
         chat_id: int,
         alias_email: str,
         summary: dict[str, str],
+        *,
+        alias_id: int | None = None,
+        sender_email: str = "",
+        sender_domain: str = "",
     ) -> None:
-        await self._application.bot.send_message(
-            chat_id=chat_id,
-            text=_render_email_message(alias_email, summary),
-            parse_mode=ParseMode.HTML,
+        # Resolve the current label so the forwarded email can show the
+        # service name in its header AND the inline button can offer an
+        # accurate "Tag ulang" affordance. ``resolve_service_label``
+        # walks ``service_labels`` then ``DEFAULT_SERVICE_LABELS`` so a
+        # /services edit reflects in real time without a backfill.
+        current_label: str | None = None
+        if sender_domain:
+            try:
+                db = self._application.bot_data.get("db")
+                if db is not None:
+                    current_label = await db.resolve_service_label(
+                        chat_id, sender_domain
+                    )
+            except Exception:
+                LOGGER.debug(
+                    "resolve_service_label failed in notifier", exc_info=True
+                )
+        text = _render_email_message(
+            alias_email, summary, service_label=current_label
         )
+        markup: InlineKeyboardMarkup | None = None
+        if alias_id is not None and sender_domain:
+            markup = _build_tag_service_keyboard(
+                alias_id=alias_id,
+                sender_domain=sender_domain,
+                current_label=current_label,
+            )
+        sent = await self._application.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=markup,
+        )
+        # Remember the message id so we can purge it when the user switches
+        # to another active alias (request: "ganti alias → bersihkan
+        # pesan email lama biar chat tidak penuh"). We only track when we
+        # actually know which alias the email belongs to; older callers
+        # without ``alias_id`` simply skip the bookkeeping.
+        if alias_id is not None and sent is not None:
+            try:
+                db = self._application.bot_data.get("db")
+                if db is not None:
+                    await db.record_forwarded_email(
+                        chat_id, alias_id, sent.message_id
+                    )
+            except Exception:
+                LOGGER.debug(
+                    "record_forwarded_email failed", exc_info=True
+                )
 
     async def notify_aliases_discovered(
         self,
@@ -5007,7 +5932,12 @@ _TELEGRAM_MESSAGE_LIMIT = 4000
 _TRUNCATION_MARKER = "\n…(dipotong)"
 
 
-def _render_email_message(alias_email: str, summary: dict[str, str]) -> str:
+def _render_email_message(
+    alias_email: str,
+    summary: dict[str, str],
+    *,
+    service_label: str | None = None,
+) -> str:
     """Render the email-received Telegram message safely under the 4096-byte limit.
 
     The body is rendered through :func:`email_parser.format_body_html`, which:
@@ -5019,11 +5949,21 @@ def _render_email_message(alias_email: str, summary: dict[str, str]) -> str:
     The body is truncated *before* the final ``<code>`` injection so we never
     split an HTML entity (e.g. ``&amp;``) or a ``<code>`` tag at the byte
     boundary, which would cause Telegram's HTML parser to reject the message.
+
+    ``service_label`` is the currently-resolved friendly name for the
+    sender's domain (e.g. ``"Devin"``). When supplied it's appended to
+    the ``Dari:`` line so the user can spot at a glance which service
+    used the alias without scrolling to the keyboard below.
     """
     body = summary.get("body") or "(tidak ada isi text)"
+    from_rendered = html.escape(summary.get("from", "?"))
+    if service_label:
+        from_rendered = (
+            f"{from_rendered}  ·  🏷️ <b>{html.escape(service_label)}</b>"
+        )
     header = (
         f"<b>Email masuk untuk</b> <code>{html.escape(alias_email)}</code>\n"
-        f"<b>Dari:</b> {html.escape(summary.get('from', '?'))}\n"
+        f"<b>Dari:</b> {from_rendered}\n"
         f"<b>Subjek:</b> {html.escape(summary.get('subject', ''))}\n"
         f"<b>Tanggal:</b> {html.escape(summary.get('date', ''))}\n"
     )
@@ -5129,6 +6069,29 @@ def build_handlers() -> list:
         allow_reentry=True,
     )
 
+    # /tag-service: triggered by the inline "🏷️ Tag ulang" button on
+    # forwarded emails. The pattern matches ``tagsvc:<alias_id>:<domain>``
+    # — domain may contain dots/hyphens but no whitespace/colons.
+    tag_service_conv = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(
+                tag_service_entry,
+                pattern=rf"^{CB_TAG_SERVICE}:\d+:[A-Za-z0-9.\-]+$",
+            ),
+        ],
+        states={
+            TAG_AWAIT_LABEL: [
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND, tag_service_label_received
+                ),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cmd_cancel)],
+        name="tag_service",
+        persistent=False,
+        allow_reentry=True,
+    )
+
     setpw_conv = ConversationHandler(
         entry_points=[
             CommandHandler("setprotonpw", cmd_setprotonpw),
@@ -5164,9 +6127,16 @@ def build_handlers() -> list:
         CommandHandler("disconnect", cmd_disconnect),
         CommandHandler("genaddr", cmd_genaddr),
         CommandHandler("cekimap", cmd_cekimap),
+        CommandHandler("services", cmd_services),
+        CommandHandler("aliasinfo", cmd_aliasinfo),
+        CommandHandler("cleanmail", cmd_cleanmail),
         connect_conv,
         sync_conv,
         setpw_conv,
+        # Tag-service conv MUST come before the catch-all
+        # ``CallbackQueryHandler(on_callback)`` so the inline-button
+        # entry point wins over the catch-all.
+        tag_service_conv,
         # Live-status indicator buttons. The button is purely
         # informational; this handler just acks the tap so Telegram
         # clients drop the spinner. Must come BEFORE the catch-all

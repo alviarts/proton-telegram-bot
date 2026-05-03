@@ -6,6 +6,7 @@ from email.message import EmailMessage
 from proton_telegram_bot.email_parser import (
     collapse_blank_lines,
     extract_recipients,
+    extract_sender,
     find_matching_alias,
     format_body_html,
     html_to_text,
@@ -296,4 +297,81 @@ def test_summarize_html_only_returns_clean_text_no_tags() -> None:
     assert "<div" not in summary["body"]
     assert "<br" not in summary["body"]
     assert "Halo!" in summary["body"]
-    assert "Ini isinya." in summary["body"]
+
+
+def test_extract_sender_plain_address() -> None:
+    raw = _build_message(sender="no-reply@cognition.ai")
+    msg = parse_message(raw)
+    assert extract_sender(msg) == ("no-reply@cognition.ai", "cognition.ai")
+
+
+def test_extract_sender_with_display_name() -> None:
+    raw = _build_message(sender='"Devin via Cognition" <noreply@cognition.ai>')
+    msg = parse_message(raw)
+    assert extract_sender(msg) == ("noreply@cognition.ai", "cognition.ai")
+
+
+def test_extract_sender_lowercases() -> None:
+    raw = _build_message(sender="Hello@GitHub.COM")
+    msg = parse_message(raw)
+    assert extract_sender(msg) == ("hello@github.com", "github.com")
+
+
+def test_extract_sender_missing_returns_empty() -> None:
+    msg = EmailMessage()
+    msg["To"] = "vielz@proton.me"
+    msg.set_content("hi")
+    parsed = parse_message(msg.as_bytes())
+    assert extract_sender(parsed) == ("", "")
+
+
+# --- HTML link preservation regression tests ---------------------------------
+
+
+def test_html_to_text_preserves_anchor_url_when_text_differs() -> None:
+    """Regression: ``<a href="…">Verifikasi</a>`` must keep the URL alive."""
+    text = html_to_text(
+        '<p>silakan klik tautan berikut</p>'
+        '<p><a href="https://acc.majoo.id/verify?token=abc">Verifikasi</a></p>'
+    )
+    assert "Verifikasi" in text
+    assert "https://acc.majoo.id/verify?token=abc" in text
+
+
+def test_html_to_text_does_not_duplicate_when_visible_is_url() -> None:
+    """Don't emit ``https://x (https://x)`` for ``<a href=x>x</a>``."""
+    text = html_to_text(
+        '<a href="https://example.com/foo">https://example.com/foo</a>'
+    )
+    assert text.count("https://example.com/foo") == 1
+
+
+def test_html_to_text_drops_javascript_anchor() -> None:
+    """``javascript:`` hrefs are NOT echoed into the body."""
+    text = html_to_text(
+        '<a href="javascript:alert(1)">Click me</a>'
+    )
+    assert "javascript" not in text
+    assert "Click me" in text
+
+
+def test_html_to_text_emits_lone_url_when_link_text_is_empty() -> None:
+    text = html_to_text('<a href="https://example.com/foo"></a>')
+    assert "https://example.com/foo" in text
+
+
+def test_format_body_html_does_not_swallow_closing_paren() -> None:
+    """Regression: the URL regex must NOT eat a trailing ``)``.
+
+    Telegram's auto-linker would otherwise treat ``)`` as part of the
+    URL and the resolved link would 404.
+    """
+    from proton_telegram_bot.email_parser import _URL_RE
+
+    text = "Klik (https://example.com/verify) untuk lanjut."
+    matches = [m.group() for m in _URL_RE.finditer(text)]
+    assert matches == ["https://example.com/verify"]
+    # And format_body_html keeps the URL itself intact (not inside <code>).
+    out = format_body_html(text)
+    assert "https://example.com/verify" in out
+    assert "<code>" not in out

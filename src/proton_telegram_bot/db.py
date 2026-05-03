@@ -8,7 +8,62 @@ from pathlib import Path
 import aiosqlite
 
 from .alias_gen import GenState
-from .models import AliasRecord, AliasStatus, BridgeCredentials, PrimaryAccount, UserRecord
+from .models import (
+    AliasRecord,
+    AliasSenderRecord,
+    AliasStatus,
+    BridgeCredentials,
+    PrimaryAccount,
+    UserRecord,
+)
+
+# Built-in domain → friendly-label fallback. Chat-level overrides
+# (``service_labels`` table) take priority; this dict is the last resort.
+DEFAULT_SERVICE_LABELS: dict[str, str] = {
+    "cognition.ai": "Devin",
+    "github.com": "GitHub",
+    "google.com": "Google",
+    "accounts.google.com": "Google",
+    "discord.com": "Discord",
+    "openai.com": "OpenAI",
+    "chat.openai.com": "OpenAI",
+    "linkedin.com": "LinkedIn",
+    "twitter.com": "X/Twitter",
+    "x.com": "X/Twitter",
+    "facebook.com": "Facebook",
+    "meta.com": "Meta",
+    "instagram.com": "Instagram",
+    "apple.com": "Apple",
+    "microsoft.com": "Microsoft",
+    "live.com": "Microsoft",
+    "outlook.com": "Microsoft",
+    "amazon.com": "Amazon",
+    "aws.amazon.com": "AWS",
+    "stripe.com": "Stripe",
+    "netlify.com": "Netlify",
+    "vercel.com": "Vercel",
+    "cloudflare.com": "Cloudflare",
+    "digitalocean.com": "DigitalOcean",
+    "heroku.com": "Heroku",
+    "gitlab.com": "GitLab",
+    "bitbucket.org": "Bitbucket",
+    "notion.so": "Notion",
+    "slack.com": "Slack",
+    "telegram.org": "Telegram",
+    "reddit.com": "Reddit",
+    "stackoverflow.com": "StackOverflow",
+    "npm.io": "npm",
+    "npmjs.com": "npm",
+    "pypi.org": "PyPI",
+    "docker.com": "Docker",
+    "fly.io": "Fly.io",
+    "railway.app": "Railway",
+    "supabase.io": "Supabase",
+    "supabase.com": "Supabase",
+    "firebase.google.com": "Firebase",
+    "sentry.io": "Sentry",
+    "datadog.com": "Datadog",
+}
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -65,8 +120,76 @@ CREATE TABLE IF NOT EXISTS alias_generator_state (
     FOREIGN KEY(chat_id) REFERENCES users(chat_id) ON DELETE CASCADE
 );
 
+-- Records unique (alias, sender_domain) pairs from incoming emails so each
+-- alias can be labelled with the services that have used it ("Devin",
+-- "GitHub", …). One row per alias+domain combination — we de-duplicate
+-- at insert time using ON CONFLICT.
+CREATE TABLE IF NOT EXISTS alias_senders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    alias_id INTEGER NOT NULL,
+    chat_id INTEGER NOT NULL,
+    sender_email TEXT,
+    sender_domain TEXT NOT NULL,
+    service_label TEXT,
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    seen_count INTEGER NOT NULL DEFAULT 1,
+    UNIQUE(alias_id, sender_domain),
+    FOREIGN KEY(alias_id) REFERENCES aliases(id) ON DELETE CASCADE,
+    FOREIGN KEY(chat_id) REFERENCES users(chat_id) ON DELETE CASCADE
+);
+
+-- Per-chat domain → friendly label mapping. The user can create/edit
+-- these via /services; they take priority over the built-in defaults
+-- in ``DEFAULT_SERVICE_LABELS``. A row with ``label = ''`` is an
+-- explicit "suppress" sentinel written by the inline 🗑 Hapus label
+-- button so the resolver returns ``None`` even when a built-in default
+-- would otherwise apply.
+CREATE TABLE IF NOT EXISTS service_labels (
+    chat_id INTEGER NOT NULL,
+    domain TEXT NOT NULL,
+    label TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (chat_id, domain),
+    FOREIGN KEY(chat_id) REFERENCES users(chat_id) ON DELETE CASCADE
+);
+
+-- Telegram message ids of every email forwarded to a chat, keyed by the
+-- alias the email was destined for. We use this to bulk-delete the
+-- "old" alias' messages when the user switches their active alias via
+-- /list or /unlock, so chats don't fill up with stale forwards.
+CREATE TABLE IF NOT EXISTS forwarded_emails (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    alias_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    sent_at TEXT NOT NULL,
+    FOREIGN KEY(chat_id) REFERENCES users(chat_id) ON DELETE CASCADE,
+    FOREIGN KEY(alias_id) REFERENCES aliases(id) ON DELETE CASCADE
+);
+
+-- Telegram message ids of bot-sent "transient" status messages — the
+-- "🔒 Aktif: …" and "🔓 Kunci dilepas …" confirmations the bot posts
+-- on every alias switch / unlock. We pop & delete them on the NEXT
+-- switch so the user only ever sees ONE such confirmation in the chat,
+-- never a wall of old lock/unlock notes from previous picks.
+-- ``kind`` is a small free-form tag ('lock', 'unlock', …) so future
+-- transient categories can reuse the same table without a schema bump.
+CREATE TABLE IF NOT EXISTS transient_status_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'lock',
+    sent_at TEXT NOT NULL,
+    FOREIGN KEY(chat_id) REFERENCES users(chat_id) ON DELETE CASCADE
+);
+
 CREATE INDEX IF NOT EXISTS idx_aliases_chat_status ON aliases(chat_id, status);
 CREATE INDEX IF NOT EXISTS idx_primary_chat ON primary_accounts(chat_id);
+CREATE INDEX IF NOT EXISTS idx_alias_senders_alias ON alias_senders(alias_id);
+CREATE INDEX IF NOT EXISTS idx_alias_senders_chat ON alias_senders(chat_id);
+CREATE INDEX IF NOT EXISTS idx_forwarded_emails_chat_alias
+    ON forwarded_emails(chat_id, alias_id);
 """
 
 
@@ -736,6 +859,309 @@ class Database:
         await self.conn.commit()
         return (cursor.rowcount or 0) > 0
 
+    # -------------------------------------------------------- alias_senders
+
+    async def record_alias_sender(
+        self,
+        chat_id: int,
+        alias_id: int,
+        sender_email: str,
+        sender_domain: str,
+    ) -> str | None:
+        """Insert/update the (alias, sender_domain) row.
+
+        Returns the resolved service label at insert time (chat override
+        first, then ``DEFAULT_SERVICE_LABELS``, walking parent domains).
+        Subsequent emails from the same sender bump ``seen_count`` /
+        ``last_seen_at`` only — they do *not* re-resolve the label so a
+        manual rename in /services is preserved.
+        """
+        sender_domain = sender_domain.strip().lower()
+        sender_email = sender_email.strip().lower() if sender_email else None
+        if not sender_domain:
+            return None
+        label = await self.resolve_service_label(chat_id, sender_domain)
+        now = _utcnow()
+        await self.conn.execute(
+            "INSERT INTO alias_senders "
+            "(alias_id, chat_id, sender_email, sender_domain, "
+            "service_label, first_seen_at, last_seen_at, seen_count) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, 1) "
+            "ON CONFLICT(alias_id, sender_domain) DO UPDATE SET "
+            "last_seen_at = excluded.last_seen_at, "
+            "seen_count = seen_count + 1, "
+            "sender_email = COALESCE(excluded.sender_email, sender_email)",
+            (
+                alias_id,
+                chat_id,
+                sender_email,
+                sender_domain,
+                label,
+                now,
+                now,
+            ),
+        )
+        await self.conn.commit()
+        return label
+
+    async def list_alias_senders(
+        self, chat_id: int, alias_id: int
+    ) -> list[AliasSenderRecord]:
+        """Full sender history for one alias, most-recent first."""
+        async with self.conn.execute(
+            "SELECT id, alias_id, chat_id, sender_email, sender_domain, "
+            "service_label, first_seen_at, last_seen_at, seen_count "
+            "FROM alias_senders "
+            "WHERE chat_id = ? AND alias_id = ? "
+            "ORDER BY last_seen_at DESC",
+            (chat_id, alias_id),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [_row_to_alias_sender(row) for row in rows]
+
+    async def get_alias_service_labels(
+        self, chat_id: int, primary_id: int | None = None
+    ) -> dict[int, list[str]]:
+        """Return ``{alias_id: [labels…]}`` for the chat (optionally one primary).
+
+        Labels are re-resolved on every call so a /services edit takes
+        effect immediately without backfilling old rows. Domains with
+        no resolvable label appear as the raw domain so the user always
+        sees *something* useful.
+        """
+        if primary_id is None:
+            async with self.conn.execute(
+                "SELECT s.alias_id, s.sender_domain, s.last_seen_at "
+                "FROM alias_senders s "
+                "WHERE s.chat_id = ? "
+                "ORDER BY s.last_seen_at DESC",
+                (chat_id,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+        else:
+            async with self.conn.execute(
+                "SELECT s.alias_id, s.sender_domain, s.last_seen_at "
+                "FROM alias_senders s "
+                "JOIN aliases a ON a.id = s.alias_id "
+                "WHERE s.chat_id = ? AND a.primary_id = ? "
+                "ORDER BY s.last_seen_at DESC",
+                (chat_id, primary_id),
+            ) as cursor:
+                rows = await cursor.fetchall()
+        # Resolve labels in bulk by domain so we don't hit the DB once
+        # per row when many aliases share a sender domain. Domains the
+        # user has explicitly *suppressed* (🗑 Hapus label → empty
+        # chat-row) are excluded entirely so /list doesn't fall back to
+        # showing the raw domain after a user already said "no thanks".
+        unique_domains = {row["sender_domain"] for row in rows}
+        resolved: dict[str, str | None] = {}
+        for domain in unique_domains:
+            label = await self.resolve_service_label(chat_id, domain)
+            if label is None and await self.is_service_label_suppressed(
+                chat_id, domain
+            ):
+                resolved[domain] = None
+            else:
+                resolved[domain] = label or domain
+        out: dict[int, list[str]] = {}
+        for row in rows:
+            alias_id = row["alias_id"]
+            label = resolved[row["sender_domain"]]
+            if label is None:
+                continue
+            bucket = out.setdefault(alias_id, [])
+            if label not in bucket:
+                bucket.append(label)
+        return out
+
+    # -------------------------------------------------------- service_labels
+
+    @staticmethod
+    def _domain_candidates(domain: str) -> list[str]:
+        """Return ``[domain, parent.tld, ..., apex.tld]`` for label lookup."""
+        out: list[str] = [domain]
+        parts = domain.split(".")
+        while len(parts) > 2:
+            parts = parts[1:]
+            out.append(".".join(parts))
+        return out
+
+    async def resolve_service_label(
+        self, chat_id: int, domain: str
+    ) -> str | None:
+        """Resolve a domain to its friendly label.
+
+        Lookup order:
+        1. Chat's own ``service_labels`` (exact match, then strip leftmost
+           subdomain and retry until 2 labels remain).
+           - A row with a non-empty label wins.
+           - A row with an *empty* label is an explicit "suppress" sentinel:
+             the resolver returns ``None`` immediately and does NOT fall
+             back to ``DEFAULT_SERVICE_LABELS``.  This is what the inline
+             "🗑 Hapus label" button writes when the user wants a built-in
+             default to stop showing up in /list.
+        2. ``DEFAULT_SERVICE_LABELS`` with the same parent-domain walk.
+        3. ``None`` if nothing matches — caller usually shows the raw
+           domain as a last resort.
+        """
+        domain = domain.strip().lower()
+        if not domain:
+            return None
+        candidates = self._domain_candidates(domain)
+        async with self.conn.execute(
+            "SELECT domain, label FROM service_labels WHERE chat_id = ?",
+            (chat_id,),
+        ) as cursor:
+            user_rows = await cursor.fetchall()
+        user_map = {row["domain"]: row["label"] for row in user_rows}
+        for candidate in candidates:
+            if candidate in user_map:
+                label = (user_map[candidate] or "").strip()
+                # Empty string = explicit suppression. Stop the walk.
+                return label or None
+        for candidate in candidates:
+            if candidate in DEFAULT_SERVICE_LABELS:
+                return DEFAULT_SERVICE_LABELS[candidate]
+        return None
+
+    async def is_service_label_suppressed(
+        self, chat_id: int, domain: str
+    ) -> bool:
+        """True if there's an explicit empty-string chat row for ``domain``
+        or one of its parents — i.e., the user tapped 🗑 Hapus label.
+        """
+        domain = domain.strip().lower()
+        if not domain:
+            return False
+        candidates = self._domain_candidates(domain)
+        async with self.conn.execute(
+            "SELECT domain FROM service_labels "
+            "WHERE chat_id = ? AND (label = '' OR label IS NULL)",
+            (chat_id,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        suppressed = {row["domain"] for row in rows}
+        return any(c in suppressed for c in candidates)
+
+    async def set_service_label(
+        self, chat_id: int, domain: str, label: str
+    ) -> None:
+        domain = domain.strip().lower()
+        label = label.strip()
+        await self.upsert_user(chat_id)
+        await self.conn.execute(
+            "INSERT INTO service_labels (chat_id, domain, label, created_at) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(chat_id, domain) DO UPDATE SET label = excluded.label",
+            (chat_id, domain, label, _utcnow()),
+        )
+        await self.conn.commit()
+
+    async def remove_service_label(self, chat_id: int, domain: str) -> bool:
+        cursor = await self.conn.execute(
+            "DELETE FROM service_labels WHERE chat_id = ? AND domain = ?",
+            (chat_id, domain.strip().lower()),
+        )
+        await self.conn.commit()
+        return (cursor.rowcount or 0) > 0
+
+    async def list_service_labels(self, chat_id: int) -> list[tuple[str, str]]:
+        async with self.conn.execute(
+            "SELECT domain, label FROM service_labels "
+            "WHERE chat_id = ? ORDER BY domain",
+            (chat_id,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [(row["domain"], row["label"]) for row in rows]
+
+    # ----------------------------------------------------- forwarded_emails
+
+    async def record_forwarded_email(
+        self, chat_id: int, alias_id: int, message_id: int
+    ) -> None:
+        """Remember the Telegram ``message_id`` of one forwarded email so we
+        can later bulk-delete it when the user switches active alias."""
+        await self.conn.execute(
+            "INSERT INTO forwarded_emails (chat_id, alias_id, message_id, sent_at) "
+            "VALUES (?, ?, ?, ?)",
+            (chat_id, alias_id, message_id, _utcnow()),
+        )
+        await self.conn.commit()
+
+    async def pop_forwarded_email_message_ids(
+        self, chat_id: int, alias_id: int
+    ) -> list[int]:
+        """Return every recorded ``message_id`` for ``(chat_id, alias_id)`` and
+        delete the rows in the same transaction. The bot uses the returned ids
+        to call ``bot.delete_message`` so the chat doesn't accumulate stale
+        forwards from a previously-active alias.
+        """
+        async with self.conn.execute(
+            "SELECT message_id FROM forwarded_emails "
+            "WHERE chat_id = ? AND alias_id = ?",
+            (chat_id, alias_id),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        message_ids = [row["message_id"] for row in rows]
+        if message_ids:
+            await self.conn.execute(
+                "DELETE FROM forwarded_emails "
+                "WHERE chat_id = ? AND alias_id = ?",
+                (chat_id, alias_id),
+            )
+            await self.conn.commit()
+        return message_ids
+
+    # ---------------------------------------------- transient_status_messages
+
+    async def record_transient_status_message(
+        self, chat_id: int, message_id: int, kind: str = "lock"
+    ) -> None:
+        """Track a bot-sent status confirmation (``🔒 Aktif: …`` / ``🔓 Kunci dilepas …``)
+        so the *next* alias-switch can wipe it from the chat. ``kind`` is a free-form
+        tag — current callers pass ``'lock'`` or ``'unlock'`` but the column accepts
+        any string for forward compatibility."""
+        await self.conn.execute(
+            "INSERT INTO transient_status_messages "
+            "(chat_id, message_id, kind, sent_at) VALUES (?, ?, ?, ?)",
+            (chat_id, message_id, kind, _utcnow()),
+        )
+        await self.conn.commit()
+
+    async def pop_transient_status_message_ids(
+        self, chat_id: int, *, kinds: tuple[str, ...] | None = None
+    ) -> list[int]:
+        """Return every recorded ``message_id`` for ``chat_id`` and delete the
+        rows. If ``kinds`` is given, only rows whose ``kind`` is in that tuple
+        are popped (others are left alone). With ``kinds=None`` ALL transient
+        rows for the chat are popped."""
+        if kinds:
+            placeholders = ",".join("?" * len(kinds))
+            select_sql = (
+                "SELECT message_id FROM transient_status_messages "
+                f"WHERE chat_id = ? AND kind IN ({placeholders})"
+            )
+            delete_sql = (
+                "DELETE FROM transient_status_messages "
+                f"WHERE chat_id = ? AND kind IN ({placeholders})"
+            )
+            params: tuple = (chat_id, *kinds)
+        else:
+            select_sql = (
+                "SELECT message_id FROM transient_status_messages WHERE chat_id = ?"
+            )
+            delete_sql = (
+                "DELETE FROM transient_status_messages WHERE chat_id = ?"
+            )
+            params = (chat_id,)
+        async with self.conn.execute(select_sql, params) as cursor:
+            rows = await cursor.fetchall()
+        message_ids = [row["message_id"] for row in rows]
+        if message_ids:
+            await self.conn.execute(delete_sql, params)
+            await self.conn.commit()
+        return message_ids
+
 
 def credentials_from_user(user: UserRecord, plaintext_password: str) -> BridgeCredentials:
     """Reconstruct a BridgeCredentials object after decrypting the stored password."""
@@ -771,6 +1197,20 @@ def _row_to_alias(row: aiosqlite.Row) -> AliasRecord:
         consumed_at=row["consumed_at"],
         last_message_id=row["last_message_id"],
         primary_id=row["primary_id"] if "primary_id" in row.keys() else None,
+    )
+
+
+def _row_to_alias_sender(row: aiosqlite.Row) -> AliasSenderRecord:
+    return AliasSenderRecord(
+        id=row["id"],
+        alias_id=row["alias_id"],
+        chat_id=row["chat_id"],
+        sender_email=row["sender_email"],
+        sender_domain=row["sender_domain"],
+        service_label=row["service_label"],
+        first_seen_at=row["first_seen_at"],
+        last_seen_at=row["last_seen_at"],
+        seen_count=row["seen_count"],
     )
 
 

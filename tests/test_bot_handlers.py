@@ -44,6 +44,10 @@ def test_build_handlers_registers_new_commands() -> None:
     assert "genaddr" in commands
     # Health check wiring
     assert "cekimap" in commands
+    # Service-label feature
+    assert "services" in commands
+    assert "aliasinfo" in commands
+    assert "cleanmail" in commands
 
 
 def test_build_handlers_has_setprotonpw_conversation() -> None:
@@ -56,6 +60,7 @@ def test_build_handlers_has_setprotonpw_conversation() -> None:
     assert "setprotonpw" in conv_names
     assert "connect" in conv_names
     assert "sync" in conv_names
+    assert "tag_service" in conv_names
 
 
 def test_build_handlers_has_callback_query_router() -> None:
@@ -284,3 +289,146 @@ async def test_pick_primary_base_match_wins_over_active(populated_db) -> None:
     )
     assert primary.email == "vielz64@proton.me"
     assert reason == "cocok dengan base"
+
+
+# --------------------------------------- service-label rendering
+
+
+def test_format_alias_with_labels_collapses_to_email_when_empty() -> None:
+    from proton_telegram_bot.bot import _format_alias_with_labels
+
+    out = _format_alias_with_labels("vielz008@proton.me", [])
+    assert "vielz008@proton.me" in out
+    assert "📧" not in out  # No labels → no service block.
+
+
+def test_format_alias_with_labels_renders_active_lock() -> None:
+    from proton_telegram_bot.bot import _format_alias_with_labels
+
+    out = _format_alias_with_labels(
+        "vielz008@proton.me", ["Devin"], is_active=True
+    )
+    assert "🔒" in out
+    assert "Devin" in out
+
+
+def test_format_alias_with_labels_caps_with_overflow_tail() -> None:
+    from proton_telegram_bot.bot import _format_alias_with_labels
+
+    out = _format_alias_with_labels(
+        "x@p.me",
+        ["Devin", "GitHub", "Stripe", "Google", "OpenAI"],
+        max_labels=3,
+    )
+    assert "Devin" in out and "GitHub" in out and "Stripe" in out
+    assert "+2" in out
+    assert "Google" not in out
+    assert "OpenAI" not in out
+
+
+def test_render_email_message_includes_service_label() -> None:
+    from proton_telegram_bot.bot import _render_email_message
+
+    summary = {
+        "from": "no-reply@cognition.ai",
+        "subject": "Devin code-review feedback",
+        "date": "Sat, 03 May 2026 03:00:00 +0000",
+        "body": "Halo!",
+        "to": "vielz008@proton.me",
+    }
+    out = _render_email_message(
+        "vielz008@proton.me", summary, service_label="Devin"
+    )
+    assert "🏷️" in out
+    assert "Devin" in out
+    out_no_label = _render_email_message(
+        "vielz008@proton.me", summary, service_label=None
+    )
+    assert "🏷️" not in out_no_label
+
+
+def test_build_tag_service_keyboard_skips_when_overflow() -> None:
+    from proton_telegram_bot.bot import _build_tag_service_keyboard
+
+    very_long_domain = "a" * 70 + ".com"
+    out = _build_tag_service_keyboard(
+        alias_id=1, sender_domain=very_long_domain, current_label=None
+    )
+    assert out is None
+
+
+def test_build_tag_service_keyboard_includes_clear_only_when_labelled() -> None:
+    from proton_telegram_bot.bot import _build_tag_service_keyboard
+
+    no_clear = _build_tag_service_keyboard(
+        alias_id=1, sender_domain="cognition.ai", current_label=None
+    )
+    assert no_clear is not None
+    assert len(no_clear.inline_keyboard) == 1
+
+    with_clear = _build_tag_service_keyboard(
+        alias_id=1, sender_domain="cognition.ai", current_label="Devin"
+    )
+    assert with_clear is not None
+    assert len(with_clear.inline_keyboard) == 2
+
+
+def test_services_keyboard_renders_suppression_distinctly() -> None:
+    """A row with ``label = ''`` is the 🗑 Hapus label sentinel — the
+    keyboard distinguishes it from named mappings using the 🚫 icon and
+    a "(disembunyikan)" placeholder so the user can audit suppressions
+    in /services."""
+    from proton_telegram_bot.bot import _build_services_keyboard
+
+    keyboard = _build_services_keyboard(
+        [("cognition.ai", ""), ("github.com", "GitHub")]
+    )
+    assert keyboard is not None
+    rows = keyboard.inline_keyboard
+    assert len(rows) == 2
+    suppressed_btn = rows[0][0]
+    named_btn = rows[1][0]
+    assert "🚫" in suppressed_btn.text
+    assert "(disembunyikan)" in suppressed_btn.text
+    assert "🗑" in named_btn.text
+    assert "GitHub" in named_btn.text
+
+
+@pytest.mark.asyncio
+async def test_purge_alias_email_messages_calls_bot_delete(tmp_path) -> None:
+    """`_purge_alias_email_messages` deletes every recorded message id for
+    the alias and pops them from the DB. Failures (>48h, message gone)
+    are swallowed silently so a single bad id doesn't abort the bulk
+    delete — the rows are removed regardless to avoid retry forever."""
+    from proton_telegram_bot.bot import _purge_alias_email_messages
+    from proton_telegram_bot.db import Database
+
+    db = Database(tmp_path / "purge.sqlite")
+    await db.connect()
+    try:
+        await db.upsert_user(1)
+        await db.add_aliases(1, ["a@proton.me"], primary_id=None)
+        alias = await db.find_alias(1, "a@proton.me")
+        assert alias is not None
+        await db.record_forwarded_email(1, alias.id, 11)
+        await db.record_forwarded_email(1, alias.id, 22)
+        await db.record_forwarded_email(1, alias.id, 33)
+
+        deleted_ids: list[int] = []
+
+        class _Bot:
+            async def delete_message(self, *, chat_id, message_id):
+                if message_id == 22:
+                    raise RuntimeError("simulate vanished message")
+                deleted_ids.append(message_id)
+
+        deleted = await _purge_alias_email_messages(
+            _Bot(), db, 1, alias.id
+        )
+        assert deleted == 2  # 11 and 33 succeeded; 22 raised and was skipped
+        assert sorted(deleted_ids) == [11, 33]
+        # All three rows are still popped from the DB regardless of the
+        # delete_message outcome.
+        assert await db.pop_forwarded_email_message_ids(1, alias.id) == []
+    finally:
+        await db.close()

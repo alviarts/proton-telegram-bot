@@ -389,3 +389,170 @@ async def test_proton_password_column_is_nullable_for_legacy_rows(tmp_path) -> N
         assert await database.get_proton_password_encrypted(primaries[0].id) == "new-pw"
     finally:
         await database.close()
+
+
+async def test_record_alias_sender_resolves_default_label(db: Database) -> None:
+    """A sender from a known default domain gets auto-labelled."""
+    await db.upsert_user(1)
+    await db.add_aliases(1, ["vielz008@proton.me"], primary_id=None)
+    alias = await db.find_alias(1, "vielz008@proton.me")
+    assert alias is not None
+
+    label = await db.record_alias_sender(
+        1, alias.id, "no-reply@cognition.ai", "cognition.ai"
+    )
+    assert label == "Devin"
+    history = await db.list_alias_senders(1, alias.id)
+    assert len(history) == 1
+    assert history[0].sender_domain == "cognition.ai"
+    assert history[0].seen_count == 1
+
+    # Same domain again: bumps seen_count, doesn't insert a new row.
+    await db.record_alias_sender(
+        1, alias.id, "billing@cognition.ai", "cognition.ai"
+    )
+    history2 = await db.list_alias_senders(1, alias.id)
+    assert len(history2) == 1
+    assert history2[0].seen_count == 2
+
+
+async def test_record_alias_sender_walks_subdomain(db: Database) -> None:
+    """A subdomain like ``mail.github.com`` resolves to ``GitHub``."""
+    await db.upsert_user(1)
+    await db.add_aliases(1, ["test@proton.me"], primary_id=None)
+    alias = await db.find_alias(1, "test@proton.me")
+    assert alias is not None
+
+    label = await db.record_alias_sender(
+        1, alias.id, "noreply@notifications.github.com", "notifications.github.com"
+    )
+    assert label == "GitHub"
+
+
+async def test_service_label_user_override_wins(db: Database) -> None:
+    """User-defined chat-level mapping beats the built-in default."""
+    await db.upsert_user(1)
+    await db.set_service_label(1, "cognition.ai", "MyDevin")
+    assert await db.resolve_service_label(1, "cognition.ai") == "MyDevin"
+    assert await db.resolve_service_label(1, "sub.cognition.ai") == "MyDevin"
+
+
+async def test_service_label_remove(db: Database) -> None:
+    await db.upsert_user(1)
+    await db.set_service_label(1, "roboneo.com", "Roboneo")
+    assert await db.resolve_service_label(1, "roboneo.com") == "Roboneo"
+    assert await db.remove_service_label(1, "roboneo.com") is True
+    # After removal: no chat override, no built-in match → None.
+    assert await db.resolve_service_label(1, "roboneo.com") is None
+    # Removing again returns False.
+    assert await db.remove_service_label(1, "roboneo.com") is False
+
+
+async def test_get_alias_service_labels_groups_by_alias(db: Database) -> None:
+    """``get_alias_service_labels`` returns ``{alias_id: [labels…]}``."""
+    await db.upsert_user(1)
+    await db.add_aliases(
+        1, ["a@proton.me", "b@proton.me"], primary_id=None
+    )
+    alias_a = await db.find_alias(1, "a@proton.me")
+    alias_b = await db.find_alias(1, "b@proton.me")
+    assert alias_a is not None and alias_b is not None
+
+    await db.record_alias_sender(1, alias_a.id, "x@cognition.ai", "cognition.ai")
+    await db.record_alias_sender(1, alias_a.id, "x@github.com", "github.com")
+    await db.record_alias_sender(1, alias_b.id, "x@stripe.com", "stripe.com")
+
+    labels = await db.get_alias_service_labels(1)
+    assert set(labels[alias_a.id]) == {"Devin", "GitHub"}
+    assert labels[alias_b.id] == ["Stripe"]
+
+
+async def test_get_alias_service_labels_unknown_domain_uses_raw(
+    db: Database,
+) -> None:
+    """When neither chat override nor default matches, the raw domain shows up."""
+    await db.upsert_user(1)
+    await db.add_aliases(1, ["x@proton.me"], primary_id=None)
+    alias = await db.find_alias(1, "x@proton.me")
+    assert alias is not None
+    await db.record_alias_sender(
+        1, alias.id, "support@some-random-saas.example", "some-random-saas.example"
+    )
+    labels = await db.get_alias_service_labels(1)
+    assert labels[alias.id] == ["some-random-saas.example"]
+
+
+async def test_service_label_empty_string_suppresses_default(
+    db: Database,
+) -> None:
+    """An empty-string chat row is the "🗑 Hapus label" sentinel — even
+    a built-in default like ``cognition.ai → Devin`` is suppressed and
+    the resolver returns ``None`` (the badge disappears from /list and
+    the email header)."""
+    await db.upsert_user(1)
+    # cognition.ai resolves to "Devin" by default.
+    assert await db.resolve_service_label(1, "cognition.ai") == "Devin"
+    # User taps 🗑 Hapus label → empty-string sentinel is written.
+    await db.set_service_label(1, "cognition.ai", "")
+    assert await db.resolve_service_label(1, "cognition.ai") is None
+    assert await db.is_service_label_suppressed(1, "cognition.ai") is True
+    # Subdomain inherits the parent suppression.
+    assert await db.resolve_service_label(1, "alerts.cognition.ai") is None
+    # And /list excludes it instead of falling back to "cognition.ai".
+    await db.add_aliases(1, ["a@proton.me"], primary_id=None)
+    alias = await db.find_alias(1, "a@proton.me")
+    assert alias is not None
+    await db.record_alias_sender(1, alias.id, "x@cognition.ai", "cognition.ai")
+    labels = await db.get_alias_service_labels(1)
+    assert labels.get(alias.id, []) == []
+    # /services del re-enables the default.
+    assert await db.remove_service_label(1, "cognition.ai") is True
+    assert await db.resolve_service_label(1, "cognition.ai") == "Devin"
+
+
+async def test_forwarded_emails_record_and_pop(db: Database) -> None:
+    """``record_forwarded_email`` + ``pop_forwarded_email_message_ids``
+    let the bot bulk-delete an alias' forwarded emails when the user
+    switches alias."""
+    await db.upsert_user(1)
+    await db.add_aliases(1, ["a@proton.me", "b@proton.me"], primary_id=None)
+    alias_a = await db.find_alias(1, "a@proton.me")
+    alias_b = await db.find_alias(1, "b@proton.me")
+    assert alias_a is not None and alias_b is not None
+
+    await db.record_forwarded_email(1, alias_a.id, 100)
+    await db.record_forwarded_email(1, alias_a.id, 101)
+    await db.record_forwarded_email(1, alias_b.id, 200)
+
+    popped_a = await db.pop_forwarded_email_message_ids(1, alias_a.id)
+    assert sorted(popped_a) == [100, 101]
+    # The pop is destructive — second call returns nothing.
+    assert await db.pop_forwarded_email_message_ids(1, alias_a.id) == []
+    # Other alias' rows are untouched.
+    assert await db.pop_forwarded_email_message_ids(1, alias_b.id) == [200]
+
+
+async def test_transient_status_messages_record_and_pop(db: Database) -> None:
+    """``record_transient_status_message`` + ``pop_transient_status_message_ids``
+    underpin the wipe-old-confirmations behavior on alias-switch.
+    """
+    await db.upsert_user(1)
+    await db.upsert_user(2)
+
+    await db.record_transient_status_message(1, 10, "lock")
+    await db.record_transient_status_message(1, 11, "lock")
+    await db.record_transient_status_message(1, 12, "unlock")
+    await db.record_transient_status_message(2, 99, "lock")
+
+    # Pop just 'lock' kind for chat 1 — leaves the unlock row alone.
+    popped_lock = await db.pop_transient_status_message_ids(1, kinds=("lock",))
+    assert sorted(popped_lock) == [10, 11]
+    assert await db.pop_transient_status_message_ids(1, kinds=("lock",)) == []
+
+    # The unlock row is still there for chat 1.
+    popped_all_chat1 = await db.pop_transient_status_message_ids(1)
+    assert popped_all_chat1 == [12]
+
+    # Other chats untouched.
+    assert await db.pop_transient_status_message_ids(2) == [99]
+    assert await db.pop_transient_status_message_ids(2) == []

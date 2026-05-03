@@ -13,7 +13,12 @@ from email.message import Message
 
 from .crypto import CredentialCipher
 from .db import Database, credentials_from_primary
-from .email_parser import extract_recipients, find_matching_alias, summarize
+from .email_parser import (
+    extract_recipients,
+    extract_sender,
+    find_matching_alias,
+    summarize,
+)
 from .imap_listener import IMAPListener
 
 LOGGER = logging.getLogger(__name__)
@@ -183,8 +188,30 @@ class ListenerManager:
             )
             return
         summary = summarize(message)
+        # Capture the From-header sender domain so /list can label this
+        # alias with the services that have used it (Devin, GitHub, …).
+        # Failures here must NOT block the actual email forward — they
+        # are purely metadata.
+        sender_email, sender_domain = extract_sender(message)
+        if sender_domain:
+            try:
+                await self._db.record_alias_sender(
+                    chat_id, active.id, sender_email, sender_domain
+                )
+            except Exception:
+                LOGGER.debug(
+                    "failed to record alias_sender for chat %s alias %s",
+                    chat_id,
+                    active.id,
+                    exc_info=True,
+                )
         await self._notifier.notify_email_received(
-            chat_id, active.email, summary
+            chat_id,
+            active.email,
+            summary,
+            alias_id=active.id,
+            sender_email=sender_email,
+            sender_domain=sender_domain,
         )
 
     async def _handle_discovered_aliases(
@@ -221,6 +248,10 @@ class Notifier:
         chat_id: int,
         alias_email: str,
         summary: dict[str, str],
+        *,
+        alias_id: int | None = None,
+        sender_email: str = "",
+        sender_domain: str = "",
     ) -> None:  # pragma: no cover - implemented by the bot module
         raise NotImplementedError
 
