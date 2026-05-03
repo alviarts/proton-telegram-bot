@@ -4865,24 +4865,47 @@ async def _run_genaddr_background(
                 )
             )
         except Exception as exc:
-            LOGGER.exception("genaddr background crashed")
-            final_status_label = "❌ Browser crash"
-            tracker.track(
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text=(
-                        f"❌ /genaddr untuk <b>{html.escape(primary.email)}</b>: "
-                        f"browser otomasi crash.\n"
-                        f"Detail: <code>"
-                        f"{html.escape(str(exc) or type(exc).__name__)}</code>\n\n"
-                        "Screenshot + HTML halaman terakhir disimpan di "
-                        "<code>/tmp/proton-browser-debug/</code> dalam container.\n"
-                        "Ambil dengan: <code>docker compose cp "
-                        "bot:/tmp/proton-browser-debug ./debug</code>"
-                    ),
-                    parse_mode=ParseMode.HTML,
+            # If the user already pressed ❌ Batalkan or fired
+            # /disconnect, the in-flight Playwright operation raises
+            # ``TargetClosedError`` (or similar) as a *side-effect* of
+            # the force_close we just performed. That's not a genuine
+            # crash — surface it as a clean cancellation instead so
+            # the user doesn't see a scary "browser otomasi crash"
+            # report after intentionally pulling the plug.
+            if cancel_event.is_set():
+                LOGGER.info(
+                    "genaddr cancelled mid-flight (browser closed): %s", exc
                 )
-            )
+                final_status_label = "❌ Dibatalkan"
+                tracker.track(
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            f"❌ /genaddr untuk <b>{html.escape(primary.email)}</b>"
+                            " dibatalkan. Browser sudah ditutup."
+                        ),
+                        parse_mode=ParseMode.HTML,
+                    )
+                )
+            else:
+                LOGGER.exception("genaddr background crashed")
+                final_status_label = "❌ Browser crash"
+                tracker.track(
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            f"❌ /genaddr untuk <b>{html.escape(primary.email)}</b>: "
+                            f"browser otomasi crash.\n"
+                            f"Detail: <code>"
+                            f"{html.escape(str(exc) or type(exc).__name__)}</code>\n\n"
+                            "Screenshot + HTML halaman terakhir disimpan di "
+                            "<code>/tmp/proton-browser-debug/</code> dalam container.\n"
+                            "Ambil dengan: <code>docker compose cp "
+                            "bot:/tmp/proton-browser-debug ./debug</code>"
+                        ),
+                        parse_mode=ParseMode.HTML,
+                    )
+                )
 
         if summary is not None:
             if cancel_event.is_set():
