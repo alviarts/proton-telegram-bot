@@ -354,6 +354,39 @@ def _bot_manager(context: ContextTypes.DEFAULT_TYPE) -> ListenerManager:
     return cast(ListenerManager, context.application.bot_data["manager"])
 
 
+async def _purge_alias_email_messages(
+    bot, db: Database, chat_id: int, alias_id: int
+) -> int:
+    """Delete every previously-forwarded email message for ``alias_id``.
+
+    Called on the three "active alias just changed" boundaries
+    (``/list`` pick, ``/unlock``, lock-reminder Lepas) so the chat stops
+    accumulating stale email forwards from an alias the user is no
+    longer using. Returns the count actually deleted from Telegram —
+    rows are popped from the DB regardless so we don't retry forever
+    on messages older than Telegram's 48-hour deletion window.
+    """
+    message_ids = await db.pop_forwarded_email_message_ids(chat_id, alias_id)
+    if not message_ids:
+        return 0
+    deleted = 0
+    for mid in message_ids:
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=mid)
+            deleted += 1
+        except Exception:
+            # Message may already be gone (user deleted it, >48h old,
+            # bot lost permission, etc.). Silently skip — the DB row
+            # was already popped so we won't retry it forever.
+            LOGGER.debug(
+                "delete_message failed for chat=%s mid=%s",
+                chat_id,
+                mid,
+                exc_info=True,
+            )
+    return deleted
+
+
 def _bot_bridge_admin(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> BridgeAdmin | None:
@@ -1203,20 +1236,26 @@ def _build_services_keyboard(
 
     Defaults from :data:`db.DEFAULT_SERVICE_LABELS` are NOT listed here
     — they're an implicit fallback the user can override by saving
-    their own ``domain → label`` row. ``None`` means the user has no
-    custom mappings yet.
+    their own ``domain → label`` row. Rows with an *empty* label
+    represent an explicit suppression (the user tapped "🗑 Hapus label"
+    on a forwarded email) and are rendered with a 🚫 icon so the user
+    can clearly tell them apart from named mappings. ``None`` means the
+    user has no custom mappings yet.
     """
     if not user_labels:
         return None
     rows: list[list[InlineKeyboardButton]] = []
     for domain, label in user_labels:
+        is_suppressed = not (label or "").strip()
+        display = "(disembunyikan)" if is_suppressed else label
+        icon = "🚫" if is_suppressed else "🗑"
         callback = f"{CB_SVC_DELETE}:{domain}"
         if len(callback.encode()) > _TG_CALLBACK_DATA_LIMIT:
             # Domain too long to round-trip safely; show as informational.
             rows.append(
                 [
                     InlineKeyboardButton(
-                        f"{label}  ·  {domain}", callback_data=CB_NOOP
+                        f"{display}  ·  {domain}", callback_data=CB_NOOP
                     )
                 ]
             )
@@ -1224,7 +1263,7 @@ def _build_services_keyboard(
         rows.append(
             [
                 InlineKeyboardButton(
-                    f"🗑 {label}  ·  {domain}", callback_data=callback
+                    f"{icon} {display}  ·  {domain}", callback_data=callback
                 )
             ]
         )
@@ -1297,10 +1336,21 @@ async def cmd_services(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
     if user_labels:
         intro += "<b>Mapping kamu:</b>\n"
-        intro += "\n".join(
-            f"• <code>{html.escape(d)}</code> → <b>{html.escape(label)}</b>"
-            for d, label in user_labels
-        )
+        rendered_lines: list[str] = []
+        for d, label in user_labels:
+            stripped = (label or "").strip()
+            if stripped:
+                rendered_lines.append(
+                    f"• <code>{html.escape(d)}</code> → "
+                    f"<b>{html.escape(stripped)}</b>"
+                )
+            else:
+                # Empty-string row → explicit suppression via 🗑 button.
+                rendered_lines.append(
+                    f"• <code>{html.escape(d)}</code> → "
+                    f"<i>🚫 disembunyikan</i>"
+                )
+        intro += "\n".join(rendered_lines)
         intro += (
             "\n\nTap tombol di bawah untuk menghapus. "
             "Untuk menambah/ubah: <code>/services domain = Label</code>."
@@ -3567,7 +3617,14 @@ async def cmd_unlock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             "Tidak ada alias yang sedang aktif. Pilih satu di /list."
         )
         return
+    # Tear down the lock first so any in-flight email-forward racing
+    # against this command is rejected by strict lock-mode, then bulk
+    # delete every message we previously forwarded for this alias so
+    # the chat doesn't stay polluted with stale emails.
     await db.set_active_alias(chat.id, None)
+    await _purge_alias_email_messages(
+        context.application.bot, db, chat.id, active.id
+    )
     await update.effective_message.reply_text(  # type: ignore[union-attr]
         f"🔓 Kunci dilepas dari <b>{html.escape(active.email)}</b>. "
         "Pilih alias di /list saat siap menerima email lagi.",
@@ -5046,25 +5103,22 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if data == CB_NOOP:
         return
     if data.startswith(f"{CB_TAG_SERVICE_CLEAR}:"):
-        # ``tagsvc_clear:<alias_id>:<domain>`` — wipe the chat-level
-        # mapping so the alias falls back to the raw domain (or any
-        # built-in default that still applies).
+        # ``tagsvc_clear:<alias_id>:<domain>`` — explicitly suppress the
+        # label so even built-in defaults (cognition.ai → Devin, …)
+        # stop showing up in /list and the email header. We write an
+        # empty-string chat row instead of deleting the row, so the
+        # resolver knows to stop walking the parent-domain chain.
         parts = data.split(":", 2)
         if len(parts) != 3:
             await query.answer("Data tag tidak valid.", show_alert=True)
             return
         domain = parts[2].strip().lower()
-        removed = await db.remove_service_label(chat_id, domain)
-        if removed:
-            await query.answer(f"Label untuk {domain} dihapus.")
-        else:
-            await query.answer(
-                "Tidak ada label kustom untuk domain ini "
-                "(default bawaan bot tetap berlaku).",
-                show_alert=True,
-            )
+        await db.set_service_label(chat_id, domain, "")
+        await query.answer(f"Label untuk {domain} dihapus.")
         # Refresh the inline keyboard on the email message so the
-        # "Tag ulang" button shows the new state immediately.
+        # "Tag ulang" button shows the new state immediately. After
+        # suppression, the resolver returns None → only the
+        # "Tag ulang" button remains (no "Hapus label").
         try:
             new_label = await db.resolve_service_label(chat_id, domain)
             try:
@@ -5369,6 +5423,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if current is not None and current.id == alias.id:
             await query.answer("Sudah aktif.", show_alert=False)
             return
+        # When switching FROM another alias, purge that alias' previously
+        # forwarded email messages so the chat isn't littered with stale
+        # forwards. We do this BEFORE flipping the active flag so any
+        # in-flight delivery to the old alias still reflects the right
+        # owner in our bookkeeping.
+        if current is not None and current.id != alias.id:
+            await _purge_alias_email_messages(
+                context.application.bot, db, chat_id, current.id
+            )
         await db.set_active_alias(chat_id, alias.id)
         # Refresh the inline keyboard so the 🔒 marker moves to the new alias
         # in-place (no second list message clutter).
@@ -5424,6 +5487,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 )
             return
         await db.set_active_alias(chat_id, None)
+        # Bulk-purge the just-released alias' forwarded emails so the
+        # chat doesn't accumulate stale emails between locks.
+        await _purge_alias_email_messages(
+            context.application.bot, db, chat_id, active.id
+        )
         with contextlib.suppress(BadRequest, Exception):
             await query.edit_message_text(
                 f"🔓 Kunci dilepas dari <b>{html.escape(active.email)}</b>. "
@@ -5629,12 +5697,28 @@ class TelegramNotifier(Notifier):
                 sender_domain=sender_domain,
                 current_label=current_label,
             )
-        await self._application.bot.send_message(
+        sent = await self._application.bot.send_message(
             chat_id=chat_id,
             text=text,
             parse_mode=ParseMode.HTML,
             reply_markup=markup,
         )
+        # Remember the message id so we can purge it when the user switches
+        # to another active alias (request: "ganti alias → bersihkan
+        # pesan email lama biar chat tidak penuh"). We only track when we
+        # actually know which alias the email belongs to; older callers
+        # without ``alias_id`` simply skip the bookkeeping.
+        if alias_id is not None and sent is not None:
+            try:
+                db = self._application.bot_data.get("db")
+                if db is not None:
+                    await db.record_forwarded_email(
+                        chat_id, alias_id, sent.message_id
+                    )
+            except Exception:
+                LOGGER.debug(
+                    "record_forwarded_email failed", exc_info=True
+                )
 
     async def notify_aliases_discovered(
         self,

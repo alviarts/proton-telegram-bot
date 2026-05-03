@@ -370,3 +370,64 @@ def test_build_tag_service_keyboard_includes_clear_only_when_labelled() -> None:
     )
     assert with_clear is not None
     assert len(with_clear.inline_keyboard) == 2
+
+
+def test_services_keyboard_renders_suppression_distinctly() -> None:
+    """A row with ``label = ''`` is the 🗑 Hapus label sentinel — the
+    keyboard distinguishes it from named mappings using the 🚫 icon and
+    a "(disembunyikan)" placeholder so the user can audit suppressions
+    in /services."""
+    from proton_telegram_bot.bot import _build_services_keyboard
+
+    keyboard = _build_services_keyboard(
+        [("cognition.ai", ""), ("github.com", "GitHub")]
+    )
+    assert keyboard is not None
+    rows = keyboard.inline_keyboard
+    assert len(rows) == 2
+    suppressed_btn = rows[0][0]
+    named_btn = rows[1][0]
+    assert "🚫" in suppressed_btn.text
+    assert "(disembunyikan)" in suppressed_btn.text
+    assert "🗑" in named_btn.text
+    assert "GitHub" in named_btn.text
+
+
+@pytest.mark.asyncio
+async def test_purge_alias_email_messages_calls_bot_delete(tmp_path) -> None:
+    """`_purge_alias_email_messages` deletes every recorded message id for
+    the alias and pops them from the DB. Failures (>48h, message gone)
+    are swallowed silently so a single bad id doesn't abort the bulk
+    delete — the rows are removed regardless to avoid retry forever."""
+    from proton_telegram_bot.bot import _purge_alias_email_messages
+    from proton_telegram_bot.db import Database
+
+    db = Database(tmp_path / "purge.sqlite")
+    await db.connect()
+    try:
+        await db.upsert_user(1)
+        await db.add_aliases(1, ["a@proton.me"], primary_id=None)
+        alias = await db.find_alias(1, "a@proton.me")
+        assert alias is not None
+        await db.record_forwarded_email(1, alias.id, 11)
+        await db.record_forwarded_email(1, alias.id, 22)
+        await db.record_forwarded_email(1, alias.id, 33)
+
+        deleted_ids: list[int] = []
+
+        class _Bot:
+            async def delete_message(self, *, chat_id, message_id):
+                if message_id == 22:
+                    raise RuntimeError("simulate vanished message")
+                deleted_ids.append(message_id)
+
+        deleted = await _purge_alias_email_messages(
+            _Bot(), db, 1, alias.id
+        )
+        assert deleted == 2  # 11 and 33 succeeded; 22 raised and was skipped
+        assert sorted(deleted_ids) == [11, 33]
+        # All three rows are still popped from the DB regardless of the
+        # delete_message outcome.
+        assert await db.pop_forwarded_email_message_ids(1, alias.id) == []
+    finally:
+        await db.close()

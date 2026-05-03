@@ -480,3 +480,53 @@ async def test_get_alias_service_labels_unknown_domain_uses_raw(
     )
     labels = await db.get_alias_service_labels(1)
     assert labels[alias.id] == ["some-random-saas.example"]
+
+
+async def test_service_label_empty_string_suppresses_default(
+    db: Database,
+) -> None:
+    """An empty-string chat row is the "🗑 Hapus label" sentinel — even
+    a built-in default like ``cognition.ai → Devin`` is suppressed and
+    the resolver returns ``None`` (the badge disappears from /list and
+    the email header)."""
+    await db.upsert_user(1)
+    # cognition.ai resolves to "Devin" by default.
+    assert await db.resolve_service_label(1, "cognition.ai") == "Devin"
+    # User taps 🗑 Hapus label → empty-string sentinel is written.
+    await db.set_service_label(1, "cognition.ai", "")
+    assert await db.resolve_service_label(1, "cognition.ai") is None
+    assert await db.is_service_label_suppressed(1, "cognition.ai") is True
+    # Subdomain inherits the parent suppression.
+    assert await db.resolve_service_label(1, "alerts.cognition.ai") is None
+    # And /list excludes it instead of falling back to "cognition.ai".
+    await db.add_aliases(1, ["a@proton.me"], primary_id=None)
+    alias = await db.find_alias(1, "a@proton.me")
+    assert alias is not None
+    await db.record_alias_sender(1, alias.id, "x@cognition.ai", "cognition.ai")
+    labels = await db.get_alias_service_labels(1)
+    assert labels.get(alias.id, []) == []
+    # /services del re-enables the default.
+    assert await db.remove_service_label(1, "cognition.ai") is True
+    assert await db.resolve_service_label(1, "cognition.ai") == "Devin"
+
+
+async def test_forwarded_emails_record_and_pop(db: Database) -> None:
+    """``record_forwarded_email`` + ``pop_forwarded_email_message_ids``
+    let the bot bulk-delete an alias' forwarded emails when the user
+    switches alias."""
+    await db.upsert_user(1)
+    await db.add_aliases(1, ["a@proton.me", "b@proton.me"], primary_id=None)
+    alias_a = await db.find_alias(1, "a@proton.me")
+    alias_b = await db.find_alias(1, "b@proton.me")
+    assert alias_a is not None and alias_b is not None
+
+    await db.record_forwarded_email(1, alias_a.id, 100)
+    await db.record_forwarded_email(1, alias_a.id, 101)
+    await db.record_forwarded_email(1, alias_b.id, 200)
+
+    popped_a = await db.pop_forwarded_email_message_ids(1, alias_a.id)
+    assert sorted(popped_a) == [100, 101]
+    # The pop is destructive — second call returns nothing.
+    assert await db.pop_forwarded_email_message_ids(1, alias_a.id) == []
+    # Other alias' rows are untouched.
+    assert await db.pop_forwarded_email_message_ids(1, alias_b.id) == [200]
