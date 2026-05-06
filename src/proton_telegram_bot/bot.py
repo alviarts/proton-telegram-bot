@@ -5,6 +5,7 @@ import asyncio
 import contextlib
 import html
 import logging
+import os
 import re
 import secrets
 import smtplib
@@ -1232,6 +1233,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/cekimap — Cek IMAP listener semua alias (jalan di background)\n"
         "/services — Atur label service (mis. cognition.ai → Devin)\n"
         "/aliasinfo &lt;email&gt; — Lihat history pengirim alias tertentu\n"
+        "/cleanmail [N] — Sapu N pesan terakhir (default 100, maks 500)\n"
+        "/resetbot — Restart proses bot (systemd/pm2 auto bring back)\n"
         "/cancel — Batalkan dialog /connect"
     )
     greeting = _greeting(update)
@@ -1574,6 +1577,61 @@ async def cmd_cleanmail(
         await msg.reply_text(
             f"🧹 Selesai: dihapus {deleted}, dilewati {failed}."
         )
+
+
+# ---------------------------------------------------------------- /resetbot
+
+
+@_gate
+async def cmd_resetbot(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Force a hard restart of the bot process.
+
+    The unit file has ``Restart=always`` (systemd) — equivalent to pm2's
+    auto-restart policy — so when this handler exits the process the
+    supervisor brings it back up within ``RestartSec=5`` seconds. This
+    works without sudo, without IPC to systemd, and without depending on
+    which supervisor is in front (systemd vs pm2 vs Docker restart-policy).
+
+    The user complained that occasional Telegram-side / IMAP-side network
+    blips left the bot in a confused state where polling kept timing out
+    even after connectivity recovered. ``/resetbot`` is the manual escape
+    hatch for those rare cases.
+    """
+    msg = update.effective_message
+    if msg is None:
+        return
+    # Acknowledge first so the user sees confirmation before the
+    # process exits and the next poll cycle goes silent for ~5s.
+    notice = await msg.reply_text(
+        "🔄 Bot restart sekarang… kembali online dalam ~5 detik. "
+        "Kalau >30 detik belum balas, cek systemd / pm2 di VPS."
+    )
+    # Best-effort: let Telegram receive the ack before we drop the
+    # event loop. Using ``loop.call_later`` instead of ``await sleep``
+    # because we want this handler to return cleanly so PTB's update
+    # tracking persists ``last_update_id`` to disk before we die. That
+    # way the next process won't replay this same /resetbot command.
+    LOGGER.warning(
+        "cmd_resetbot: triggered by user %s in chat %s (msg %s); "
+        "exiting in 1s for supervisor restart",
+        update.effective_user.id if update.effective_user else "?",
+        update.effective_chat.id if update.effective_chat else "?",
+        notice.message_id,
+    )
+    loop = asyncio.get_running_loop()
+
+    def _hard_exit() -> None:
+        # ``os._exit`` skips Python finalizers — that's what we want here:
+        # we already flushed the ack message, and the alternative
+        # (``sys.exit``) would let aioimaplib's TCP teardown stall for
+        # 30+s on a flaky connection, which is exactly the failure mode
+        # /resetbot exists to bypass.
+        LOGGER.warning("cmd_resetbot: os._exit(0) now")
+        os._exit(0)
+
+    loop.call_later(1.0, _hard_exit)
 
 
 # ----------------------------------------------- /tag-service conversation
@@ -6130,6 +6188,7 @@ def build_handlers() -> list:
         CommandHandler("services", cmd_services),
         CommandHandler("aliasinfo", cmd_aliasinfo),
         CommandHandler("cleanmail", cmd_cleanmail),
+        CommandHandler("resetbot", cmd_resetbot),
         connect_conv,
         sync_conv,
         setpw_conv,
