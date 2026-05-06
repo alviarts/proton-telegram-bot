@@ -328,3 +328,47 @@ async def test_handle_message_does_not_rematch_consumed_alias(db: Database) -> N
     )
     # No active alias is locked, so nothing is forwarded.
     assert notifier.calls == []
+
+
+async def test_handle_message_does_not_auto_record_alias_sender(
+    db: Database,
+) -> None:
+    """Regression: deferred labeling.
+
+    Before, ``_handle_new_message`` called ``record_alias_sender`` on
+    every forward, which mislabeled aliases when the downstream
+    ``send_message`` failed (Telegram timeout, polling drop). Recording
+    is now gated on the user's "✓ Tandai sudah dibaca" callback, so a
+    bare manager dispatch must NOT touch ``alias_senders``.
+    """
+    chat_id = 200
+    await db.upsert_user(chat_id)
+    primary_id = await _seed_primary(db, chat_id, "vielz43@proton.me")
+    await db.add_aliases(chat_id, ["vielz77@proton.me"], primary_id=primary_id)
+    active = await db.find_alias(chat_id, "vielz77@proton.me")
+    assert active is not None
+    await db.set_active_alias(chat_id, active.id)
+    notifier = _RecordingNotifier()
+    manager = ListenerManager(
+        db=db,
+        cipher=CredentialCipher(CredentialCipher.generate_key()),
+        notifier=notifier,
+    )
+    msg = EmailMessage()
+    msg["From"] = "no-reply@cognition.ai"
+    msg["To"] = "vielz77@proton.me"
+    msg["Subject"] = "Welcome"
+    msg.set_content("body")
+    await manager._handle_new_message(
+        chat_id,
+        primary_id,
+        parse_message(msg.as_bytes()),  # type: ignore[arg-type]
+        "1",
+    )
+    assert len(notifier.calls) == 1
+    # Critical: no row was written to alias_senders. The
+    # notifier-level "✓ Tandai sudah dibaca" callback is what writes
+    # the row now, not the manager.
+    history = await db.list_alias_senders(chat_id, active.id)
+    assert history == []
+    assert await db.has_alias_sender(chat_id, active.id, "cognition.ai") is False

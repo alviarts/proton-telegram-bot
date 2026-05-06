@@ -9,7 +9,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from email.message import Message
+
+from aioimaplib import aioimaplib
 
 from .crypto import CredentialCipher
 from .db import Database, credentials_from_primary
@@ -17,9 +20,11 @@ from .email_parser import (
     extract_recipients,
     extract_sender,
     find_matching_alias,
+    parse_message,
     summarize,
 )
 from .imap_listener import IMAPListener
+from .models import BridgeCredentials
 
 LOGGER = logging.getLogger(__name__)
 
@@ -102,6 +107,48 @@ class ListenerManager:
             ]
             for pid in primary_ids:
                 await self._stop_locked(pid)
+
+    async def fetch_recent_for_active(
+        self, chat_id: int, limit: int = 5
+    ) -> list[Message]:
+        """Open a fresh IMAP session and fetch the last ``limit`` messages
+        targeting the chat's currently active alias.
+
+        Returns an empty list when:
+
+        * no alias is locked,
+        * the primary's credentials are missing,
+        * the IMAP server returns no matching mail.
+
+        This is the backbone of the ``/inbox`` recovery command: when an
+        email arrives but never appears in the chat (Telegram API
+        timeout, listener crash, etc.) the user can pull it back via a
+        manual fetch instead of waiting for the next poll cycle.
+
+        We deliberately use a *fresh* connection rather than reusing
+        the running listener's client, so the listener's poll loop is
+        not interrupted and any concurrency bugs in aioimaplib's state
+        machine cannot starve regular forwards.
+        """
+        active = await self._db.get_active_alias(chat_id)
+        if active is None:
+            return []
+        primary = await self._db.get_primary_account_by_id(active.primary_id)
+        encrypted = await self._db.get_primary_encrypted_password(
+            active.primary_id
+        )
+        if primary is None or encrypted is None:
+            return []
+        try:
+            password = self._cipher.decrypt(encrypted)
+        except Exception:
+            LOGGER.debug(
+                "decrypt failed for primary %s in /inbox", active.primary_id
+            )
+            return []
+        creds = credentials_from_primary(primary, password)
+        target = active.email.lower()
+        return await _imap_fetch_recent_for_alias(creds, target, limit=limit)
 
     def poke_user(self, chat_id: int) -> bool:
         """Trigger an immediate IMAP poll for every listener owned by
@@ -188,23 +235,17 @@ class ListenerManager:
             )
             return
         summary = summarize(message)
-        # Capture the From-header sender domain so /list can label this
-        # alias with the services that have used it (Devin, GitHub, …).
-        # Failures here must NOT block the actual email forward — they
-        # are purely metadata.
+        # Surface the From-header so the notifier can decide whether to
+        # auto-label this alias or defer until the user confirms they
+        # actually saw the email. The previous implementation called
+        # ``record_alias_sender`` here unconditionally, which mislabeled
+        # aliases when the subsequent ``send_message`` failed (Telegram
+        # API timeout, polling disconnect, etc.) — the user complained:
+        # "email tdk keluar dibot saya tetapi otomatis kelabel devin".
+        # Recording is now deferred to the notifier's "✓ Tandai sudah
+        # dibaca" callback in ``bot.py``; this method is purely metadata
+        # plumbing.
         sender_email, sender_domain = extract_sender(message)
-        if sender_domain:
-            try:
-                await self._db.record_alias_sender(
-                    chat_id, active.id, sender_email, sender_domain
-                )
-            except Exception:
-                LOGGER.debug(
-                    "failed to record alias_sender for chat %s alias %s",
-                    chat_id,
-                    active.id,
-                    exc_info=True,
-                )
         await self._notifier.notify_email_received(
             chat_id,
             active.email,
@@ -261,3 +302,117 @@ class Notifier:
         aliases: list[str],
     ) -> None:  # pragma: no cover - implemented by the bot module
         pass
+
+
+# IMAP FETCH responses use ``* <seq> FETCH ...`` lines; aioimaplib strips
+# the leading ``* `` so we accept either form. Used by the manual /inbox
+# fetch helper below to skip status lines and find the literal payload.
+_FETCH_LINE_RE = re.compile(rb"^(?:\*\s+)?\d+\s+FETCH\b", re.IGNORECASE)
+
+
+def _parse_uids(lines: list[bytes | str]) -> list[int]:
+    """Mirror of ``IMAPListener._parse_uids`` — kept module-level so the
+    on-demand /inbox fetcher doesn't need a listener instance.
+    """
+    uids: list[int] = []
+    for line in lines:
+        if isinstance(line, bytes):
+            line = line.decode("ascii", errors="ignore")
+        tokens = line.split()
+        if not tokens:
+            continue
+        if tokens[0].upper() == "SEARCH":
+            tokens = tokens[1:]
+        if not tokens or not all(t.isdigit() for t in tokens):
+            continue
+        uids.extend(int(t) for t in tokens)
+    return uids
+
+
+def _extract_rfc822_payload(lines: list[bytes | str]) -> bytes | None:
+    for index, line in enumerate(lines):
+        if isinstance(line, str):
+            line_bytes = line.encode()
+        elif isinstance(line, (bytes, bytearray)):
+            line_bytes = bytes(line)
+        else:
+            continue
+        if _FETCH_LINE_RE.match(line_bytes) and index + 1 < len(lines):
+            payload = lines[index + 1]
+            if isinstance(payload, str):
+                return payload.encode("utf-8", errors="replace")
+            if isinstance(payload, (bytes, bytearray)):
+                return bytes(payload)
+    return None
+
+
+async def _imap_fetch_recent_for_alias(
+    creds: BridgeCredentials,
+    target_alias: str,
+    *,
+    limit: int = 5,
+) -> list[Message]:
+    """Open a one-shot IMAP session, fetch the last ``limit`` messages
+    addressed to ``target_alias``, and return them as parsed
+    ``email.message.Message`` objects.
+
+    The active background listener is *not* touched — Bridge accepts
+    parallel sessions cheaply, and this avoids any risk of stalling
+    real-time forwards.
+    """
+    if creds.use_ssl:
+        client = aioimaplib.IMAP4_SSL(
+            host=creds.host, port=creds.port, timeout=30
+        )
+    else:
+        client = aioimaplib.IMAP4(host=creds.host, port=creds.port, timeout=30)
+    messages: list[Message] = []
+    try:
+        await client.wait_hello_from_server()
+        await client.login(creds.username, creds.password)
+        await client.select("INBOX")
+        # Two-step search: (1) ``TO`` is the cheapest server-side filter
+        # for messages targeting this alias; (2) fall back to ``ALL`` and
+        # filter client-side because Proton Bridge sometimes doesn't
+        # honour ``TO`` for plus-addressed/bcc'd mail.
+        target = target_alias.strip().lower()
+        primary_attempt = await client.uid_search(f'TO "{target}"')
+        uids = _parse_uids(primary_attempt.lines)
+        if not uids:
+            fallback = await client.uid_search("ALL")
+            uids = _parse_uids(fallback.lines)
+            client_side_filter = True
+        else:
+            client_side_filter = False
+        # Most recent first, capped at limit (the server returns
+        # ascending UIDs).
+        uids.sort(reverse=True)
+        for uid in uids:
+            if len(messages) >= limit:
+                break
+            response = await client.uid("fetch", str(uid), "(RFC822)")
+            if response.result != "OK":
+                continue
+            raw = _extract_rfc822_payload(response.lines)
+            if raw is None:
+                continue
+            try:
+                msg = parse_message(raw)
+            except Exception:
+                LOGGER.debug("parse failed for /inbox UID %s", uid, exc_info=True)
+                continue
+            if client_side_filter:
+                recipients = extract_recipients(msg)
+                if target not in recipients:
+                    continue
+            # Skip /cekimap probe mails just like the live listener does.
+            subject_header = msg.get("Subject") or ""
+            if "[health-check]" in subject_header.lower():
+                continue
+            messages.append(msg)
+    finally:
+        try:
+            await client.logout()
+        except Exception:
+            pass
+    return messages

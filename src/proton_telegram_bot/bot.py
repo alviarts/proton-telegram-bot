@@ -44,7 +44,7 @@ from .bridge_admin import (
 from .config import Settings
 from .crypto import CredentialCipher
 from .db import Database
-from .email_parser import format_body_html
+from .email_parser import extract_sender, format_body_html, summarize
 from .health_check import run_health_check
 from .manager import ListenerManager, Notifier
 from .models import AliasRecord, AliasStatus, PrimaryAccount
@@ -298,6 +298,15 @@ CB_SYNC_PRIMARY = "syncp"
 # wipes the label so the alias falls back to the raw domain.
 CB_TAG_SERVICE = "tagsvc"
 CB_TAG_SERVICE_CLEAR = "tagsvc_clear"
+# "Mark as read" affordance on a forwarded email. Clicking this
+# is what writes the (alias, sender_domain) row to ``alias_senders``
+# — i.e. labeling is gated on the user confirming they actually saw
+# the email. Format: ``mr:<alias_id>:<sender_domain>``. The previous
+# auto-record-on-arrival behaviour mislabeled aliases when the
+# downstream ``send_message`` failed (Telegram API timeout, polling
+# disconnect, etc.) so the alias was tagged but the user never saw
+# the mail.
+CB_MARK_READ = "mr"
 # /services keyboard: rows of ``svcdel:<domain>`` entries to one-tap
 # delete a chat-level mapping.
 CB_SVC_DELETE = "svcdel"
@@ -353,6 +362,17 @@ def _bot_cipher(context: ContextTypes.DEFAULT_TYPE) -> CredentialCipher:
 
 def _bot_manager(context: ContextTypes.DEFAULT_TYPE) -> ListenerManager:
     return cast(ListenerManager, context.application.bot_data["manager"])
+
+
+def _bot_notifier(context: ContextTypes.DEFAULT_TYPE) -> Notifier:
+    """Resolve the singleton Notifier registered by ``build_application``.
+
+    Used by /inbox to re-deliver fetched emails through the same render
+    + keyboard pipeline that the listener uses for live forwards, so a
+    re-fetched email looks identical to one that arrived via the
+    background poll.
+    """
+    return cast(Notifier, context.application.bot_data["notifier"])
 
 
 async def _purge_alias_email_messages(
@@ -717,31 +737,57 @@ def _build_tag_service_keyboard(
     alias_id: int,
     sender_domain: str,
     current_label: str | None,
+    pending_mark_read: bool = False,
 ) -> InlineKeyboardMarkup | None:
-    """Single-row keyboard attached to forwarded emails.
+    """Inline keyboard attached to forwarded emails.
 
-    Lets the user (re)label the sender's domain (chat-wide mapping) or
-    clear an existing label. Returns ``None`` when the callback_data
-    payload would overflow Telegram's 64-byte cap so the email is
-    forwarded without buttons rather than crashing the send.
+    Has two modes:
+
+    * ``pending_mark_read=True`` (first email from a sender, not yet
+      confirmed by the user): top row is "✓ Tandai sudah dibaca",
+      followed by "🏷 Tag ulang". The user complained that clicked-but-
+      undelivered emails still labeled the alias, so labeling is now
+      gated on this explicit confirmation.
+
+    * ``pending_mark_read=False`` (sender already in ``alias_senders``):
+      classic "🏷 Tag ulang" + optional "🗑 Hapus label" rows.
+
+    Returns ``None`` when the callback_data payload would overflow
+    Telegram's 64-byte cap so the email is forwarded without buttons
+    rather than crashing the send.
     """
     domain = sender_domain.strip().lower()
     if not domain:
         return None
     tag_data = f"{CB_TAG_SERVICE}:{alias_id}:{domain}"
     clear_data = f"{CB_TAG_SERVICE_CLEAR}:{alias_id}:{domain}"
+    mark_read_data = f"{CB_MARK_READ}:{alias_id}:{domain}"
     if len(tag_data.encode()) > _TG_CALLBACK_DATA_LIMIT:
         return None
     label_for_button = current_label or domain
-    rows: list[list[InlineKeyboardButton]] = [
+    rows: list[list[InlineKeyboardButton]] = []
+    if pending_mark_read:
+        if len(mark_read_data.encode()) <= _TG_CALLBACK_DATA_LIMIT:
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        f"✓ Tandai sudah dibaca · label: {label_for_button}",
+                        callback_data=mark_read_data,
+                    )
+                ]
+            )
+    rows.append(
         [
             InlineKeyboardButton(
                 f"🏷️ Tag ulang ({label_for_button})", callback_data=tag_data
             )
         ]
-    ]
-    if current_label is not None:
-        # Only show "Hapus label" when there's actually a label to wipe.
+    )
+    # "Hapus label" only makes sense AFTER the user has actively
+    # tagged or marked-read — before then the user has no signal to
+    # remove. Same rendering rule: present only when there is a real
+    # label to wipe.
+    if current_label is not None and not pending_mark_read:
         if len(clear_data.encode()) <= _TG_CALLBACK_DATA_LIMIT:
             rows.append(
                 [
@@ -750,7 +796,7 @@ def _build_tag_service_keyboard(
                     )
                 ]
             )
-    return InlineKeyboardMarkup(rows)
+    return InlineKeyboardMarkup(rows) if rows else None
 
 
 async def _alias_count_per_primary(
@@ -1234,6 +1280,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/services — Atur label service (mis. cognition.ai → Devin)\n"
         "/aliasinfo &lt;email&gt; — Lihat history pengirim alias tertentu\n"
         "/cleanmail [N] — Sapu N pesan terakhir (default 100, maks 500)\n"
+        "/inbox [N] — Re-fetch N email terakhir alias aktif (default 5)\n"
         "/resetbot — Restart proses bot (systemd/pm2 auto bring back)\n"
         "/cancel — Batalkan dialog /connect"
     )
@@ -1634,6 +1681,131 @@ async def cmd_resetbot(
     loop.call_later(1.0, _hard_exit)
 
 
+# ---------------------------------------------------------------- /inbox
+
+
+# How many recent emails ``/inbox`` re-fetches by default. The user
+# usually only needs to recover the very last forward that didn't make
+# it (Telegram timeout, listener stalled), so 5 is a sensible default;
+# they can pass ``/inbox 10`` for a wider sweep.
+INBOX_DEFAULT_COUNT = 5
+INBOX_MAX_COUNT = 20
+
+
+@_gate
+async def cmd_inbox(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Manually re-fetch the last N emails for the active alias.
+
+    Recovery command for the case the user described as: "kalau email
+    masuk tetapi tidak muncul ada check inbox" — the IMAP listener
+    saw the mail and the underlying Telegram ``send_message`` failed
+    silently (API timeout, polling drop), so the email never reaches
+    the chat even though it sits perfectly fine in the Proton inbox.
+
+    Behaviour:
+
+    * ``/inbox`` — fetch the 5 most recent messages targeting the
+      currently locked alias.
+    * ``/inbox <n>`` — fetch up to ``n`` (capped at INBOX_MAX_COUNT).
+
+    Each fetched message is fed back through the normal notifier path,
+    so it carries the same "✓ Tandai sudah dibaca" CTA as a fresh
+    forward and the alias only gets labeled when the user actually
+    confirms reading it. Duplicates ARE possible (an email that DID
+    forward correctly will appear twice if /inbox is run on it), which
+    is intentional — this is a manual recovery affordance.
+    """
+    chat = update.effective_chat
+    msg = update.effective_message
+    if chat is None or msg is None:
+        return
+    db = _bot_db(context)
+    active = await db.get_active_alias(chat.id)
+    if active is None:
+        await msg.reply_text(
+            "Belum ada alias aktif. Pilih alias di /list dulu, lalu "
+            "/inbox akan menarik email terbaru untuk alias itu."
+        )
+        return
+    requested = INBOX_DEFAULT_COUNT
+    if context.args:
+        try:
+            requested = int(context.args[0])
+        except ValueError:
+            await msg.reply_text(
+                f"Argumen harus angka. Contoh: /inbox 10 (max {INBOX_MAX_COUNT})."
+            )
+            return
+    requested = max(1, min(requested, INBOX_MAX_COUNT))
+    manager = _bot_manager(context)
+    progress = await msg.reply_text(
+        f"📥 Membuka inbox <code>{html.escape(active.email)}</code> "
+        f"(ambil {requested} email terbaru)…",
+        parse_mode=ParseMode.HTML,
+    )
+    try:
+        messages = await manager.fetch_recent_for_active(
+            chat.id, limit=requested
+        )
+    except Exception as exc:
+        LOGGER.warning(
+            "cmd_inbox: fetch failed for chat %s alias %s: %s",
+            chat.id,
+            active.email,
+            exc,
+        )
+        with contextlib.suppress(BadRequest, Exception):
+            await progress.edit_text(
+                f"❌ Gagal buka inbox: {html.escape(str(exc))}\n\n"
+                "Cek apakah Bridge masih jalan di VPS, dan /resetbot "
+                "kalau koneksi listener mandek.",
+                parse_mode=ParseMode.HTML,
+            )
+        return
+    if not messages:
+        with contextlib.suppress(BadRequest, Exception):
+            await progress.edit_text(
+                f"📭 Tidak ada email untuk "
+                f"<code>{html.escape(active.email)}</code> di inbox "
+                f"Proton. Kalau yakin baru saja terima, tunggu sebentar "
+                f"(server bisa lag) lalu coba lagi.",
+                parse_mode=ParseMode.HTML,
+            )
+        return
+    notifier = _bot_notifier(context)
+    delivered = 0
+    for parsed in messages:
+        sender_email, sender_domain = extract_sender(parsed)
+        summary = summarize(parsed)
+        try:
+            await notifier.notify_email_received(
+                chat.id,
+                active.email,
+                summary,
+                alias_id=active.id,
+                sender_email=sender_email,
+                sender_domain=sender_domain,
+            )
+            delivered += 1
+        except Exception:
+            LOGGER.warning(
+                "cmd_inbox: notify failed for chat %s alias %s",
+                chat.id,
+                active.email,
+                exc_info=True,
+            )
+    with contextlib.suppress(BadRequest, Exception):
+        await progress.edit_text(
+            f"📬 {delivered} dari {len(messages)} email terbaru untuk "
+            f"<code>{html.escape(active.email)}</code> berhasil di-fetch "
+            f"ulang. Klik <b>✓ Tandai sudah dibaca</b> di tiap email "
+            f"untuk pasang label.",
+            parse_mode=ParseMode.HTML,
+        )
+
+
 # ----------------------------------------------- /tag-service conversation
 
 
@@ -1702,8 +1874,23 @@ async def tag_service_label_received(
         )
         return ConversationHandler.END
     domain = pending["domain"]
+    alias_id = pending.get("alias_id")
     db = _bot_db(context)
     await db.set_service_label(update.effective_chat.id, domain, label)
+    # An explicit "Tag ulang" is also an implicit "yes I saw the email
+    # from this sender" — record the (alias, domain) pair so /list and
+    # /aliasinfo reflect the labeling immediately. Without this, a user
+    # who tags before clicking "Sudah dibaca" would never see the alias
+    # listed under that service in /list.
+    if isinstance(alias_id, int) and domain:
+        try:
+            await db.record_alias_sender(
+                update.effective_chat.id, alias_id, "", domain
+            )
+        except Exception:
+            LOGGER.debug(
+                "record_alias_sender failed in tag-save", exc_info=True
+            )
     await update.effective_message.reply_text(
         f"✅ <code>{html.escape(domain)}</code> → "
         f"<b>{html.escape(label)}</b> tersimpan. Email berikutnya dari "
@@ -5348,6 +5535,61 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         except Exception:
             pass
         return
+    if data.startswith(f"{CB_MARK_READ}:"):
+        # ``mr:<alias_id>:<sender_domain>`` — the explicit
+        # "✓ Tandai sudah dibaca" confirmation. This is what writes
+        # to ``alias_senders`` (and therefore what makes the alias
+        # show the service label in /list). Deferring the write to
+        # this click means a forward that never made it to the chat
+        # — Telegram timeout, listener dropped — leaves no stale
+        # label behind.
+        parts = data.split(":", 2)
+        if len(parts) != 3:
+            await query.answer("Data mark-read tidak valid.", show_alert=True)
+            return
+        try:
+            alias_id = int(parts[1])
+        except ValueError:
+            await query.answer("alias_id tidak valid.", show_alert=True)
+            return
+        sender_domain = parts[2].strip().lower()
+        if not sender_domain:
+            await query.answer("Domain kosong.", show_alert=True)
+            return
+        # Best-effort: missing sender_email is OK (the column is
+        # nullable and is purely informational for /aliasinfo).
+        try:
+            label = await db.record_alias_sender(
+                chat_id, alias_id, "", sender_domain
+            )
+        except Exception:
+            LOGGER.debug(
+                "record_alias_sender failed for mark-read callback",
+                exc_info=True,
+            )
+            label = None
+        # Refresh the email's keyboard: drop the mark-read CTA, leave
+        # the standard "🏷 Tag ulang" / "🗑 Hapus label" rows so the
+        # user can still re-tag if the auto-resolved label is wrong.
+        try:
+            await query.edit_message_reply_markup(
+                reply_markup=_build_tag_service_keyboard(
+                    alias_id=alias_id,
+                    sender_domain=sender_domain,
+                    current_label=label,
+                    pending_mark_read=False,
+                )
+            )
+        except Exception:
+            LOGGER.debug(
+                "edit_message_reply_markup failed after mark-read",
+                exc_info=True,
+            )
+        await query.answer(
+            f"✓ Ditandai dibaca · label: {label or sender_domain}",
+            show_alert=False,
+        )
+        return
     if data.startswith(f"{CB_SVC_DELETE}:"):
         # ``svcdel:<domain>`` from the /services keyboard.
         domain = data.split(":", 1)[1].strip().lower()
@@ -5921,20 +6163,43 @@ class TelegramNotifier(Notifier):
         # accurate "Tag ulang" affordance. ``resolve_service_label``
         # walks ``service_labels`` then ``DEFAULT_SERVICE_LABELS`` so a
         # /services edit reflects in real time without a backfill.
+        #
+        # Note: labeling is now deferred to the user's "✓ Tandai sudah
+        # dibaca" confirmation (or to "🏷 Tag ulang"). On a sender's
+        # FIRST email the alias_senders row does not exist yet, so we
+        # show the keyboard's mark-read CTA and DO NOT print the
+        # service-label badge in the header — that way a forward that
+        # later fails to deliver doesn't leave a stale label behind.
+        # Subsequent emails from the same sender already have a row and
+        # render normally.
         current_label: str | None = None
-        if sender_domain:
+        already_recorded = False
+        db = self._application.bot_data.get("db")
+        if sender_domain and db is not None:
             try:
-                db = self._application.bot_data.get("db")
-                if db is not None:
-                    current_label = await db.resolve_service_label(
-                        chat_id, sender_domain
-                    )
+                current_label = await db.resolve_service_label(
+                    chat_id, sender_domain
+                )
             except Exception:
                 LOGGER.debug(
                     "resolve_service_label failed in notifier", exc_info=True
                 )
+            if alias_id is not None:
+                try:
+                    already_recorded = await db.has_alias_sender(
+                        chat_id, alias_id, sender_domain
+                    )
+                except Exception:
+                    LOGGER.debug(
+                        "has_alias_sender failed in notifier", exc_info=True
+                    )
+        # Header gets the service label only AFTER the alias has been
+        # confirmed-read at least once. First-time emails render without
+        # a service badge so a delivery failure can't tag the alias.
         text = _render_email_message(
-            alias_email, summary, service_label=current_label
+            alias_email,
+            summary,
+            service_label=current_label if already_recorded else None,
         )
         markup: InlineKeyboardMarkup | None = None
         if alias_id is not None and sender_domain:
@@ -5942,6 +6207,7 @@ class TelegramNotifier(Notifier):
                 alias_id=alias_id,
                 sender_domain=sender_domain,
                 current_label=current_label,
+                pending_mark_read=not already_recorded,
             )
         sent = await self._application.bot.send_message(
             chat_id=chat_id,
@@ -5949,6 +6215,27 @@ class TelegramNotifier(Notifier):
             parse_mode=ParseMode.HTML,
             reply_markup=markup,
         )
+        # Touch the existing row so /aliasinfo's seen_count keeps
+        # incrementing the same way it did before deferred labeling
+        # landed. We only do this for senders the user has ALREADY
+        # confirmed at least once — first-time senders stay out of
+        # alias_senders until the explicit "✓ Tandai sudah dibaca"
+        # click. Failures are logged but never block the forward.
+        if (
+            already_recorded
+            and alias_id is not None
+            and sender_domain
+            and db is not None
+        ):
+            try:
+                await db.record_alias_sender(
+                    chat_id, alias_id, sender_email, sender_domain
+                )
+            except Exception:
+                LOGGER.debug(
+                    "record_alias_sender (touch) failed in notifier",
+                    exc_info=True,
+                )
         # Remember the message id so we can purge it when the user switches
         # to another active alias (request: "ganti alias → bersihkan
         # pesan email lama biar chat tidak penuh"). We only track when we
@@ -6189,6 +6476,7 @@ def build_handlers() -> list:
         CommandHandler("aliasinfo", cmd_aliasinfo),
         CommandHandler("cleanmail", cmd_cleanmail),
         CommandHandler("resetbot", cmd_resetbot),
+        CommandHandler("inbox", cmd_inbox),
         connect_conv,
         sync_conv,
         setpw_conv,
