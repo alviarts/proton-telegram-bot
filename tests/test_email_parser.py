@@ -82,8 +82,28 @@ def test_summarize_truncates_long_body() -> None:
     raw = _build_message(body="x" * 5000)
     parsed = parse_message(raw)
     summary = summarize(parsed, max_chars=200)
-    assert len(summary["body"]) <= 220
+    # Body has no URLs, so it ends at the "(dipotong)" marker.
     assert summary["body"].endswith("(dipotong)")
+    assert len(summary["body"]) <= 220
+
+
+def test_summarize_preserves_urls_in_truncated_tail() -> None:
+    """Transactional emails (Paddle / magic-link) put the actionable
+    URL several paragraphs in. Truncation MUST surface those URLs even
+    when the head of the body fills the budget. Previously the bot
+    silently swallowed the link, leaving the user stranded."""
+    sign_in_url = "https://buyer.paddle.com/passwordless?token=abc123"
+    body = "x" * 800 + "\n\nSign in here: " + sign_in_url + "\n\nThanks!"
+    raw = _build_message(body=body)
+    parsed = parse_message(raw)
+    summary = summarize(parsed, max_chars=400)
+    assert "(dipotong)" in summary["body"]
+    # The actionable URL from the truncated tail is appended verbatim.
+    assert sign_in_url in summary["body"]
+    # And it appears AFTER the truncation marker so the user can spot it.
+    assert summary["body"].rindex(sign_in_url) > summary["body"].rindex(
+        "(dipotong)"
+    )
 
 
 def test_summarize_falls_back_to_html_when_no_text() -> None:
