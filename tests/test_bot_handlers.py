@@ -48,6 +48,7 @@ def test_build_handlers_registers_new_commands() -> None:
     assert "services" in commands
     assert "aliasinfo" in commands
     assert "cleanmail" in commands
+    assert "resetbot" in commands
 
 
 def test_build_handlers_has_setprotonpw_conversation() -> None:
@@ -126,6 +127,57 @@ async def test_send_connect_log_tracks_when_tracker_given() -> None:
         "log line",
     )
     assert len(tracker) == 1
+
+
+@pytest.mark.asyncio
+async def test_cmd_resetbot_acks_then_schedules_exit(monkeypatch) -> None:
+    """``/resetbot`` MUST (a) reply with a confirmation, then (b) schedule
+    a hard ``os._exit`` via the running loop. We patch ``os._exit`` so the
+    test process survives the call, and assert the loop callback target
+    matches the patched function.
+    """
+    from proton_telegram_bot import bot as bot_module
+
+    exit_calls: list[int] = []
+
+    def _fake_exit(code: int) -> None:
+        exit_calls.append(code)
+
+    monkeypatch.setattr(bot_module.os, "_exit", _fake_exit)
+
+    sent: list[str] = []
+
+    class _FakeMessage:
+        message_id = 4242
+
+        async def reply_text(self, text, **kw):
+            sent.append(text)
+            return self
+
+    class _FakeUser:
+        id = 123
+
+    class _FakeChat:
+        id = 456
+
+    class _FakeUpdate:
+        effective_message = _FakeMessage()
+        effective_user = _FakeUser()
+        effective_chat = _FakeChat()
+
+    fake_settings = type("S", (), {"allowed_user_ids": []})()
+    fake_app = type("A", (), {"bot_data": {"settings": fake_settings}})()
+    fake_ctx = type("C", (), {"application": fake_app})()
+
+    import asyncio
+
+    await bot_module.cmd_resetbot(_FakeUpdate(), fake_ctx)  # type: ignore[arg-type]
+
+    # Acknowledged before exit.
+    assert sent and "restart" in sent[0].lower()
+    # Loop scheduled the hard exit; let it fire.
+    await asyncio.sleep(1.2)
+    assert exit_calls == [0], "cmd_resetbot must invoke os._exit(0)"
 
 
 def test_resolve_connect_email_appends_default_domain() -> None:
