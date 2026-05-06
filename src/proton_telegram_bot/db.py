@@ -904,6 +904,30 @@ class Database:
         await self.conn.commit()
         return label
 
+    async def has_alias_sender(
+        self, chat_id: int, alias_id: int, sender_domain: str
+    ) -> bool:
+        """Cheap existence check for ``(alias_id, sender_domain)``.
+
+        Used by the notifier to decide whether a forwarded email should
+        carry the standard "🏷 Tag ulang" / "🗑 Hapus label" keyboard
+        (for senders the user has already confirmed they read at least
+        once) or the lazier "✓ Tandai sudah dibaca" CTA (for first-time
+        senders, deferring service-label recording until the user
+        explicitly confirms they actually saw the email).
+        """
+        domain = sender_domain.strip().lower()
+        if not domain:
+            return False
+        async with self.conn.execute(
+            "SELECT 1 FROM alias_senders "
+            "WHERE chat_id = ? AND alias_id = ? AND sender_domain = ? "
+            "LIMIT 1",
+            (chat_id, alias_id, domain),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return row is not None
+
     async def list_alias_senders(
         self, chat_id: int, alias_id: int
     ) -> list[AliasSenderRecord]:

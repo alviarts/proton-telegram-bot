@@ -110,6 +110,10 @@ def _build_application(settings: Settings) -> Application:
     application.bot_data["db"] = db
     application.bot_data["cipher"] = cipher
     application.bot_data["manager"] = manager
+    # Expose the singleton notifier so ``/inbox`` (in bot.py) can
+    # re-deliver fetched emails through exactly the same render +
+    # keyboard pipeline that the live IMAP listener uses.
+    application.bot_data["notifier"] = notifier
     application.bot_data["bridge_admin"] = BridgeAdmin(settings)
     # Optional Proton-bound proxy rotation. ``from_env`` returns ``None`` when
     # ``PROTON_USE_PROXY=0`` so deployments can disable it without touching code.

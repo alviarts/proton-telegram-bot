@@ -429,6 +429,36 @@ async def test_record_alias_sender_walks_subdomain(db: Database) -> None:
     assert label == "GitHub"
 
 
+async def test_has_alias_sender_returns_false_until_recorded(
+    db: Database,
+) -> None:
+    """The deferred-labeling notifier path uses this to decide whether
+    to show the "✓ Tandai sudah dibaca" CTA on a forwarded email.
+    A first-time sender must report False; once recorded, True."""
+    await db.upsert_user(1)
+    await db.add_aliases(1, ["vielz008@proton.me"], primary_id=None)
+    alias = await db.find_alias(1, "vielz008@proton.me")
+    assert alias is not None
+
+    assert await db.has_alias_sender(1, alias.id, "cognition.ai") is False
+    # Empty / whitespace-only domains are not interesting and return
+    # False without touching the DB.
+    assert await db.has_alias_sender(1, alias.id, "") is False
+    assert await db.has_alias_sender(1, alias.id, "   ") is False
+
+    await db.record_alias_sender(
+        1, alias.id, "no-reply@cognition.ai", "cognition.ai"
+    )
+    assert await db.has_alias_sender(1, alias.id, "cognition.ai") is True
+    # Domain comparison is case-insensitive (rows are stored lowercased).
+    assert await db.has_alias_sender(1, alias.id, "Cognition.AI") is True
+    # Different alias: still False.
+    await db.add_aliases(1, ["other@proton.me"], primary_id=None)
+    other = await db.find_alias(1, "other@proton.me")
+    assert other is not None
+    assert await db.has_alias_sender(1, other.id, "cognition.ai") is False
+
+
 async def test_service_label_user_override_wins(db: Database) -> None:
     """User-defined chat-level mapping beats the built-in default."""
     await db.upsert_user(1)
