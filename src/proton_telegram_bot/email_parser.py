@@ -12,14 +12,19 @@ from html.parser import HTMLParser
 from typing import ClassVar
 
 RECIPIENT_HEADERS = ("Delivered-To", "X-Original-To", "To", "Cc", "Bcc")
-# Cap on the body preview rendered into a Telegram message. The user
-# complained that Stripe / Cognition-style notifications produced huge
-# walls of whitespace + boilerplate footer ("Unsubscribe Preferences",
-# legal address, "View in browser" …) that pushed the actual content
-# off-screen. 700 chars fits roughly one phone-screen of text; the
-# footer-stripping pass below removes most marketing fluff before
-# truncation kicks in.
-MAX_BODY_PREVIEW_CHARS = 700
+# Cap on the body preview rendered into a Telegram message. The original
+# 700-char cap was too aggressive: transactional emails (Paddle, Stripe,
+# magic-link logins, …) put the actual sign-in URL or action button after
+# a couple of paragraphs of explanatory text, so 700 chars frequently cut
+# off the URL itself. The bot's render path (``_render_email_message``
+# in ``bot.py``) already enforces the hard Telegram 4000-char ceiling, so
+# we can comfortably preview much more of the body.
+#
+# ``summarize`` also defends against link loss explicitly: if truncation
+# kicks in here, every URL found in the truncated tail is appended after
+# the "(dipotong)" marker so the user can still click it. See
+# :func:`summarize` for the implementation.
+MAX_BODY_PREVIEW_CHARS = 3500
 
 # Lines / phrases that mark the boundary between the actual email
 # content and marketing / legal boilerplate. Anything from the FIRST
@@ -313,14 +318,32 @@ def get_text_body(message: Message) -> str:
 
 
 def summarize(message: Message, max_chars: int = MAX_BODY_PREVIEW_CHARS) -> dict[str, str]:
-    """Build a small dict of human-readable fields suitable for a Telegram message."""
+    """Build a small dict of human-readable fields suitable for a Telegram message.
+
+    If ``body`` exceeds ``max_chars``, this function still preserves URLs found
+    in the truncated tail by appending them after the ``(dipotong)`` marker —
+    transactional emails (magic-link sign-in, password reset, OTP confirm)
+    typically put the actionable URL several paragraphs in, and silently
+    cutting it off was the most common user complaint with the old 700-char
+    cap.
+    """
     subject = _decode_header_value(message.get("Subject"))
     from_ = _decode_header_value(message.get("From"))
     to = _decode_header_value(message.get("To"))
     date = _decode_header_value(message.get("Date"))
     body = get_text_body(message).strip()
     if len(body) > max_chars:
-        body = body[:max_chars].rstrip() + "\n…(dipotong)"
+        head = body[:max_chars].rstrip()
+        tail = body[max_chars:]
+        # Harvest URLs from the dropped tail and append them so the user
+        # never loses the actionable link to a length cap. ``dict.fromkeys``
+        # de-dupes while preserving first-seen order.
+        tail_urls = list(dict.fromkeys(_URL_RE.findall(tail)))
+        body = head + "\n…(dipotong)"
+        if tail_urls:
+            body += "\n\n🔗 Link di bagian yang dipotong:\n" + "\n".join(
+                tail_urls
+            )
     return {
         "subject": subject or "(tanpa subject)",
         "from": from_ or "(tidak diketahui)",
