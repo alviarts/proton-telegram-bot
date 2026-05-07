@@ -1,50 +1,78 @@
 # proton-telegram-bot
 
-Telegram bot that watches one or more Proton Mail aliases (via [Proton
-Mail Bridge][bridge]) and forwards every new email to your Telegram chat.
-Once an alias receives its first email it is removed from the list of
-"available" aliases — handy if you mint a fresh address for every
-contact and want a one-shot notification.
+Telegram bot yang menerusin email dari **Proton Mail** ke chat Telegram
+kamu — lewat Proton Mail Bridge — sambil ngatur banyak alias supaya
+kamu bisa kasih alamat email beda ke setiap orang/layanan tanpa
+pernah buka inbox Proton lagi.
 
-[bridge]: https://proton.me/mail/bridge
+> Ringkasnya: kamu kasih `vielz123@proton.me` ke website A, dan
+> `vielz124@proton.me` ke website B. Bot watch keduanya. Setiap email
+> masuk diteruskan ke chat Telegram dengan tombol "✓ Tandai sudah
+> dibaca". Kalau alias kena spam, tinggal hapus aliasnya — alamat
+> yang lain tetap aman.
 
-## Flow
+---
 
-1. Start the bot with `/start`.
-2. Run `/connect` to enter the IMAP host / port / username / password
-   that Proton Bridge exposes for your account. Credentials are
-   stored encrypted at rest with a Fernet master key.
-3. Run `/addalias addr1@proton.me addr2@yourdomain.com …` to register
-   the aliases the bot should watch. (You can paste many at once.)
-4. `/list` shows the available aliases as inline buttons. Tap one to
-   confirm it — give that address to your contact.
-5. As soon as an email arrives at that alias, the bot delivers the
-   subject / sender / body to the chat and the alias is moved to the
-   "consumed" list, disappearing from `/list`.
-6. `/history` shows consumed aliases. `/reset email@…` puts an alias
-   back into the available pool. `/disconnect` deletes the saved
-   credentials and stops the listener.
+## Untuk apa bot ini?
 
-The bot supports multiple Telegram users in parallel — each user
-provides their own Proton Bridge credentials and tracks their own
-aliases.
+- **Privasi per-layanan.** Setiap akun online punya alias sendiri,
+  kalau ada yang bocor / spam tinggal di-hapus tanpa ganggu yang lain.
+- **Tidak perlu buka inbox Proton.** Verifikasi OTP / link reset
+  password / notifikasi langsung muncul di Telegram dengan satu tap
+  copy.
+- **Lock-mode untuk pendaftaran.** Saat lagi daftar di satu layanan,
+  kunci alias aktif lewat `/list` → bot cuma forward email yang
+  dikirim ke alamat itu, jadi pesan dari alias lain tidak ngeganggu.
+- **Recovery saat network blip.** Kalau VPS lagi flaky dan email
+  tidak terforward, tombol `📂 Inbox` (atau `/inbox`) re-fetch 5 email
+  terakhir langsung dari Proton.
+- **Multi-akun, multi-user.** Satu deployment bisa jalan untuk
+  beberapa user Telegram, masing-masing dengan akun Proton sendiri.
+
+---
+
+## Fitur utama
+
+| Area | Apa yang bisa kamu lakukan |
+|---|---|
+| **Forward email** | Setiap email yang masuk ke alias diteruskan ke Telegram dengan subject + sender + body preview + tombol "✓ Tandai sudah dibaca" yang langsung label di Proton. |
+| **Manage alias** | `/list` (drill-down per primary), `/addalias`, `/removealias`, `/history`, `/reset`, `/aliasinfo`. Kamu juga bisa `/sync` untuk import semua alamat dari akun Proton sekali tap. |
+| **Bulk generate** | `/genaddr vielz 10` → bikin `vielz001…vielz010` lewat headless Chromium yang drive UI Proton. Resume otomatis kalau ada CAPTCHA. |
+| **Lock alias aktif** | Tap alias di `/list` untuk lock — bot cuma forward email ke alamat itu sampai kamu `/unlock` atau pilih alias lain. Otomatis cocok untuk flow signup. |
+| **Per-service labels** | Saat email pertama masuk untuk satu domain, bot tawarkan tombol untuk pasang label (mis. `Devin`, `GitHub`, `Skip — work`). Email berikutnya dari domain itu otomatis dapat label di Proton + di chat. |
+| **Recovery** | `📂 Inbox` button + `/inbox [n]` re-fetch N email terakhir untuk alias aktif kalau listener kelewatan satu (mis. saat network blip). |
+| **Restart instan** | `/resetbot` exit ke supervisor (systemd / pm2) → restart 5 detik tanpa SSH ke VPS. |
+| **Health check** | `/cekimap` ping IMAP listener. Tombol "🩺 Cek IMAP listener (background)" dari `/list` jalanin probe penuh. |
+| **Cleanup** | `/cleanmail` hapus history email lama dari chat (Telegram retention). `/disconnect` hapus akun + stop listener. |
+| **Auto-sync** | Setiap N menit (default 5) bot scan inbox Proton untuk alias baru yang dibikin manual lewat web Proton, tambahkan ke daftar. |
+| **Tahan blip jaringan** | HTTP timeouts 15–60 s + exponential backoff retry (1/3/7/15 s) untuk error transient `TimedOut` / `NetworkError` / `httpx.TimeoutException`. Email forward tidak hilang lagi karena network blip. |
+| **Hardened systemd** | Unit file restart selamanya (`StartLimitIntervalSec=0`), survive OOM kill, priority CPU/IO tinggi. Bot praktis selalu jalan. |
+| **Multi-user** | Setiap user Telegram punya database row terpisah; credentials Bridge di-encrypt at-rest dengan Fernet master key. |
+
+---
 
 ## Requirements
 
-- Python ≥ 3.11
-- A running [Proton Mail Bridge][bridge] reachable from wherever you
-  run the bot (usually the same machine; Bridge listens on
-  `127.0.0.1:1143` by default).
-- A Telegram bot token from [@BotFather](https://t.me/botfather).
+- **Python ≥ 3.11**
+- **[Proton Mail Bridge][bridge]** running di mesin yang sama dengan
+  bot (atau accessible via SSH tunnel / WireGuard). Bridge listen di
+  `127.0.0.1:1143` (IMAP) by default.
+- **Telegram bot token** dari [@BotFather](https://t.me/botfather).
+- (Opsional) Plan Proton yang allow banyak alias kalau mau pakai
+  `/genaddr` / `/sync` (Mail Plus / Unlimited / Business).
 
-> **Multi-user heads up.** Proton Bridge only exposes IMAP on the
-> machine it is running on. If you want to host one bot for several
-> users, each user must either run the bot on the same machine as their
-> Bridge, or expose their Bridge IMAP port to the bot host through a
-> private channel (e.g. SSH tunnel, WireGuard). Don't expose Bridge
-> directly to the public internet.
+[bridge]: https://proton.me/mail/bridge
 
-## Quick start (local)
+> ⚠️ **Multi-user heads up.** Bridge cuma expose IMAP di mesin tempat
+> dia jalan. Kalau mau host satu bot untuk banyak user, masing-masing
+> user harus jalanin Bridge sendiri di mesin yang sama dengan bot,
+> ATAU expose port IMAP-nya ke bot via private channel (SSH tunnel,
+> WireGuard). **Jangan pernah expose Bridge IMAP ke internet
+> publik.**
+
+---
+
+## Quick start (lokal, 5 menit)
 
 ```bash
 git clone https://github.com/alviarts/proton-telegram-bot.git
@@ -54,200 +82,274 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
 
-cp .env.example .env
-# fill in TELEGRAM_BOT_TOKEN and ENCRYPTION_KEY
-
-# generate a Fernet key once:
+# Generate Fernet key sekali, copy ke .env:
 python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+
+cp .env.example .env
+# edit .env, isi minimal:
+#   TELEGRAM_BOT_TOKEN=<dari @BotFather>
+#   ENCRYPTION_KEY=<key dari command di atas>
+#   ALLOWED_USER_IDS=<your-telegram-user-id>     # WAJIB untuk private bot
 
 python -m proton_telegram_bot
 ```
 
-## Deployment
+Cek user ID Telegram kamu lewat [@userinfobot](https://t.me/userinfobot).
 
-### Option A — Docker (recommended)
+---
 
-The simplest way to deploy on a VPS that already runs Proton Bridge.
+## Deploy ke VPS
+
+### Opsi A — Docker (paling simple)
 
 ```bash
 git clone https://github.com/alviarts/proton-telegram-bot.git
 cd proton-telegram-bot
-
-cp .env.example .env
-# edit .env — fill in TELEGRAM_BOT_TOKEN and ENCRYPTION_KEY
-
-docker compose up -d          # build & start
-docker compose logs -f bot    # tail logs
+cp .env.example .env  # edit isi token + key
+docker compose up -d
+docker compose logs -f bot
 ```
 
-`docker-compose.yml` uses `network_mode: host` so the bot can reach
-Bridge on `127.0.0.1:1143` without extra configuration. Data is
-persisted in a Docker volume (`bot-data`).
+`docker-compose.yml` pakai `network_mode: host` jadi bot bisa reach
+Bridge di `127.0.0.1:1143` tanpa konfig tambahan.
 
-Useful commands:
-
-```bash
-docker compose down            # stop
-docker compose up -d --build   # rebuild after a code update
-docker compose logs -f bot     # watch live logs
-```
-
-### Option B — systemd service (no Docker)
-
-1. Clone and install on your server:
+### Opsi B — systemd (high-availability, recommended buat VPS)
 
 ```bash
-sudo useradd -r -s /usr/sbin/nologin botuser
-sudo mkdir -p /opt/proton-telegram-bot
-sudo chown botuser:botuser /opt/proton-telegram-bot
-
-sudo -u botuser git clone https://github.com/alviarts/proton-telegram-bot.git /opt/proton-telegram-bot
+# 1) Clone & install
+sudo git clone https://github.com/alviarts/proton-telegram-bot.git /opt/proton-telegram-bot
 cd /opt/proton-telegram-bot
-sudo -u botuser python3 -m venv .venv
-sudo -u botuser .venv/bin/pip install .
-```
+sudo python3 -m venv .venv
+sudo .venv/bin/pip install .
 
-2. Configure:
-
-```bash
-sudo -u botuser cp .env.example .env
-sudo -u botuser nano .env
-# fill in TELEGRAM_BOT_TOKEN and ENCRYPTION_KEY
-
-# generate key:
+# 2) Generate Fernet key & isi .env
 python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
-```
+sudo cp .env.example .env
+sudo nano .env
 
-3. Install and start the service:
-
-```bash
+# 3) Pasang unit file (sudah di-harden untuk auto-restart selamanya)
 sudo cp deploy/proton-telegram-bot.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now proton-telegram-bot
 
-# check status
+# 4) Verifikasi
 sudo systemctl status proton-telegram-bot
 sudo journalctl -u proton-telegram-bot -f
 ```
 
-### Proton Bridge setup
+Unit file di `deploy/proton-telegram-bot.service` sudah di-set:
 
-The bot connects to Proton Bridge via IMAP. Make sure Bridge is running
-and note the credentials it provides:
+- `Restart=always` + `StartLimitIntervalSec=0` → systemd retry restart
+  selamanya, tidak akan pernah nyerah.
+- `RestartForceExitStatus` covers semua exit code + `SIGTERM`, jadi
+  `os._exit(0)` dari `/resetbot` cleanly cycling process.
+- `OOMPolicy=continue` + `OOMScoreAdjust=-200` → bot survive walaupun
+  OOM killer reaping process lain.
+- `Nice=-5`, `IOSchedulingPriority=2` → priority CPU/IO bumped supaya
+  bot tetap responsive di VPS yang busy.
+- `LimitNOFILE=65536` → tidak akan kena fd exhaustion saat banyak
+  IMAP listener + httpx connection nyala.
+- `WatchdogSec=15s` → kalau event-loop hang, systemd kill & restart
+  otomatis.
 
-1. Install [Proton Mail Bridge](https://proton.me/mail/bridge) on your
-   server or local machine.
-2. Log in with your Proton account.
-3. In Bridge, go to the account settings and note:
-   - **IMAP host**: usually `127.0.0.1`
-   - **IMAP port**: usually `1143`
-   - **Username**: your Proton email address
-   - **Password**: the Bridge-generated password (not your Proton password)
-4. Use these credentials when running `/connect` in the Telegram bot.
+Verifikasi hardening live:
 
-> **Headless server?** Proton Bridge has a CLI mode:
-> `protonmail-bridge --cli`. See the
-> [Bridge documentation](https://proton.me/support/bridge) for details.
+```bash
+systemctl show proton-telegram-bot \
+  -p Restart -p StartLimitIntervalUSec -p OOMPolicy \
+  -p OOMScoreAdjust -p Nice -p LimitNOFILE
+```
 
-### Optional: auto-register accounts with Bridge
+### Update bot di VPS
 
-Set `BRIDGE_ADMIN_ENABLED=true` if the bot runs on the Bridge host and
-you'd rather have `/connect` ask for your **Proton account** password
-than the random Bridge IMAP password. The bot will then:
+```bash
+cd /opt/proton-telegram-bot
+sudo git pull
+sudo .venv/bin/pip install .
+sudo cp deploy/proton-telegram-bot.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl restart proton-telegram-bot
+```
+
+---
+
+## Setup Proton Bridge
+
+Bot connect ke Bridge via IMAP. Pastikan Bridge running:
+
+1. Install [Proton Mail Bridge][bridge] di mesin yang sama dengan bot.
+2. Login dengan akun Proton kamu.
+3. Di Bridge, masuk akun → catat:
+   - **IMAP host**: biasanya `127.0.0.1`
+   - **IMAP port**: biasanya `1143`
+   - **Username**: alamat email Proton kamu
+   - **Password**: password Bridge yang di-generate (bukan password Proton master)
+4. Pakai credentials ini saat kamu `/connect` di chat Telegram.
+
+> **Headless server?** Bridge punya CLI mode: `protonmail-bridge --cli`.
+> Lihat [dokumentasi Bridge](https://proton.me/support/bridge).
+
+### Opsional: auto-register akun (bot drives Bridge sendiri)
+
+Set `BRIDGE_ADMIN_ENABLED=true` kalau bot jalan di host yang sama
+dengan Bridge dan kamu mau `/connect` minta password **akun Proton**
+(bukan password Bridge IMAP yang random). Bot bakal:
 
 1. Stop `protonmail-bridge.service`.
-2. Drive `bridge --cli login` with the email / Proton password you
-   typed in `/connect`.
-3. If Proton requests human verification, the bot forwards the
-   verification URL to the Telegram chat — solve it in a browser, then
-   reply `ok` and the bot resumes.
-4. Restart `protonmail-bridge.service` and decrypt the vault to pluck
-   out the per-account IMAP password Bridge just generated.
-5. Save the IMAP password to the bot's DB (Fernet-encrypted) and start
-   the listener — no manual copy/paste required.
+2. Drive `bridge --cli login` pakai email + Proton password yang kamu
+   ketik di `/connect`.
+3. Kalau Proton minta CAPTCHA, bot forward URL-nya ke Telegram —
+   solve di browser, balas `ok`, bot resume.
+4. Restart `protonmail-bridge.service` & decrypt vault untuk ambil
+   password IMAP yang Bridge baru bikin.
+5. Save IMAP password ke DB bot (Fernet-encrypted) dan start listener.
 
-Requirements (typical setup):
+Requirement extra: bot run as root (atau `BRIDGE_SUDO=true` + sudoers
+rule), `cryptography` + `msgpack` + `pexpect` installed (`pip install
+-e '.[bridge-admin]'`).
 
-- The bot runs as root (or with `BRIDGE_SUDO=true` plus a sudoers rule)
-  so it can `systemctl start/stop protonmail-bridge.service`.
-- The `pass` keychain entry that Bridge writes on first run is
-  readable by that user. The default
-  `BRIDGE_VAULT_KEY_COMMAND` matches the standard install layout.
-- The `cryptography`, `msgpack`, and `pexpect` packages are installed
-  in the Python environment that runs the helper scripts. They are
-  pulled in via the `[bridge-admin]` extra:
-  `pip install -e '.[bridge-admin]'`.
+---
 
-When `BRIDGE_ADMIN_ENABLED=false` (default), `/connect` works the same
-as before — you paste the Bridge IMAP password manually.
+## Cara pakai harian
+
+### 1. Setup pertama kali
+
+```
+/start                       # daftarkan chat
+/connect                     # masuk dialog input Bridge IMAP credentials
+/sync vielz <password>       # auto-import semua alamat dari akun Proton kamu
+                             # (atau /addalias addr1@proton.me addr2@... manual)
+```
+
+### 2. Pakai alias untuk daftar di layanan baru
+
+```
+/list                        # lihat alias yang available, tap salah satu
+                             # → bot kunci alias itu, kasih kamu tombol Copy
+                             # → kamu paste alias di form signup di website
+                             # → email verifikasi muncul di Telegram dalam ~5 detik
+                             # → tap "✓ Tandai sudah dibaca" supaya Proton ditandai read
+```
+
+Setelah alias dipakai, statusnya berpindah ke `/history` dan tidak
+muncul lagi di `/list` (kecuali kamu `/reset alias@proton.me`).
+
+### 3. Pesan alias-aktif: 3 tombol cepat
+
+Setelah lock alias, bot kirim pesan dengan 3 baris tombol:
+
+- **📋 Copy email aktif** — bot kirim alias di pesan baru sebagai
+  `<code>` tap-to-copy (untuk desktop yang tidak punya tap-to-copy
+  di body HTML).
+- **📥 Cek email sekarang** — paksa listener polling sekarang
+  (tidak nunggu 5 detik berikutnya).
+- **📂 Inbox** — re-fetch 5 email terakhir untuk alias aktif
+  langsung dari Proton (recovery kalau listener kelewatan / VPS
+  blip jaringan).
+
+### 4. Recovery saat ada masalah
+
+| Gejala | Solusi |
+|---|---|
+| Email udah masuk Proton tapi belum sampai Telegram | Tap **📂 Inbox** atau kirim `/inbox` |
+| Listener stuck tidak polling | Kirim `/cekimap` (light probe) atau tap "🩺 Cek IMAP listener" di `/list` |
+| Bot lambat respon / hang | Kirim `/resetbot` → systemd restart bot dalam 5 detik |
+| Lupa alias mana yang aktif | Lihat header `/start` atau `/list` (tampil "🔒 Aktif: …") |
+| Mau pakai alias lain sementara | `/unlock` → balik ke mode forward semua alias |
+
+---
+
+## Daftar lengkap commands
+
+| Command | Fungsi |
+|---|---|
+| `/start` | Daftarkan chat & tampilan panduan singkat. |
+| `/connect` | Dialog input Bridge IMAP credentials. |
+| `/disconnect` | Hapus credentials + stop listener untuk akun yang dipilih. |
+| `/list` | Daftar alias available sebagai inline buttons (tap untuk lock). |
+| `/accounts` | Shortcut untuk `/list`. |
+| `/unlock` | Lepas kunci alias aktif. |
+| `/inbox [n]` | Re-fetch N email terakhir untuk alias aktif (default 5, max 20). Recovery kalau listener kelewatan. |
+| `/history` | Daftar alias yang sudah dipakai. |
+| `/reset a@b.com` | Pindahkan alias kembali ke "available". |
+| `/addalias a@b.com c@d.com …` | Tambah alias manual (banyak sekaligus juga bisa). |
+| `/removealias a@b.com` | Hapus alias dari daftar (juga di Proton kalau mau). |
+| `/aliasinfo a@b.com` | Detail per-alias (kapan dibuat, owner primary, status). |
+| `/sync user password` | Auto-sync semua alamat dari akun Proton via API Bridge. |
+| `/setprotonpw` | Simpan password master Proton (untuk `/genaddr`). |
+| `/genaddr <base> <count> [@domain]` | Bulk-create alamat lewat headless Chrome (mis. `/genaddr vielz 50`). |
+| `/services` | Daftar service-label yang sudah kamu set. |
+| `/cekimap` | Ping IMAP listener (light probe). |
+| `/cleanmail` | Sweep & hapus pesan email lama dari chat (Telegram retention). |
+| `/resetbot` | Force restart bot lewat supervisor (systemd / pm2). |
+| `/cancel` | Batalkan dialog conversation yang lagi jalan. |
+
+---
 
 ## Environment variables
 
+Minimal config (`.env`):
+
+```bash
+TELEGRAM_BOT_TOKEN=123456:ABC...      # dari @BotFather
+ENCRYPTION_KEY=<fernet-key>           # generate sekali, jangan ganti
+ALLOWED_USER_IDS=123456789            # comma-separated, restrict siapa yang bisa pakai
+LOG_LEVEL=INFO                        # DEBUG/INFO/WARNING/ERROR
+```
+
+Reference lengkap:
+
 | Variable | Required | Description |
 |---|---|---|
-| `TELEGRAM_BOT_TOKEN` | yes | Token from @BotFather. |
-| `ENCRYPTION_KEY` | yes | URL-safe base64 32-byte Fernet key used to encrypt stored IMAP passwords. |
-| `DATABASE_PATH` | no | SQLite file path. Default: `data/bot.sqlite3`. |
-| `ALLOWED_USER_IDS` | no | Comma-separated list of Telegram user IDs allowed to use the bot. Empty = anyone. |
-| `LOG_LEVEL` | no | `DEBUG`, `INFO`, `WARNING`, or `ERROR`. Default: `INFO`. |
-| `ALIAS_SYNC_INTERVAL_MINUTES` | no | How often (in minutes) to re-scan the inbox for new aliases. Default: `5`. |
-| `BRIDGE_ADMIN_ENABLED` | no | Set to `true` to let `/connect` accept your **Proton account** password and auto-register the account with Proton Bridge (instead of asking for the Bridge IMAP password). Requires the bot to run on the Bridge host with permission to call `systemctl` and read the Bridge vault key. Default: `false`. |
-| `BRIDGE_ADD_ACCOUNT_SCRIPT` | no | Path to `bridge_add_account.py`. Default: `scripts/bridge_add_account.py`. |
-| `BRIDGE_DECRYPT_VAULT_SCRIPT` | no | Path to `bridge_decrypt_vault.py`. Default: `scripts/bridge_decrypt_vault.py`. |
-| `BRIDGE_VAULT_PATH` | no | Bridge encrypted-vault file. Default: `/root/.config/protonmail/bridge-v3/vault.enc`. |
-| `BRIDGE_VAULT_KEY_COMMAND` | no | Shell command (run with `sh -c`) that prints the raw vault key on stdout. Default: `pass show docker-credential-helpers/<base64>/bridge-vault-key`. |
-| `BRIDGE_CAPTCHA_URL_FILE` | no | Path the helper uses to write a CAPTCHA verification URL. Default: `/tmp/bridge_captcha_url.txt`. |
-| `BRIDGE_CAPTCHA_DONE_FLAG` | no | Path the bot creates once the user has solved the CAPTCHA. Default: `/tmp/bridge_captcha_done.flag`. |
-| `BRIDGE_CAPTCHA_TIMEOUT_SECONDS` | no | How long the helper waits for the user to solve a CAPTCHA. Default: `600`. |
-| `BRIDGE_PYTHON` | no | Python interpreter used to run the helper scripts. Default: `python3`. |
-| `BRIDGE_SUDO` | no | Set to `true` to wrap helper invocations in `sudo -n …`. Default: `false`. |
+| `TELEGRAM_BOT_TOKEN` | yes | Token dari @BotFather. |
+| `ENCRYPTION_KEY` | yes | URL-safe base64 32-byte Fernet key untuk encrypt password Bridge & Proton di DB. |
+| `DATABASE_PATH` | no | Path SQLite. Default: `data/bot.sqlite3`. |
+| `ALLOWED_USER_IDS` | no | List user ID Telegram yang boleh pakai bot. Kosong = siapa saja (NOT recommended). |
+| `LOG_LEVEL` | no | `DEBUG`/`INFO`/`WARNING`/`ERROR`. Default: `INFO`. |
+| `ALIAS_SYNC_INTERVAL_MINUTES` | no | Interval auto-sync inbox cari alias baru. Default: 5 menit. |
+| `PROTON_BOT_VERBOSE_THIRDPARTY` | no | `1` = lepas mute log `aioimaplib`/`httpx`/`httpcore` saat `LOG_LEVEL=DEBUG`. Default: muted (untuk privacy — `aioimaplib` DEBUG bisa dump body email + OTP ke journalctl). |
+| `BRIDGE_ADMIN_ENABLED` | no | `true` = `/connect` minta password Proton & auto-register akun di Bridge. Default: `false`. |
+| `BRIDGE_ADD_ACCOUNT_SCRIPT` | no | Path ke `bridge_add_account.py`. |
+| `BRIDGE_DECRYPT_VAULT_SCRIPT` | no | Path ke `bridge_decrypt_vault.py`. |
+| `BRIDGE_VAULT_PATH` | no | File vault Bridge. Default: `/root/.config/protonmail/bridge-v3/vault.enc`. |
+| `BRIDGE_VAULT_KEY_COMMAND` | no | Shell command yang print raw vault key ke stdout. |
+| `BRIDGE_CAPTCHA_URL_FILE` | no | Path file untuk write CAPTCHA URL. Default: `/tmp/bridge_captcha_url.txt`. |
+| `BRIDGE_CAPTCHA_DONE_FLAG` | no | Path flag yang dibikin bot saat CAPTCHA solved. Default: `/tmp/bridge_captcha_done.flag`. |
+| `BRIDGE_CAPTCHA_TIMEOUT_SECONDS` | no | Timeout nunggu CAPTCHA solved. Default: `600`. |
+| `BRIDGE_PYTHON` | no | Python interpreter untuk helper scripts. Default: `python3`. |
+| `BRIDGE_SUDO` | no | `true` = wrap helper invocation pakai `sudo -n …`. Default: `false`. |
 
-## Telegram commands
+---
 
-| Command | Description |
-|---|---|
-| `/start` | Register your chat and show available aliases. |
-| `/connect` | Guided dialog to store your Proton Bridge IMAP credentials. |
-| `/disconnect` | Delete stored credentials and stop watching your inbox. |
-| `/addalias a@b.com c@d.com …` | Register one or more aliases. Repeats are ignored. |
-| `/sync user password` | Auto-sync all addresses from your Proton account. |
-| `/removealias a@b.com` | Forget an alias entirely. |
-| `/list` | Show available aliases as inline buttons. |
-| `/accounts` | Shortcut for `/list`. |
-| `/history` | Show aliases that already received their email. |
-| `/reset a@b.com` | Move an alias back to "available". |
-| `/setprotonpw` | Store your Proton master password (used by `/genaddr`). |
-| `/genaddr <base> <count> [@domain]` | Auto-create N addresses on Proton via headless browser. |
-| `/cancel` | Abort the current `/connect` / `/setprotonpw` dialog. |
+## Troubleshooting
 
-### Bulk address creation (`/genaddr`)
-
-Drives the official Proton account UI through a headless Chromium so
-the address-key cryptography is performed by Proton's own JavaScript —
-the bot never touches your private keys. Names are generated
-deterministically:
-
+**Bot tidak respon `/start`:**
+```bash
+sudo systemctl status proton-telegram-bot
+sudo journalctl -u proton-telegram-bot -n 100 --no-pager
 ```
-/genaddr vielz 10
-# → vielz001 … vielz010 @ proton.me
+Kalau status `failed`, biasanya `.env` belum lengkap atau Bridge
+belum jalan. Hardened unit akan auto-restart selamanya jadi cek
+journal untuk error sebenarnya.
 
-/genaddr vielz 50 @proton.me
-# resumes from the last successful number; on overflow appends a
-#   letter suffix (vielz999 → vielza001 → … → vielzz999 → vielzaa001).
-```
+**Email Proton masuk tapi tidak ada di Telegram:**
+1. Tap **📥 Cek email sekarang** atau **📂 Inbox** di pesan alias-aktif.
+2. Kalau masih tidak datang, kirim `/cekimap` untuk cek IMAP listener.
+3. Restart bot dengan `/resetbot`.
 
-Prerequisites:
+**Bot crash setiap beberapa menit dengan `httpcore.ConnectTimeout`:**
+Update ke versi terbaru — versi v2026.05+ punya retry helper +
+HTTP timeout yang sudah generous (15–60 s). Lihat `journalctl` untuk
+WARNING `transient network error in handler:` (artinya retry helper
+lagi jalan, bukan bug).
 
-1. `/connect` an account first (Bridge credentials).
-2. `/setprotonpw` to store the Proton **master** password (Fernet-encrypted
-   alongside Bridge credentials). This is required because
-   address-key generation in the web UI needs it.
-3. Make sure your Proton plan permits enough addresses (Business / Mail
-   Plus / Unlimited). Already-existing names are detected and skipped.
+**`LOG_LEVEL=DEBUG` bikin journal banjir IMAP frame raw:**
+Default behavior sudah mute `aioimaplib`/`httpx`/`httpcore` ke
+WARNING walau root level DEBUG. Set
+`PROTON_BOT_VERBOSE_THIRDPARTY=1` di `.env` kalau memang butuh
+DEBUG dari library itu.
 
-If Proton presents a CAPTCHA mid-batch the bot stops and tells you which
-name it stopped on; solve in the browser, then re-run `/genaddr` with
-the same arguments — the cursor resumes where it left off.
+---
 
 ## Development
 
@@ -257,29 +359,42 @@ ruff check .
 pytest
 ```
 
-The bot is intentionally small and uses only the standard library +
-`python-telegram-bot`, `aioimaplib`, `aiosqlite`, `cryptography`,
-`pydantic-settings`. Persistence is a single SQLite file; per-user
-state is fully isolated.
+Tech stack:
+- `python-telegram-bot ≥ 21.6` (async, jobqueue, conversation)
+- `aioimaplib` (IMAP listen Bridge)
+- `aiosqlite` (SQLite single-file persistence per-user)
+- `cryptography.Fernet` (encrypt creds at rest)
+- `pydantic-settings` (config dari `.env`)
+- `playwright` (untuk `/genaddr` headless browser flow)
+
+Test suite ada 358+ tests covering: handlers, IMAP listener, manager
+state, retry helper, on_error, ApplicationBuilder timeout, log muting,
+inbox button placement, slash menu, dst.
+
+---
 
 ## Security notes
 
-- Bridge passwords are encrypted at rest with `cryptography.Fernet`.
-  Lose the `ENCRYPTION_KEY` and you will need to `/connect` again.
-- The Proton **master password** stored by `/setprotonpw` is encrypted
-  the same way, but unlike a Bridge password it cannot be revoked
-  per-device — anyone with both your `.env` (containing the
-  `ENCRYPTION_KEY`) **and** the SQLite DB can sign in to your Proton
-  account fully. Only enable `/setprotonpw` on a host you treat as
-  authoritative, and rotate the Proton password if the host is ever
+- **Bridge passwords** di-encrypt at rest dengan `cryptography.Fernet`.
+  Hilang `ENCRYPTION_KEY` = harus `/connect` ulang.
+- **Proton master password** dari `/setprotonpw` di-encrypt cara yang
+  sama tapi tidak bisa di-revoke per-device — siapa pun yang punya
+  akses ke `.env` (dengan `ENCRYPTION_KEY`) **dan** SQLite DB bisa
+  full sign-in ke Proton kamu. Cuma enable di host yang kamu treat
+  sebagai authoritative; rotate password Proton kalau host pernah
   compromised.
-- Telegram message bodies may contain sensitive content. Treat the
-  chat history as you would your inbox.
-- Never commit your `.env` or the SQLite database. Both are excluded
-  by `.gitignore`.
-- Set `ALLOWED_USER_IDS` to restrict access to your Telegram user ID
-  only. Without it anyone who finds your bot can use it.
+- **Body email** di Telegram bisa berisi konten sensitif. Treat chat
+  history sama dengan inbox.
+- **JANGAN** commit `.env` atau SQLite DB. Keduanya excluded di
+  `.gitignore`.
+- Set `ALLOWED_USER_IDS` ke user ID Telegram kamu saja. Tanpa itu,
+  siapa pun yang nemu bot kamu bisa pakai.
+- Default mute third-party DEBUG logs supaya `aioimaplib` tidak dump
+  raw IMAP frame (body email, OTP, link reset password) ke journalctl
+  walau `LOG_LEVEL=DEBUG`.
+
+---
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT. Lihat [LICENSE](LICENSE).
