@@ -32,11 +32,13 @@ BOT_COMMAND_MENU: list[tuple[str, str]] = [
     ("genaddr", "Generate alamat (cth: /genaddr vielz 10)"),
     ("addalias", "Tambah alias manual"),
     ("removealias", "Hapus alias"),
+    ("inbox", "Fetch ulang email terbaru utk alias aktif"),
     ("history", "Alias yang sudah terpakai"),
     ("reset", "Kembalikan alias ke daftar tersedia"),
     ("unlock", "Lepas kunci alias aktif"),
     ("disconnect", "Hapus akun + stop listener"),
     ("sync", "Auto-sync alias dari akun Proton"),
+    ("resetbot", "Restart bot (lewat supervisor systemd/pm2)"),
     ("cancel", "Batalkan dialog yang sedang jalan"),
 ]
 

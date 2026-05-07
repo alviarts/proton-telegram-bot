@@ -591,3 +591,232 @@ def test_configure_logging_respects_verbose_third_party_escape_hatch(
     # All four must remain NOTSET because the escape hatch is set.
     for name in ("aioimaplib", "aioimaplib.aioimaplib", "httpx", "httpcore"):
         assert logging.getLogger(name).level == logging.NOTSET
+
+
+# ----------------------------------------------------------------------
+# Inbox button + slash-menu coverage (user requirement: "inbox taro
+# disini dibawah cek email sekarang" + "untuk restart bot di command
+# vps kasih di start /resetbot").
+# ----------------------------------------------------------------------
+
+
+def _flatten_button_callbacks(markup: Any) -> list[str]:
+    """Return all ``callback_data`` strings on every button row, in
+    visual top-to-bottom / left-to-right order. Used by the inbox-row
+    placement assertions below."""
+    callbacks: list[str] = []
+    for row in markup.inline_keyboard:
+        for button in row:
+            if button.callback_data is not None:
+                callbacks.append(button.callback_data)
+    return callbacks
+
+
+def test_poll_now_keyboard_includes_inbox_button_below_poll_now() -> None:
+    """The standalone alias-locked confirmation keyboard must show
+    a 📂 Inbox row directly underneath 📥 Cek email sekarang. The user
+    explicitly asked for this layout — see screenshot in the chat
+    history (alias-aktif lock confirmation message)."""
+    markup = bot._build_poll_now_keyboard(with_copy_active=True)
+
+    callbacks = _flatten_button_callbacks(markup)
+
+    assert bot.CB_POLL_NOW in callbacks, (
+        "📥 Cek email sekarang button must remain on the keyboard"
+    )
+    assert bot.CB_INBOX in callbacks, (
+        "📂 Inbox button must be present so the user can recover "
+        "missed emails without typing /inbox"
+    )
+    poll_idx = callbacks.index(bot.CB_POLL_NOW)
+    inbox_idx = callbacks.index(bot.CB_INBOX)
+    assert inbox_idx == poll_idx + 1, (
+        "📂 Inbox must appear immediately after 📥 Cek email sekarang "
+        "so the two recovery actions cluster together. Got order: "
+        f"{callbacks!r}"
+    )
+
+
+def test_poll_now_keyboard_inbox_button_label_uses_recognisable_emoji() -> None:
+    """Belt-and-braces: the inbox button must be labelled with the
+    📂 emoji so the user recognises the recovery affordance."""
+    markup = bot._build_poll_now_keyboard()
+
+    inbox_buttons = [
+        button
+        for row in markup.inline_keyboard
+        for button in row
+        if button.callback_data == bot.CB_INBOX
+    ]
+
+    assert len(inbox_buttons) == 1, (
+        f"expected exactly one inbox button, got {len(inbox_buttons)}"
+    )
+    label = inbox_buttons[0].text
+    assert "📂" in label, f"inbox button label must contain 📂, got {label!r}"
+    assert "Inbox" in label or "inbox" in label, (
+        f"inbox button label must mention Inbox, got {label!r}"
+    )
+
+
+def test_bot_command_menu_includes_resetbot_and_inbox() -> None:
+    """The ``/start`` slash-menu in Telegram is built from
+    ``BOT_COMMAND_MENU``. The user wanted:
+
+    * ``/resetbot`` discoverable in the slash menu so they can restart
+      the bot from the chat without typing the full command.
+    * ``/inbox`` discoverable in the slash menu as the recovery
+      counterpart to ``/list``.
+    """
+    from proton_telegram_bot import __main__ as main_mod
+
+    commands = [name for name, _desc in main_mod.BOT_COMMAND_MENU]
+
+    assert "resetbot" in commands, (
+        "/resetbot must be present in BOT_COMMAND_MENU so the slash "
+        "menu shows it as a tap-able command"
+    )
+    assert "inbox" in commands, (
+        "/inbox must be present in BOT_COMMAND_MENU as the recovery "
+        "counterpart to /list"
+    )
+
+    # Each command must have a non-empty Indonesian-language description
+    # since the rest of the menu is in Indonesian.
+    by_name = dict(main_mod.BOT_COMMAND_MENU)
+    assert by_name["resetbot"], "resetbot description must be non-empty"
+    assert by_name["inbox"], "inbox description must be non-empty"
+
+
+async def test_run_inbox_recovery_dispatches_each_message_to_notifier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The shared ``_run_inbox_recovery`` helper must:
+
+    * resolve the active alias via ``_bot_db``,
+    * call ``manager.fetch_recent_for_active(chat_id, limit=...)``,
+    * forward each message through ``notifier.notify_email_received``,
+    * report the final ``delivered/total`` count by editing the
+      caller-supplied progress message in place.
+
+    This is the contract both ``cmd_inbox`` (slash command) and the
+    ``CB_INBOX`` callback rely on. Breaking it would silently drop the
+    user's manual recovery attempts.
+    """
+    fake_alias = MagicMock()
+    fake_alias.id = 7
+    fake_alias.email = "vielz@proton.me"
+
+    db = MagicMock()
+    db.get_active_alias = AsyncMock(return_value=fake_alias)
+
+    fake_email_a = MagicMock()
+    fake_email_b = MagicMock()
+    manager = MagicMock()
+    manager.fetch_recent_for_active = AsyncMock(
+        return_value=[fake_email_a, fake_email_b]
+    )
+
+    notifier = MagicMock()
+    notifier.notify_email_received = AsyncMock()
+
+    progress = MagicMock()
+    progress.edit_text = AsyncMock()
+
+    monkeypatch.setattr(bot, "_bot_db", lambda _ctx: db)
+    monkeypatch.setattr(bot, "_bot_manager", lambda _ctx: manager)
+    monkeypatch.setattr(bot, "_bot_notifier", lambda _ctx: notifier)
+    monkeypatch.setattr(
+        bot,
+        "extract_sender",
+        lambda _msg: ("from@example.com", "example.com"),
+    )
+    monkeypatch.setattr(bot, "summarize", lambda _msg: "summary")
+
+    ctx = MagicMock()
+    await bot._run_inbox_recovery(
+        chat_id=999,
+        progress_message=progress,
+        context=ctx,
+        requested=5,
+    )
+
+    manager.fetch_recent_for_active.assert_awaited_once_with(999, limit=5)
+    assert notifier.notify_email_received.await_count == 2, (
+        "every fetched message must be dispatched to the notifier"
+    )
+    final_call = progress.edit_text.await_args_list[-1]
+    final_text = final_call.args[0] if final_call.args else final_call.kwargs.get("text", "")
+    assert "2 dari 2" in final_text, (
+        f"final status must report delivered/total counts, got {final_text!r}"
+    )
+
+
+async def test_run_inbox_recovery_clamps_requested_to_max(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Users tapping the inbox button (or running ``/inbox 999``) must
+    not be able to ask for more than ``INBOX_MAX_COUNT`` emails — that
+    cap exists to keep a single recovery from spamming the chat."""
+    fake_alias = MagicMock()
+    fake_alias.id = 1
+    fake_alias.email = "alias@proton.me"
+
+    db = MagicMock()
+    db.get_active_alias = AsyncMock(return_value=fake_alias)
+
+    manager = MagicMock()
+    manager.fetch_recent_for_active = AsyncMock(return_value=[])
+
+    progress = MagicMock()
+    progress.edit_text = AsyncMock()
+
+    monkeypatch.setattr(bot, "_bot_db", lambda _ctx: db)
+    monkeypatch.setattr(bot, "_bot_manager", lambda _ctx: manager)
+    monkeypatch.setattr(bot, "_bot_notifier", lambda _ctx: MagicMock())
+
+    await bot._run_inbox_recovery(
+        chat_id=42,
+        progress_message=progress,
+        context=MagicMock(),
+        requested=999_999,
+    )
+
+    manager.fetch_recent_for_active.assert_awaited_once_with(
+        42, limit=bot.INBOX_MAX_COUNT
+    )
+
+
+async def test_run_inbox_recovery_warns_when_no_active_alias(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Tapping 📂 Inbox without an active alias must not crash — the
+    helper has to edit the progress message with a friendly hint
+    pointing the user at /list instead."""
+    db = MagicMock()
+    db.get_active_alias = AsyncMock(return_value=None)
+
+    manager = MagicMock()
+    manager.fetch_recent_for_active = AsyncMock()
+
+    progress = MagicMock()
+    progress.edit_text = AsyncMock()
+
+    monkeypatch.setattr(bot, "_bot_db", lambda _ctx: db)
+    monkeypatch.setattr(bot, "_bot_manager", lambda _ctx: manager)
+    monkeypatch.setattr(bot, "_bot_notifier", lambda _ctx: MagicMock())
+
+    await bot._run_inbox_recovery(
+        chat_id=1,
+        progress_message=progress,
+        context=MagicMock(),
+        requested=5,
+    )
+
+    manager.fetch_recent_for_active.assert_not_called()
+    edit_text_call = progress.edit_text.await_args_list[-1]
+    edit_msg = edit_text_call.args[0] if edit_text_call.args else edit_text_call.kwargs.get("text", "")
+    assert "/list" in edit_msg, (
+        "no-active-alias hint must direct the user to /list, "
+        f"got {edit_msg!r}"
+    )

@@ -348,6 +348,13 @@ CB_RESET = "reset"
 CB_DELETE = "delete"
 CB_NOOP = "noop"
 CB_POLL_NOW = "poll_now"
+# Manual re-fetch of the active alias' last few inbox emails. Same
+# behaviour as ``/inbox`` but reachable via the inline keyboard so
+# the user doesn't have to type the slash command. The user
+# explicitly asked for this button to live underneath
+# "Cek email sekarang" so the recovery action is one tap away from
+# the alias-active confirmation message.
+CB_INBOX = "inbox"
 # Tap-to-copy convenience: posts a fresh single-line ``<code>email</code>``
 # message containing the user's currently locked alias so desktop users
 # can one-click copy without scrolling back through chat history. The
@@ -717,6 +724,18 @@ def _build_primary_keyboard(
             )
         ]
     )
+    # "📂 Inbox" sits one row underneath "Cek email sekarang" so the
+    # two recovery actions cluster visually: the first nudges the
+    # listener to poll, the second pulls the last N emails directly
+    # from Proton if the listener missed any. The user requested this
+    # exact layout: "inbox taro disini dibawah cek email sekarang".
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "📂 Inbox", callback_data=CB_INBOX
+            )
+        ]
+    )
     rows.append(
         [InlineKeyboardButton("🔄 Refresh daftar", callback_data=CB_REFRESH)]
     )
@@ -776,6 +795,16 @@ def _build_alias_keyboard_for_primary(
             ),
         ]
     )
+    # See ``_build_primary_list_keyboard`` for the rationale behind the
+    # adjacent placement of "📂 Inbox" — same recovery cluster, same
+    # one-tap convenience for the alias drill-down view.
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "📂 Inbox", callback_data=CB_INBOX
+            )
+        ]
+    )
     rows.append(
         [
             InlineKeyboardButton(
@@ -828,6 +857,14 @@ def _build_poll_now_keyboard(
         )
     rows.append(
         [InlineKeyboardButton("📥 Cek email sekarang", callback_data=CB_POLL_NOW)]
+    )
+    # User-requested third row underneath "Cek email sekarang": the
+    # 📂 Inbox button manually re-fetches the last few emails for the
+    # active alias even if the IMAP listener missed them. This is the
+    # exact layout the user described in the alias-locked confirmation
+    # screenshot.
+    rows.append(
+        [InlineKeyboardButton("📂 Inbox", callback_data=CB_INBOX)]
     )
     return InlineKeyboardMarkup(rows)
 
@@ -1800,6 +1837,107 @@ INBOX_DEFAULT_COUNT = 5
 INBOX_MAX_COUNT = 20
 
 
+async def _run_inbox_recovery(
+    *,
+    chat_id: int,
+    progress_message: Any,
+    context: ContextTypes.DEFAULT_TYPE,
+    requested: int,
+) -> None:
+    """Shared inbox-recovery flow used by ``/inbox`` and ``CB_INBOX``.
+
+    ``progress_message`` is the ``Message`` we will edit-in-place
+    with phase status — both the slash-command entry point (where
+    ``msg.reply_text(...)`` provides the message) and the inline-button
+    entry point (where ``query.message.reply_text(...)`` does the same)
+    pass in their own bubble so the user sees the spinner anchored
+    near the action they triggered.
+
+    Failure handling: every Telegram-edit call is wrapped in
+    ``contextlib.suppress(BadRequest, Exception)`` so a transient
+    Telegram blip while reporting status doesn't crash the whole
+    recovery flow. The IMAP fetch itself uses ``manager.fetch_recent``
+    and is allowed to raise — callers catch that and surface a
+    user-visible error message.
+    """
+    db = _bot_db(context)
+    active = await db.get_active_alias(chat_id)
+    if active is None:
+        with contextlib.suppress(BadRequest, Exception):
+            await progress_message.edit_text(
+                "Belum ada alias aktif. Pilih alias di /list dulu, lalu "
+                "tekan tombol 📂 Inbox lagi."
+            )
+        return
+    requested = max(1, min(requested, INBOX_MAX_COUNT))
+    with contextlib.suppress(BadRequest, Exception):
+        await progress_message.edit_text(
+            f"📥 Membuka inbox <code>{html.escape(active.email)}</code> "
+            f"(ambil {requested} email terbaru)…",
+            parse_mode=ParseMode.HTML,
+        )
+    manager = _bot_manager(context)
+    try:
+        messages = await manager.fetch_recent_for_active(
+            chat_id, limit=requested
+        )
+    except Exception as exc:
+        LOGGER.warning(
+            "inbox: fetch failed for chat %s alias %s: %s",
+            chat_id,
+            active.email,
+            exc,
+        )
+        with contextlib.suppress(BadRequest, Exception):
+            await progress_message.edit_text(
+                f"❌ Gagal buka inbox: {html.escape(str(exc))}\n\n"
+                "Cek apakah Bridge masih jalan di VPS, dan /resetbot "
+                "kalau koneksi listener mandek.",
+                parse_mode=ParseMode.HTML,
+            )
+        return
+    if not messages:
+        with contextlib.suppress(BadRequest, Exception):
+            await progress_message.edit_text(
+                f"📭 Tidak ada email untuk "
+                f"<code>{html.escape(active.email)}</code> di inbox "
+                f"Proton. Kalau yakin baru saja terima, tunggu sebentar "
+                f"(server bisa lag) lalu coba lagi.",
+                parse_mode=ParseMode.HTML,
+            )
+        return
+    notifier = _bot_notifier(context)
+    delivered = 0
+    for parsed in messages:
+        sender_email, sender_domain = extract_sender(parsed)
+        summary = summarize(parsed)
+        try:
+            await notifier.notify_email_received(
+                chat_id,
+                active.email,
+                summary,
+                alias_id=active.id,
+                sender_email=sender_email,
+                sender_domain=sender_domain,
+            )
+            delivered += 1
+        except Exception:
+            LOGGER.warning(
+                "inbox: notify failed for chat %s alias %s",
+                chat_id,
+                active.email,
+                exc_info=True,
+            )
+    with contextlib.suppress(BadRequest, Exception):
+        await progress_message.edit_text(
+            f"📬 {delivered} dari {len(messages)} email terbaru untuk "
+            f"<code>{html.escape(active.email)}</code> berhasil di-fetch "
+            f"ulang. Klik <b>✓ Tandai sudah dibaca</b> di tiap email "
+            f"untuk pasang label.",
+            parse_mode=ParseMode.HTML,
+        )
+
+
 @_gate
 async def cmd_inbox(
     update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -1829,14 +1967,6 @@ async def cmd_inbox(
     msg = update.effective_message
     if chat is None or msg is None:
         return
-    db = _bot_db(context)
-    active = await db.get_active_alias(chat.id)
-    if active is None:
-        await msg.reply_text(
-            "Belum ada alias aktif. Pilih alias di /list dulu, lalu "
-            "/inbox akan menarik email terbaru untuk alias itu."
-        )
-        return
     requested = INBOX_DEFAULT_COUNT
     if context.args:
         try:
@@ -1846,72 +1976,15 @@ async def cmd_inbox(
                 f"Argumen harus angka. Contoh: /inbox 10 (max {INBOX_MAX_COUNT})."
             )
             return
-    requested = max(1, min(requested, INBOX_MAX_COUNT))
-    manager = _bot_manager(context)
     progress = await msg.reply_text(
-        f"📥 Membuka inbox <code>{html.escape(active.email)}</code> "
-        f"(ambil {requested} email terbaru)…",
-        parse_mode=ParseMode.HTML,
+        "📂 Inbox…",
     )
-    try:
-        messages = await manager.fetch_recent_for_active(
-            chat.id, limit=requested
-        )
-    except Exception as exc:
-        LOGGER.warning(
-            "cmd_inbox: fetch failed for chat %s alias %s: %s",
-            chat.id,
-            active.email,
-            exc,
-        )
-        with contextlib.suppress(BadRequest, Exception):
-            await progress.edit_text(
-                f"❌ Gagal buka inbox: {html.escape(str(exc))}\n\n"
-                "Cek apakah Bridge masih jalan di VPS, dan /resetbot "
-                "kalau koneksi listener mandek.",
-                parse_mode=ParseMode.HTML,
-            )
-        return
-    if not messages:
-        with contextlib.suppress(BadRequest, Exception):
-            await progress.edit_text(
-                f"📭 Tidak ada email untuk "
-                f"<code>{html.escape(active.email)}</code> di inbox "
-                f"Proton. Kalau yakin baru saja terima, tunggu sebentar "
-                f"(server bisa lag) lalu coba lagi.",
-                parse_mode=ParseMode.HTML,
-            )
-        return
-    notifier = _bot_notifier(context)
-    delivered = 0
-    for parsed in messages:
-        sender_email, sender_domain = extract_sender(parsed)
-        summary = summarize(parsed)
-        try:
-            await notifier.notify_email_received(
-                chat.id,
-                active.email,
-                summary,
-                alias_id=active.id,
-                sender_email=sender_email,
-                sender_domain=sender_domain,
-            )
-            delivered += 1
-        except Exception:
-            LOGGER.warning(
-                "cmd_inbox: notify failed for chat %s alias %s",
-                chat.id,
-                active.email,
-                exc_info=True,
-            )
-    with contextlib.suppress(BadRequest, Exception):
-        await progress.edit_text(
-            f"📬 {delivered} dari {len(messages)} email terbaru untuk "
-            f"<code>{html.escape(active.email)}</code> berhasil di-fetch "
-            f"ulang. Klik <b>✓ Tandai sudah dibaca</b> di tiap email "
-            f"untuk pasang label.",
-            parse_mode=ParseMode.HTML,
-        )
+    await _run_inbox_recovery(
+        chat_id=chat.id,
+        progress_message=progress,
+        context=context,
+        requested=requested,
+    )
 
 
 # ----------------------------------------------- /tag-service conversation
@@ -6027,8 +6100,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             "dikirim ke alamat di atas yang akan diteruskan ke chat ini. "
             "Alias tetap di /list dan terus terima email sampai kamu pilih "
             "alias lain atau kirim /unlock.\n\n"
-            "Klik tombol di bawah kalau email kamu belum sampai dan kamu "
-            "ingin cek manual (tanpa nunggu polling 5 detik).",
+            "Klik <b>📥 Cek email sekarang</b> kalau email belum sampai "
+            "(memicu polling listener), atau <b>📂 Inbox</b> kalau ingin "
+            "fetch ulang langsung dari Proton (kalau listener melewatkannya).",
             parse_mode=ParseMode.HTML,
             reply_markup=_build_poll_now_keyboard(with_copy_active=True),
         )
@@ -6043,6 +6117,27 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await query.answer(
                 "Listener belum jalan — kirim /connect dulu.", show_alert=True
             )
+        return
+    if data == CB_INBOX:
+        # Same recovery flow as ``/inbox`` (default 5 most recent),
+        # reachable from the alias-active inline keyboard so the user
+        # doesn't need to type a slash command. Acknowledge first
+        # (Telegram keeps the spinner on the button until we do) then
+        # post a fresh progress bubble that ``_run_inbox_recovery``
+        # edits in place — the original keyboard stays where it is so
+        # the user can still tap "Cek email sekarang" if they want.
+        await query.answer("📂 Inbox…")
+        if query.message is None:
+            return
+        progress = await query.message.reply_text(
+            "📂 Inbox…",
+        )
+        await _run_inbox_recovery(
+            chat_id=chat_id,
+            progress_message=progress,
+            context=context,
+            requested=INBOX_DEFAULT_COUNT,
+        )
         return
     if data == CB_LOCK_REMINDER_UNLOCK:
         # PR-F lock reminder: release the active alias lock in-place.

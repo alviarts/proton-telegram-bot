@@ -1,7 +1,18 @@
 [Unit]
 Description=Proton Telegram Bot
-After=network.target protonmail-bridge.service
-Wants=protonmail-bridge.service
+After=network-online.target protonmail-bridge.service
+Wants=network-online.target protonmail-bridge.service
+# After=network-online.target (instead of just network.target) makes
+# systemd wait until at least one routable network interface is up,
+# which keeps the bot from dying instantly on boot when the network
+# stack hasn't finished negotiating with the upstream router.
+# StartLimitIntervalSec=0 disables the rate-limiter that would
+# normally refuse further restarts after StartLimitBurst failures
+# inside a window — the user explicitly asked: "saya mau bot selalu
+# jalan di vps saya apapun yang terjadi walapun error tetap lakukan
+# restarting". Restart=always + StartLimitIntervalSec=0 means systemd
+# will keep retrying forever without ever giving up.
+StartLimitIntervalSec=0
 
 [Service]
 # ``Type=notify`` lets the bot tell systemd it's READY=1 once startup
@@ -18,11 +29,51 @@ WorkingDirectory=/opt/proton-telegram-bot
 EnvironmentFile=/opt/proton-telegram-bot/.env
 ExecStart=/opt/proton-telegram-bot/.venv/bin/python -m proton_telegram_bot
 
+# "Always restart" semantics: ANY exit (clean, crash, watchdog, OOM)
+# triggers a restart after RestartSec=5. The user accepted any
+# behaviour as long as the bot stays up: "PENTING LAKUKAN APAPUN saya
+# mau bot selalu jalan".
 Restart=always
 RestartSec=5
+# Treat *every* exit code (including SIGTERM and clean exit) as a
+# restart trigger so /resetbot's ``os._exit(0)`` cleanly cycles the
+# process instead of being interpreted as a "stopped on purpose"
+# event that systemd would honour.
+RestartForceExitStatus=0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 SIGTERM
+SuccessExitStatus=0
+# OOMPolicy=continue means a child process being killed by the OOM
+# killer doesn't propagate to the unit — the bot's main process
+# survives even if a transient subprocess (e.g. an aioimaplib parser
+# allocating a very large email) gets reaped. The systemd watchdog +
+# Restart=always still cover the case where the *main* process itself
+# is killed.
+OOMPolicy=continue
+# OOMScoreAdjust pushes the bot's OOM-kill priority *down* so the
+# kernel reaps memory hogs (Bridge, browser smoke-test, etc.) before
+# touching the bot. Range is -1000 (never killed) to +1000 (killed
+# first); -200 is "important but not critical".
+OOMScoreAdjust=-200
+
+# Process scheduling: keep the bot responsive on a busy VPS. ``Nice=-5``
+# raises priority modestly without starving other services; the user
+# said "mau pm2 di jadikan high priority atau apa terserah" — this is
+# the systemd equivalent of pm2's ``--node-args="--max-old-space-size"``
+# + scheduler tweaks.
+Nice=-5
+IOSchedulingClass=best-effort
+IOSchedulingPriority=2
+
+# Resource limits: keep the bot from being killed by per-process file
+# descriptor exhaustion when multiple IMAP listeners + Telegram
+# connections + browser smoke-tests all open sockets at once.
+LimitNOFILE=65536
+LimitNPROC=4096
 
 StandardOutput=journal
 StandardError=journal
+# SyslogIdentifier makes ``journalctl -t proton-telegram-bot`` work
+# without needing ``-u`` so logs are easy to filter from the VPS.
+SyslogIdentifier=proton-telegram-bot
 
 [Install]
 WantedBy=multi-user.target
