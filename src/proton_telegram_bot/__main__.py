@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 
 from telegram import BotCommand
 from telegram.ext import Application, ApplicationBuilder
@@ -31,11 +32,13 @@ BOT_COMMAND_MENU: list[tuple[str, str]] = [
     ("genaddr", "Generate alamat (cth: /genaddr vielz 10)"),
     ("addalias", "Tambah alias manual"),
     ("removealias", "Hapus alias"),
+    ("inbox", "Fetch ulang email terbaru utk alias aktif"),
     ("history", "Alias yang sudah terpakai"),
     ("reset", "Kembalikan alias ke daftar tersedia"),
     ("unlock", "Lepas kunci alias aktif"),
     ("disconnect", "Hapus akun + stop listener"),
     ("sync", "Auto-sync alias dari akun Proton"),
+    ("resetbot", "Restart bot (lewat supervisor systemd/pm2)"),
     ("cancel", "Batalkan dialog yang sedang jalan"),
 ]
 
@@ -78,6 +81,26 @@ async def _post_shutdown(application: Application) -> None:
         await db.close()
 
 
+# Telegram-API HTTP timeouts. The defaults baked into
+# ``python-telegram-bot`` (5 s connect / 5 s read / 5 s write) are too
+# tight for VPS-to-Telegram links with elevated latency or transient
+# packet loss — observed on the Indonesian VPS where ping to
+# ``api.telegram.org`` showed ~33% loss and ~170 ms RTT, which made
+# every other ``send_message`` raise ``httpcore.ConnectTimeout`` and
+# bubble up as ``uncaught exception in handler``. Bumping the
+# connect/read/write budget to ~15-20 s absorbs those blips without
+# changing behaviour on healthy networks (a successful round-trip is
+# still <500 ms).
+_TELEGRAM_CONNECT_TIMEOUT = 15.0
+_TELEGRAM_READ_TIMEOUT = 20.0
+_TELEGRAM_WRITE_TIMEOUT = 20.0
+_TELEGRAM_POOL_TIMEOUT = 30.0
+# ``getUpdates`` long-poll keeps the connection open for the duration
+# of ``timeout`` in the request payload (PTB sets this to 10 s by
+# default), so the read budget must be larger than that plus margin.
+_GET_UPDATES_READ_TIMEOUT = 60.0
+
+
 def _build_application(settings: Settings) -> Application:
     # ``concurrent_updates=True`` lets PTB dispatch handlers in parallel
     # tasks instead of one-at-a-time. Without this a single user whose
@@ -89,6 +112,14 @@ def _build_application(settings: Settings) -> Application:
         ApplicationBuilder()
         .token(settings.telegram_bot_token)
         .concurrent_updates(True)
+        .connect_timeout(_TELEGRAM_CONNECT_TIMEOUT)
+        .read_timeout(_TELEGRAM_READ_TIMEOUT)
+        .write_timeout(_TELEGRAM_WRITE_TIMEOUT)
+        .pool_timeout(_TELEGRAM_POOL_TIMEOUT)
+        .get_updates_connect_timeout(_TELEGRAM_CONNECT_TIMEOUT)
+        .get_updates_read_timeout(_GET_UPDATES_READ_TIMEOUT)
+        .get_updates_write_timeout(_TELEGRAM_WRITE_TIMEOUT)
+        .get_updates_pool_timeout(_TELEGRAM_POOL_TIMEOUT)
         .post_init(_post_init)
         .post_shutdown(_post_shutdown)
         .build()
@@ -110,6 +141,10 @@ def _build_application(settings: Settings) -> Application:
     application.bot_data["db"] = db
     application.bot_data["cipher"] = cipher
     application.bot_data["manager"] = manager
+    # Expose the singleton notifier so ``/inbox`` (in bot.py) can
+    # re-deliver fetched emails through exactly the same render +
+    # keyboard pipeline that the live IMAP listener uses.
+    application.bot_data["notifier"] = notifier
     application.bot_data["bridge_admin"] = BridgeAdmin(settings)
     # Optional Proton-bound proxy rotation. ``from_env`` returns ``None`` when
     # ``PROTON_USE_PROXY=0`` so deployments can disable it without touching code.
@@ -131,12 +166,44 @@ async def _bootstrap_db(application: Application) -> None:
     await db.connect()
 
 
-def main() -> None:
-    settings = load_settings()
+# Third-party loggers we always pin to WARNING regardless of the
+# user's ``LOG_LEVEL``:
+#
+# - ``aioimaplib`` and ``aioimaplib.aioimaplib`` log every IMAP frame
+#   at DEBUG, which means raw email bodies (including OTPs, account
+#   recovery links, and unredacted message contents) end up in
+#   ``journalctl`` whenever the operator turns on DEBUG to debug the
+#   bot. That's both a privacy leak and an unmanageable amount of
+#   log volume.
+# - ``httpx`` and ``httpcore`` log every TCP connect, request, and
+#   response at DEBUG. Useful occasionally, but in steady state they
+#   triple the journal size and hide the application's own log lines.
+#
+# Operators who genuinely need third-party DEBUG can still get it by
+# setting ``PROTON_BOT_VERBOSE_THIRDPARTY=1`` in the environment.
+_QUIET_THIRDPARTY_LOGGERS: tuple[str, ...] = (
+    "aioimaplib",
+    "aioimaplib.aioimaplib",
+    "httpx",
+    "httpcore",
+    "hpack",
+)
+
+
+def _configure_logging(settings: Settings) -> None:
     logging.basicConfig(
         level=getattr(logging, settings.log_level.upper(), logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    if os.environ.get("PROTON_BOT_VERBOSE_THIRDPARTY") == "1":
+        return
+    for name in _QUIET_THIRDPARTY_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
+def main() -> None:
+    settings = load_settings()
+    _configure_logging(settings)
     application = _build_application(settings)
     # Connect DB before run_polling takes over the event loop.
     asyncio.get_event_loop().run_until_complete(_bootstrap_db(application))

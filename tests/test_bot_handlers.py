@@ -425,6 +425,47 @@ def test_build_tag_service_keyboard_includes_clear_only_when_labelled() -> None:
     assert len(with_clear.inline_keyboard) == 2
 
 
+def test_build_tag_service_keyboard_pending_mark_read_mode() -> None:
+    """First-time forwards must lead with "✓ Tandai sudah dibaca" and
+    suppress "🗑 Hapus label" — labeling is gated on the user's explicit
+    confirmation.
+    """
+    from proton_telegram_bot.bot import (
+        CB_MARK_READ,
+        CB_TAG_SERVICE,
+        _build_tag_service_keyboard,
+    )
+
+    pending = _build_tag_service_keyboard(
+        alias_id=42,
+        sender_domain="cognition.ai",
+        current_label="Devin",
+        pending_mark_read=True,
+    )
+    assert pending is not None
+    rows = pending.inline_keyboard
+    # Top row is the mark-read CTA.
+    assert "✓ Tandai sudah dibaca" in rows[0][0].text
+    assert rows[0][0].callback_data == f"{CB_MARK_READ}:42:cognition.ai"
+    # Followed by tag-ulang. No "Hapus label" until the sender row exists.
+    assert "Tag ulang" in rows[1][0].text
+    assert rows[1][0].callback_data == f"{CB_TAG_SERVICE}:42:cognition.ai"
+    assert all("Hapus label" not in btn.text for row in rows for btn in row)
+
+    # Standard mode (already recorded): top row is tag-ulang, then
+    # "Hapus label" when a label exists.
+    standard = _build_tag_service_keyboard(
+        alias_id=42,
+        sender_domain="cognition.ai",
+        current_label="Devin",
+        pending_mark_read=False,
+    )
+    assert standard is not None
+    standard_rows = standard.inline_keyboard
+    assert "Tag ulang" in standard_rows[0][0].text
+    assert "Hapus label" in standard_rows[1][0].text
+
+
 def test_services_keyboard_renders_suppression_distinctly() -> None:
     """A row with ``label = ''`` is the 🗑 Hapus label sentinel — the
     keyboard distinguishes it from named mappings using the 🚫 icon and
