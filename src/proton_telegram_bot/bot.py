@@ -21,7 +21,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ParseMode
-from telegram.error import BadRequest
+from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -62,6 +62,105 @@ from .tempmail import TempMailbox, TempMailError
 LOGGER = logging.getLogger(__name__)
 
 
+# Backoff schedule for ``_send_with_retry``: we retry the Telegram API
+# call after these gaps (seconds). The total ceiling (~22 s) is shorter
+# than the IMAP polling interval (5 s) times the typical retry budget,
+# so the listener won't fall too far behind on a noisy network. The
+# user-visible failure mode is "email arrived 25 s late" rather than
+# "email never arrived" — explicitly preferred over a silent drop.
+_TELEGRAM_RETRY_BACKOFF_SECONDS: tuple[float, ...] = (1.0, 3.0, 7.0, 15.0)
+# Exception types that are recoverable on retry. ``RetryAfter`` is
+# Telegram's flood-control hint — PTB raises it with a ``retry_after``
+# attribute that we honour explicitly. ``TimedOut`` and ``NetworkError``
+# wrap the underlying ``httpx``/``httpcore`` timeouts and DNS / TCP
+# resets that were filling the journal before this fix.
+#
+# Important inheritance gotcha: in python-telegram-bot v22 ``BadRequest``
+# subclasses ``NetworkError`` for historical reasons, even though it
+# represents an API-level rejection (malformed HTML, message too long,
+# bot kicked from chat) that retrying would never fix. We therefore
+# exclude it explicitly via :func:`_is_retryable_telegram_error`
+# rather than a flat ``isinstance`` check on the base classes.
+_RETRYABLE_TELEGRAM_ERRORS: tuple[type[BaseException], ...] = (
+    TimedOut,
+    NetworkError,
+    httpx.TimeoutException,
+    httpx.NetworkError,
+)
+_NON_RETRYABLE_TELEGRAM_ERRORS: tuple[type[BaseException], ...] = (
+    BadRequest,
+)
+
+
+def _is_retryable_telegram_error(exc: BaseException) -> bool:
+    if isinstance(exc, _NON_RETRYABLE_TELEGRAM_ERRORS):
+        return False
+    return isinstance(exc, _RETRYABLE_TELEGRAM_ERRORS)
+
+
+async def _send_with_retry(
+    coro_factory: Callable[[], Awaitable[Any]],
+    *,
+    description: str,
+    backoff: tuple[float, ...] = _TELEGRAM_RETRY_BACKOFF_SECONDS,
+) -> Any:
+    """Run ``coro_factory()`` with retries on transient Telegram errors.
+
+    ``coro_factory`` is a zero-arg callable that returns a fresh
+    coroutine each time — we need a factory rather than a single
+    awaitable because each retry must produce a new ``HTTP`` request
+    (you cannot ``await`` the same coroutine twice).
+
+    On :class:`telegram.error.RetryAfter` we sleep for
+    ``exc.retry_after`` instead of the schedule (Telegram's own
+    flood-control hint is more accurate than our static backoff).
+
+    Exceptions outside :data:`_RETRYABLE_TELEGRAM_ERRORS` propagate
+    unchanged so callers retain visibility into bad-request /
+    invalid-token / unsupported-parse-mode failures, which retrying
+    would not fix.
+    """
+    last_exc: BaseException | None = None
+    for attempt, sleep_for in enumerate((0.0, *backoff)):
+        if sleep_for > 0:
+            await asyncio.sleep(sleep_for)
+        try:
+            return await coro_factory()
+        except RetryAfter as exc:
+            last_exc = exc
+            wait = float(getattr(exc, "retry_after", 1.0))
+            LOGGER.warning(
+                "%s: telegram flood-control, retrying after %.1fs (attempt %d)",
+                description,
+                wait,
+                attempt + 1,
+            )
+            await asyncio.sleep(wait)
+        except Exception as exc:
+            if not _is_retryable_telegram_error(exc):
+                raise
+            last_exc = exc
+            if attempt >= len(backoff):
+                # No more attempts left — bubble up so the caller can
+                # decide whether to log+continue or surface the failure.
+                LOGGER.error(
+                    "%s: giving up after %d attempts (%s)",
+                    description,
+                    attempt + 1,
+                    exc,
+                )
+                raise
+            LOGGER.warning(
+                "%s: transient network error, retrying (%s)",
+                description,
+                exc,
+            )
+    # Defensive: the loop always either returns or raises, but a
+    # static analyser may not prove that to itself.
+    assert last_exc is not None
+    raise last_exc
+
+
 async def on_error(
     update: object,
     context: ContextTypes.DEFAULT_TYPE,
@@ -95,7 +194,16 @@ async def on_error(
        ``allow_reentry=True``.
     """
     err = context.error
-    LOGGER.exception("uncaught exception in handler", exc_info=err)
+    # Telegram-side network blips (``TimedOut``, ``NetworkError``,
+    # underlying ``httpx.TimeoutException``) are recoverable transients
+    # — the journal used to drown in 60-line tracebacks every time the
+    # VPS-to-Telegram link sneezed. We still log them, but at WARNING
+    # without the full traceback so the signal-to-noise stays usable.
+    is_transient_network = err is not None and _is_retryable_telegram_error(err)
+    if is_transient_network:
+        LOGGER.warning("transient network error in handler: %s", err)
+    else:
+        LOGGER.exception("uncaught exception in handler", exc_info=err)
 
     # Best-effort: clear stale ``user_data`` so the next command starts
     # from a clean slate instead of inheriting half-set keys
@@ -6209,11 +6317,21 @@ class TelegramNotifier(Notifier):
                 current_label=current_label,
                 pending_mark_read=not already_recorded,
             )
-        sent = await self._application.bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            parse_mode=ParseMode.HTML,
-            reply_markup=markup,
+        # Retry on transient network errors so a 5-30s blip in the
+        # VPS-to-Telegram link doesn't drop the email forward. Without
+        # this the listener used to log "failed to fetch/dispatch UID
+        # X" and the user simply never learned that mail had arrived
+        # (``imap_listener._fetch_new_messages`` advances the UID
+        # baseline in ``finally``, so the dropped message never
+        # retries).
+        sent = await _send_with_retry(
+            lambda: self._application.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=markup,
+            ),
+            description=f"forward email to chat {chat_id}",
         )
         # Touch the existing row so /aliasinfo's seen_count keeps
         # incrementing the same way it did before deferred labeling
@@ -6264,10 +6382,13 @@ class TelegramNotifier(Notifier):
         for alias in sorted(aliases):
             lines.append(f"• <code>{html.escape(alias)}</code>")
         lines.append("\n/list untuk lihat semua alias.")
-        await self._application.bot.send_message(
-            chat_id=chat_id,
-            text="\n".join(lines),
-            parse_mode=ParseMode.HTML,
+        await _send_with_retry(
+            lambda: self._application.bot.send_message(
+                chat_id=chat_id,
+                text="\n".join(lines),
+                parse_mode=ParseMode.HTML,
+            ),
+            description=f"notify aliases discovered to chat {chat_id}",
         )
 
 
